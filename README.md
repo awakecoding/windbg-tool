@@ -9,8 +9,8 @@
 - Run a stdio MCP server for TTD replay workflows.
 - Keep long-lived replay sessions in a local daemon and drive them from the CLI.
 - Open traces, create cursors, seek positions, inspect threads/modules/registers/memory, and replay to watchpoints.
-- Use higher-level helpers such as `discover`, `recipes`, `context snapshot`, `symbols diagnose`, `disasm`, `stack backtrace`, and `memory chase`.
-- Start a DbgEng process server and install, update, or launch WinDbg.
+- Use higher-level helpers such as `discover`, `recipes`, `debug capabilities`, `debug snapshot`, `triage`, `symbols doctor`, `disasm`, `stack backtrace`, and `memory chase`.
+- Plan and diagnose local/remote DbgEng workflows with `remote doctor`, `remote plan`, process-server commands, and WinDbg install/update/launch helpers.
 
 ## Repository layout
 
@@ -51,6 +51,7 @@ Some commands work without loading a trace or starting the daemon:
 
 ```powershell
 target\debug\windbg-tool.exe discover
+target\debug\windbg-tool.exe cli-schema
 target\debug\windbg-tool.exe recipes
 target\debug\windbg-tool.exe tools
 ```
@@ -61,18 +62,23 @@ For trace-driven work, the common flow is:
 target\debug\windbg-tool.exe daemon ensure
 target\debug\windbg-tool.exe open C:\path\to\trace.run --binary-path C:\path\to\binary.exe
 target\debug\windbg-tool.exe sessions
-target\debug\windbg-tool.exe context snapshot --session 1 --cursor 1
+target\debug\windbg-tool.exe debug capabilities --session 1 --cursor 1
+target\debug\windbg-tool.exe debug snapshot --session 1 --cursor 1
 target\debug\windbg-tool.exe disasm --session 1 --cursor 1
 ```
 
 `open` is the best starting command for the CLI because it loads the trace, creates a cursor, and returns both `session_id` and `cursor_id`. Most replay commands then use `--session` and `--cursor` (or the short forms `-s` and `-c`).
 
+For AI agents and robust scripts, add `--envelope` or set `WINDBG_TOOL_ENVELOPE=1` to get stable `{ schema_version, ok, data|error }` JSON responses and structured error codes.
+Set `WINDBG_TOOL_ACTION_LOG=<path>` to append redacted JSONL command outcomes for handoff/resume workflows, then inspect them with `debug log summarize`.
+
 Representative command areas:
 
-- Discovery: `discover`, `recipes`, `tools`, `schema`
+- Discovery: `discover`, `cli-schema`, `recipes`, `tools`, `schema`
 - Session and replay: `open`, `load`, `sessions`, `info`, `position set`, `step`, `replay to`
+- Agent workflow: `debug capabilities`, `debug snapshot`, `triage crash`, `symbols doctor`, `breakpoint plan`, `debug log summarize`
 - Analysis: `symbols diagnose`, `disasm`, `memory dump`, `memory strings`, `memory chase`, `stack recover`, `stack backtrace`
-- Platform helpers: `remote explain`, `dbgeng server`, `live launch`, `dump create`, `dump inspect`, `windbg status`
+- Platform helpers: `remote explain`, `remote doctor`, `remote plan`, `dbgeng server`, `live launch`, `dump create`, `dump inspect`, `windbg status`
 
 For a fuller CLI walkthrough, output-shaping flags, and command map, see [the CLI guide](docs/cli.md).
 

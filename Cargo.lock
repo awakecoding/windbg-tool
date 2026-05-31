@@ -1814,6 +1814,7 @@ dependencies = [
  "clap",
  "iced-x86",
  "rmcp",
+ "serde",
  "serde_json",
  "tokio",
  "tracing-subscriber",

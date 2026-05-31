@@ -69,11 +69,21 @@ impl ServerHandler for TtdMcpServer {
 }
 
 fn tool_text(value: Value) -> CallToolResult {
-    CallToolResult::success(vec![Content::text(pretty_json(value))])
+    CallToolResult {
+        content: vec![Content::text(pretty_json(value.clone()))],
+        structured_content: Some(value),
+        is_error: Some(false),
+        meta: None,
+    }
 }
 
 fn tool_error(value: Value) -> CallToolResult {
-    CallToolResult::error(vec![Content::text(pretty_json(value))])
+    CallToolResult {
+        content: vec![Content::text(pretty_json(value.clone()))],
+        structured_content: Some(value),
+        is_error: Some(true),
+        meta: None,
+    }
 }
 
 fn pretty_json(value: Value) -> String {
