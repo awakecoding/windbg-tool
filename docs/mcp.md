@@ -106,8 +106,9 @@ Load the trace, create a cursor, move to the end of the trace, and search backwa
 
 ## Practical notes
 
-- Tool results are returned as JSON text content
+- Tool results include both JSON text content and MCP `structuredContent`
 - Tool failures are returned as MCP tool results with `isError: true`
+- Tool definitions include MCP annotations that hint whether a tool is read-only, destructive, idempotent, or open-world
 - If native replay is unavailable, some tools return placeholder or empty results with warnings instead of full trace-backed data
 
 ## Privacy

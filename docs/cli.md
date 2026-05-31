@@ -4,9 +4,10 @@
 
 ## How the CLI is organized
 
-- **Discovery commands** do not require the daemon: `discover`, `recipes`, `tools`, `schema`, `trace-list`, `symbols inspect`
+- **Discovery commands** do not require the daemon: `discover`, `cli-schema`, `recipes`, `tools`, `schema`, `trace-list`, `symbols inspect`
 - **Replay commands** usually talk to the local daemon and operate on a `session_id` and `cursor_id`
-- **Platform helper commands** cover DbgEng, remote debugging recipes, live-launch probing, and WinDbg installation
+- **Canonical agent debugging commands** start with `debug`, `triage`, `symbols doctor`, and `breakpoint plan`
+- **Platform helper commands** cover DbgEng, remote debugging doctors/plans, live-launch probing, and WinDbg installation
 
 ## Common replay workflow
 
@@ -32,14 +33,66 @@ Use the returned handles with analysis commands:
 
 ```powershell
 target\debug\windbg-tool.exe info --session 1
-target\debug\windbg-tool.exe context snapshot --session 1 --cursor 1
+target\debug\windbg-tool.exe debug snapshot --session 1 --cursor 1
 target\debug\windbg-tool.exe position set --session 1 --cursor 1 --position 50
 target\debug\windbg-tool.exe registers --session 1 --cursor 1
 target\debug\windbg-tool.exe disasm --session 1 --cursor 1
 target\debug\windbg-tool.exe memory strings --session 1 --cursor 1 --address 0x12345678 --size 256 --encoding both
 ```
 
-`open` is the preferred starting point because it loads the trace, creates a cursor, and optionally seeks to a position in one response.
+`open` is the preferred starting point because it loads the trace, creates a cursor, and optionally seeks to a position in one response. `debug snapshot` is the canonical cross-backend snapshot for agents; `context snapshot` remains available as the legacy TTD-focused snapshot.
+
+## Canonical agent debugging commands
+
+Use `debug capabilities` before choosing actions. With no subject it returns a backend matrix for TTD cursors, daemon-owned live/dump targets, and remote process-server plans. With `--session/--cursor` or `--target`, it includes selected-subject status/evidence where available.
+
+```powershell
+target\debug\windbg-tool.exe --compact debug capabilities
+target\debug\windbg-tool.exe --compact debug capabilities --session 1 --cursor 1
+target\debug\windbg-tool.exe --compact debug capabilities --target 1
+```
+
+Use `debug snapshot` for bounded, sectioned context capture. Each section has independent status, duration, truncation, diagnostics, and the primitive follow-up command. TTD subjects use `--session` and `--cursor`; live or dump subjects use `--target`.
+
+```powershell
+target\debug\windbg-tool.exe --compact debug snapshot --session 1 --cursor 1 --include stack --include current_disassembly
+target\debug\windbg-tool.exe --compact debug snapshot --target 1 --max-frames 16 --max-modules 32
+```
+
+Use `triage <kind>` for evidence plus hypotheses rather than a verdict-only answer:
+
+```powershell
+target\debug\windbg-tool.exe --compact triage crash --session 1 --cursor 1
+target\debug\windbg-tool.exe --compact triage hang --target 1
+```
+
+Use `symbols doctor` and `breakpoint plan` when an agent needs to validate names/source paths or dry-run a mutation:
+
+```powershell
+target\debug\windbg-tool.exe --compact symbols doctor --session 1 --cursor 1 --address 0x7ff600001000
+target\debug\windbg-tool.exe --compact breakpoint plan --target 1 --address 0x7ff600001000
+target\debug\windbg-tool.exe --compact breakpoint plan --session 1 --cursor 1 --address 0x12345678 --kind write --size 8 --direction previous
+```
+
+## Remote debugging doctors and plans
+
+`remote doctor`, `remote status`, and `remote plan` are read-only helpers for DbgEng process-server style workflows. TCP connect probing is opt-in because it can be visible to network monitoring.
+
+```powershell
+target\debug\windbg-tool.exe --compact remote doctor --transport tcp:port=5005
+target\debug\windbg-tool.exe --compact remote status --server target-host --transport tcp:port=5005 --probe-connect --timeout-ms 1000
+target\debug\windbg-tool.exe --compact remote plan --server target-host --transport tcp:port=5005
+```
+
+## Optional agent action log
+
+Set `WINDBG_TOOL_ACTION_LOG` to append one JSONL entry per CLI invocation. By default entries include only the command path, success status, exit code, and duration; raw arguments are redacted. Set `WINDBG_TOOL_ACTION_LOG_FULL=1` only when full command-line logging is safe for your environment.
+
+```powershell
+$env:WINDBG_TOOL_ACTION_LOG = "D:\logs\windbg-tool-actions.jsonl"
+target\debug\windbg-tool.exe --compact debug capabilities
+target\debug\windbg-tool.exe --compact debug log summarize --path D:\logs\windbg-tool-actions.jsonl
+```
 
 ## Session and cursor basics
 
@@ -55,26 +108,57 @@ CLI output is JSON by default. These flags make it easier to script:
 - `--compact` for single-line JSON
 - `--field <dot.path>` to extract one field
 - `--raw` to print scalar values without JSON quotes
+- `--envelope` or `WINDBG_TOOL_ENVELOPE=1` to wrap success and failure output in a stable agent contract
 
 Example:
 
 ```powershell
 target\debug\windbg-tool.exe --field session_id --raw open C:\path\to\trace.run
 target\debug\windbg-tool.exe --compact registers --session 1 --cursor 1
+target\debug\windbg-tool.exe --compact --envelope sessions
 ```
+
+In envelope mode, successful commands return `{ "schema_version": 1, "ok": true, "data": ... }`. `--field` selects from `data`, so `--envelope --field session_id --raw open ...` still prints the raw session id. Failures return `{ "schema_version": 1, "ok": false, "error": ... }` and ignore `--field`/`--raw` so agents always receive the full error reason.
+
+Structured error codes use stable exit codes:
+
+| Code | Exit | Retryable |
+| --- | ---: | --- |
+| `invalid_argument` | 2 | false |
+| `daemon_unavailable` | 3 | true |
+| `daemon_error` | 4 | depends on cause |
+| `session_not_found` | 5 | false |
+| `cursor_not_found` | 6 | false |
+| `timeout` | 7 | true |
+| `tool_error` | 8 | depends on cause |
+| `internal` | 1 | false |
+
+Daemon connection failures include the selected pipe and a hint to run `windbg-tool daemon ensure`.
+
+## CLI schema discovery
+
+Use `cli-schema` for machine-readable command paths, arguments, possible values, defaults, conflicts, and command metadata:
+
+```powershell
+target\debug\windbg-tool.exe --compact cli-schema
+target\debug\windbg-tool.exe --compact cli-schema memory read
+```
+
+The schema includes curated metadata where available and inferred metadata for other leaf commands. Bounded collection outputs include additive `returned`, `limit`, and `truncated` fields when the command has a fixed result budget.
 
 ## Command groups worth learning first
 
 | Goal | Commands |
 | --- | --- |
-| Discover capabilities | `discover`, `recipes`, `tools`, `schema <tool>` |
+| Discover capabilities | `discover`, `cli-schema [command...]`, `recipes`, `tools`, `schema <tool>` |
+| Canonical agent context | `debug capabilities`, `debug snapshot`, `triage <kind>`, `symbols doctor`, `breakpoint plan`, `debug log summarize` |
 | Manage daemon/session state | `daemon ensure`, `daemon status`, `sessions`, `open`, `load`, `close`, `info` |
 | Move through a trace | `cursor create`, `position get`, `position set`, `step`, `replay to`, `replay watch-memory`, `sweep watch-memory` |
 | Inspect trace metadata | `threads`, `modules`, `exceptions`, `keyframes`, `timeline events`, `module info`, `module audit` |
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
-| Symbol and source triage | `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg, live, dump, and remote helpers | `remote explain`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `dump create`, `dump open`, `dump inspect`, `target dump`, `windbg status` |
+| Symbol and source triage | `symbols doctor`, `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `dump create`, `dump open`, `dump inspect`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 
@@ -83,7 +167,8 @@ These are good starting points even before you have a trace open:
 ```powershell
 target\debug\windbg-tool.exe discover
 target\debug\windbg-tool.exe recipes
-target\debug\windbg-tool.exe remote explain
+target\debug\windbg-tool.exe debug capabilities
+target\debug\windbg-tool.exe remote doctor --transport tcp:port=5005
 target\debug\windbg-tool.exe symbols inspect C:\Windows\System32\notepad.exe
 target\debug\windbg-tool.exe windbg status
 ```

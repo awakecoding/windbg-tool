@@ -1,19 +1,27 @@
-use clap::Parser;
+use clap::{error::ErrorKind, Parser};
 use serde_json::json;
 
 use super::daemon_mode;
-use super::output::{print_value, OutputOptions};
+use super::output::{invalid_argument, print_value, OutputOptions};
 use super::platform;
 use super::remote;
 use super::*;
 
 pub(super) async fn run_cli() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let output = OutputOptions {
-        compact: cli.compact,
-        field: cli.field,
-        raw: cli.raw,
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if matches!(
+                error.kind(),
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+            ) =>
+        {
+            error.print()?;
+            return Ok(());
+        }
+        Err(error) => return Err(invalid_argument(error.to_string()).into()),
     };
+    let output = OutputOptions::new(cli.compact, cli.field, cli.raw, cli.envelope);
     let pipe = cli.pipe.unwrap_or_else(default_pipe_name);
 
     match cli.command {
@@ -21,6 +29,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         Some(Commands::Discover) => print_value(discover_manifest(), &output),
         Some(Commands::Recipes(args)) => print_value(recipes_value(args)?, &output),
         Some(Commands::Schema(args)) => print_value(tool_schema(&args.tool)?, &output),
+        Some(Commands::CliSchema(args)) => print_value(cli_schema(args)?, &output),
         Some(Commands::Trace { command }) => match command {
             TraceCommand::List(args) => call_and_print(pipe, trace_list_call(args), &output).await,
         },
@@ -48,6 +57,32 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         Some(Commands::Remote { command }) => {
             print_value(remote::remote_command_value(command)?, &output)
         }
+        Some(Commands::Debug { command }) => match command {
+            DebugCommand::Capabilities(args) => {
+                debug_capabilities_and_print(pipe, args, &output).await
+            }
+            DebugCommand::Snapshot(args) => debug_snapshot_and_print(pipe, args, &output).await,
+            DebugCommand::Log { command } => match command {
+                DebugLogCommand::Summarize(args) => debug_log_summarize_and_print(args, &output),
+            },
+        },
+        Some(Commands::Triage { command }) => match command {
+            TriageCommand::Crash(args) => triage_and_print(pipe, "crash", args, &output).await,
+            TriageCommand::Hang(args) => triage_and_print(pipe, "hang", args, &output).await,
+            TriageCommand::AccessViolation(args) => {
+                triage_and_print(pipe, "access_violation", args, &output).await
+            }
+            TriageCommand::MemoryCorruption(args) => {
+                triage_and_print(pipe, "memory_corruption", args, &output).await
+            }
+            TriageCommand::Loader(args) => triage_and_print(pipe, "loader", args, &output).await,
+            TriageCommand::SymbolHealth(args) => {
+                triage_and_print(pipe, "symbol_health", args, &output).await
+            }
+            TriageCommand::Deadlock(args) => {
+                triage_and_print(pipe, "deadlock", args, &output).await
+            }
+        },
         Some(Commands::Windbg { command }) => platform::run_windbg_command(command, &output),
         Some(Commands::Open(args)) => open_and_print(pipe, args, &output).await,
         Some(Commands::Load(args)) => call_and_print(pipe, load_call(args), &output).await,
@@ -69,6 +104,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             SymbolsCommand::Inspect(args) => print_value(diagnose_pe(&args.path)?, &output),
             SymbolsCommand::Exports(args) => symbols_exports_and_print(args, &output),
             SymbolsCommand::Nearest(args) => symbols_nearest_and_print(pipe, args, &output).await,
+            SymbolsCommand::Doctor(args) => symbols_doctor_and_print(pipe, args, &output).await,
         },
         Some(Commands::Source { command }) => match command {
             SourceCommand::Resolve(args) => print_value(source_resolve(args)?, &output),
@@ -209,6 +245,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             BreakpointCommand::Remove(args) => {
                 call_and_print(pipe, breakpoint_remove_call(args), &output).await
             }
+            BreakpointCommand::Plan(args) => breakpoint_plan_and_print(pipe, args, &output).await,
         },
         Some(Commands::Datamodel { command }) => match command {
             DataModelCommand::Capabilities => {

@@ -147,7 +147,44 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
         &ttd,
         ["recipes".to_string(), "remote-debugging".to_string()],
     )?;
+    let debug_capabilities =
+        run_local_json(&ttd, ["debug".to_string(), "capabilities".to_string()])?;
+    let debug_schema = run_local_json(
+        &ttd,
+        [
+            "cli-schema".to_string(),
+            "debug".to_string(),
+            "snapshot".to_string(),
+        ],
+    )?;
     let remote_explain = run_local_json(&ttd, ["remote".to_string(), "explain".to_string()])?;
+    let remote_doctor = run_local_json(
+        &ttd,
+        [
+            "remote".to_string(),
+            "doctor".to_string(),
+            "--transport".to_string(),
+            "tcp:port=0".to_string(),
+        ],
+    )?;
+    let remote_status = run_local_json(
+        &ttd,
+        [
+            "remote".to_string(),
+            "status".to_string(),
+            "--transport".to_string(),
+            "tcp:port=0".to_string(),
+        ],
+    )?;
+    let remote_plan = run_local_json(
+        &ttd,
+        [
+            "remote".to_string(),
+            "plan".to_string(),
+            "--server".to_string(),
+            "target01".to_string(),
+        ],
+    )?;
     let remote_connect = run_local_json(
         &ttd,
         [
@@ -162,6 +199,17 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
     let live_capabilities = run_local_json(&ttd, ["live".to_string(), "capabilities".to_string()])?;
     let breakpoint_capabilities =
         run_local_json(&ttd, ["breakpoint".to_string(), "capabilities".to_string()])?;
+    let breakpoint_plan = run_local_json(
+        &ttd,
+        [
+            "breakpoint".to_string(),
+            "plan".to_string(),
+            "--target".to_string(),
+            "1".to_string(),
+            "--address".to_string(),
+            "0x1000".to_string(),
+        ],
+    )?;
     let datamodel_capabilities =
         run_local_json(&ttd, ["datamodel".to_string(), "capabilities".to_string()])?;
     let target_capabilities =
@@ -247,6 +295,8 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
     ensure!(
         discover["command_groups"]["dbgeng"].is_array()
             && discover["command_groups"]["windbg"].is_array()
+            && discover["command_groups"]["debug"].is_array()
+            && discover["command_groups"]["triage"].is_array()
             && discover["command_groups"]["context"].is_array()
             && discover["command_groups"]["remote"].is_array()
             && discover["command_groups"]["live"].is_array()
@@ -264,6 +314,37 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
             && discover["command_groups"]["disassembly"].is_array()
             && discover["command_groups"]["object"].is_array(),
         "discover manifest should advertise broader WinDbg command groups: {discover}"
+    );
+    ensure!(
+        discover["action_log"]["enable"].is_string()
+            && discover["command_metadata"]
+                .as_array()
+                .is_some_and(
+                    |items| items.iter().any(|item| item["command"] == "debug snapshot"
+                        && item["cost"] == "bounded_composite")
+                        && items.iter().any(|item| item["command"] == "remote doctor")
+                        && items
+                            .iter()
+                            .any(|item| item["command"] == "debug log summarize")
+                ),
+        "discover manifest should advertise the agent debug and action-log contracts: {discover}"
+    );
+    ensure!(
+        debug_capabilities["canonical_command"] == "debug capabilities"
+            && debug_capabilities["backend_matrix"]
+                .as_array()
+                .is_some_and(
+                    |items| items.iter().any(|item| item["backend"] == "ttd_cursor")
+                        && items
+                            .iter()
+                            .any(|item| item["backend"] == "dbgeng_remote_plan")
+                ),
+        "debug capabilities should expose the cross-backend matrix: {debug_capabilities}"
+    );
+    ensure!(
+        debug_schema["command"]["path"] == "debug snapshot"
+            && debug_schema["command"]["metadata"]["command"] == "debug snapshot",
+        "cli-schema should include debug snapshot metadata: {debug_schema}"
     );
     let recipe_items = discover["recipes"]
         .as_array()
@@ -302,6 +383,29 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
         "remote explain should compare DbgSrv and NTSD/CDB workflows: {remote_explain}"
     );
     ensure!(
+        remote_doctor["schema_version"] == 1
+            && remote_doctor["status"]["parsed_tcp_port"].as_u64() == Some(0)
+            && remote_doctor["diagnostics"].as_array().is_some_and(|items| items
+                .iter()
+                .any(|item| item["id"] == "remote.probe.opt_in")),
+        "remote doctor should return structured diagnostics without probing by default: {remote_doctor}"
+    );
+    ensure!(
+        remote_status["schema_version"] == 1
+            && remote_status["probe"].is_null()
+            && remote_status["diagnostics"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item["id"] == "remote.probe.opt_in")),
+        "remote status should be read-only unless --probe-connect is set: {remote_status}"
+    );
+    ensure!(
+        remote_plan["steps"].as_array().is_some_and(|items| items
+            .iter()
+            .any(|step| step["id"] == "target_start_server")
+            && items.iter().any(|step| step["id"] == "host_connect")),
+        "remote plan should generate target and host steps: {remote_plan}"
+    );
+    ensure!(
         remote_connect["command"]
             .as_array()
             .is_some_and(|items| items.iter().any(|arg| arg == "-premote")
@@ -321,6 +425,15 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
             .as_array()
             .is_some_and(|items| items.iter().any(|item| item == "sweep watch-memory")),
         "breakpoint capabilities should mention sweep watch-memory: {breakpoint_capabilities}"
+    );
+    ensure!(
+        breakpoint_plan["supported"] == true
+            && breakpoint_plan["safety"] == "mutating"
+            && breakpoint_plan["command"]
+                .as_array()
+                .is_some_and(|items| items.iter().any(|item| item == "breakpoint")
+                    && items.iter().any(|item| item == "set")),
+        "breakpoint plan should dry-run a live target code breakpoint: {breakpoint_plan}"
     );
     ensure!(
         datamodel_capabilities["gaps"]
@@ -431,6 +544,40 @@ fn local_discovery_is_complete_without_daemon() -> anyhow::Result<()> {
         );
     }
 
+    let log_path = std::env::temp_dir().join(format!(
+        "windbg-tool-action-log-test-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&log_path);
+    let _ = run_local_json_with_env(
+        &ttd,
+        [
+            ("WINDBG_TOOL_ACTION_LOG", path_string(&log_path)),
+            ("WINDBG_TOOL_ENVELOPE", "1".to_string()),
+        ],
+        ["debug".to_string(), "capabilities".to_string()],
+    )?;
+    let action_log_summary = run_local_json(
+        &ttd,
+        [
+            "debug".to_string(),
+            "log".to_string(),
+            "summarize".to_string(),
+            "--path".to_string(),
+            path_string(&log_path),
+        ],
+    )?;
+    let _ = std::fs::remove_file(&log_path);
+    ensure!(
+        action_log_summary["total_entries"].as_u64() == Some(1)
+            && action_log_summary["recent"][0]["command_path"]
+                .as_array()
+                .is_some_and(|items| items.len() == 2
+                    && items[0] == "debug"
+                    && items[1] == "capabilities"),
+        "action log summary should expose redacted command outcomes: {action_log_summary}"
+    );
+
     Ok(())
 }
 
@@ -508,6 +655,121 @@ fn ping_trace_agent_cli_scenario_uses_long_lived_daemon_session() -> anyhow::Res
     ensure!(
         capabilities["features"]["trace_info"] == true,
         "capabilities should report trace_info support: {capabilities}"
+    );
+    let debug_capabilities = run_json_vec(
+        &ttd,
+        &pipe,
+        vec![
+            "debug".to_string(),
+            "capabilities".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+        ],
+    )?;
+    ensure!(
+        debug_capabilities["canonical_command"] == "debug capabilities"
+            && debug_capabilities["selected"]["subject"]["kind"] == "ttd_cursor"
+            && debug_capabilities["selected"]["matrix"]["can_time_travel"] == true,
+        "debug capabilities should describe the selected TTD cursor: {debug_capabilities}"
+    );
+    let debug_snapshot = run_json_vec(
+        &ttd,
+        &pipe,
+        vec![
+            "debug".to_string(),
+            "snapshot".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+            "--include".to_string(),
+            "trace_info".to_string(),
+            "--include".to_string(),
+            "capabilities".to_string(),
+            "--include".to_string(),
+            "position".to_string(),
+        ],
+    )?;
+    ensure!(
+        debug_snapshot["canonical_command"] == "debug snapshot"
+            && debug_snapshot["subject"]["kind"] == "ttd_cursor"
+            && debug_snapshot["sections"]["trace_info"]["status"].is_string()
+            && debug_snapshot["sections"]["capabilities"]["status"].is_string()
+            && debug_snapshot["sections"]["position"]["status"].is_string(),
+        "debug snapshot should return sectioned TTD evidence: {debug_snapshot}"
+    );
+    let symbols_doctor = run_json_vec(
+        &ttd,
+        &pipe,
+        vec![
+            "symbols".to_string(),
+            "doctor".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+        ],
+    )?;
+    ensure!(
+        symbols_doctor["schema_version"] == 1
+            && symbols_doctor["subject"]["kind"] == "ttd_cursor"
+            && symbols_doctor["doctor"]["status"] == "ok"
+            && symbols_doctor["doctor"]["value"]["trace_info"]["ok"].is_boolean()
+            && symbols_doctor["doctor"]["diagnostics"]
+                .as_array()
+                .is_some_and(|items| items
+                    .iter()
+                    .any(|item| item["id"] == "symbols.source.follow_up")),
+        "symbols doctor should compose trace and symbol/source diagnostics: {symbols_doctor}"
+    );
+    let triage = run_json_vec(
+        &ttd,
+        &pipe,
+        vec![
+            "triage".to_string(),
+            "symbol-health".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+        ],
+    )?;
+    ensure!(
+        triage["schema_version"] == 1
+            && triage["kind"] == "symbol_health"
+            && triage["evidence"]["snapshot"]["canonical_command"] == "debug snapshot"
+            && triage["hypotheses"]
+                .as_array()
+                .is_some_and(|items| !items.is_empty()),
+        "triage symbol-health should include snapshot evidence and hypotheses: {triage}"
+    );
+    let watchpoint_plan = run_json_vec(
+        &ttd,
+        &pipe,
+        vec![
+            "breakpoint".to_string(),
+            "plan".to_string(),
+            "--session".to_string(),
+            session_id.to_string(),
+            "--cursor".to_string(),
+            cursor_id.to_string(),
+            "--address".to_string(),
+            "0x1000".to_string(),
+            "--kind".to_string(),
+            "write".to_string(),
+            "--size".to_string(),
+            "8".to_string(),
+            "--direction".to_string(),
+            "previous".to_string(),
+        ],
+    )?;
+    ensure!(
+        watchpoint_plan["supported"] == true
+            && watchpoint_plan["safety"] == "bounded_replay"
+            && watchpoint_plan["subject"]["kind"] == "ttd_cursor",
+        "breakpoint plan should dry-run TTD watchpoints: {watchpoint_plan}"
     );
 
     run_json_vec(
@@ -794,6 +1056,29 @@ fn run_local_json<const N: usize>(ttd: &PathBuf, args: [String; N]) -> anyhow::R
         .args(args)
         .output()
         .context("running local ttd CLI command")?;
+    if !output.status.success() {
+        bail!(
+            "ttd command failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parsing local ttd JSON stdout")
+}
+
+#[cfg(windows)]
+fn run_local_json_with_env<const N: usize, const M: usize>(
+    ttd: &PathBuf,
+    envs: [(&str, String); M],
+    args: [String; N],
+) -> anyhow::Result<Value> {
+    let mut command = Command::new(ttd);
+    command.args(args);
+    for (key, value) in envs {
+        command.env(key, value);
+    }
+    let output = command.output().context("running local ttd CLI command")?;
     if !output.status.success() {
         bail!(
             "ttd command failed with status {}\nstdout:\n{}\nstderr:\n{}",

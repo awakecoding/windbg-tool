@@ -1,13 +1,15 @@
 use crate::pe_symbols::{diagnose_pe, export_symbol_value, read_export_symbols, ExportSymbol};
 use anyhow::{bail, ensure, Context};
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Arg, Args, Command, CommandFactory, Parser, Subcommand, ValueEnum};
 use iced_x86::{
     Decoder, DecoderOptions, FlowControl, Formatter, Instruction, NasmFormatter, OpKind, Register,
 };
 use rmcp::{transport::stdio, ServiceExt};
 use serde_json::{json, Map, Value};
-use std::fs;
+use std::fs::{self, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use windbg_ttd::daemon::{default_pipe_name, run_daemon, DaemonClient};
 use windbg_ttd::server::TtdMcpServer;
 use windbg_ttd::tools::{self, ToolCall};
@@ -18,7 +20,7 @@ mod output;
 mod platform;
 mod remote;
 
-use output::{print_value, OutputOptions};
+use output::{classify_error, print_failure, print_value, OutputOptions};
 
 #[derive(Debug, Parser)]
 #[command(about = "WinDbg Time Travel Debugging MCP server, daemon, and CLI")]
@@ -39,6 +41,12 @@ struct Cli {
         help = "Print selected scalar values without JSON quoting"
     )]
     raw: bool,
+    #[arg(
+        long,
+        global = true,
+        help = "Wrap command results in a stable {schema_version, ok, data|error} JSON envelope"
+    )]
+    envelope: bool,
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -56,6 +64,11 @@ enum Commands {
     Recipes(RecipeArgs),
     #[command(about = "Show the JSON schema for one MCP tool without contacting the daemon")]
     Schema(SchemaArgs),
+    #[command(
+        name = "cli-schema",
+        about = "Show machine-readable CLI command and argument schemas without contacting the daemon"
+    )]
+    CliSchema(CliSchemaArgs),
     Trace {
         #[command(subcommand)]
         command: TraceCommand,
@@ -91,6 +104,14 @@ enum Commands {
     Remote {
         #[command(subcommand)]
         command: RemoteCommand,
+    },
+    Debug {
+        #[command(subcommand)]
+        command: DebugCommand,
+    },
+    Triage {
+        #[command(subcommand)]
+        command: TriageCommand,
     },
     Windbg {
         #[command(subcommand)]
@@ -274,6 +295,53 @@ enum RemoteCommand {
     ServerCommand(RemoteServerCommandArgs),
     #[command(about = "Generate a host-side WinDbg connection command")]
     ConnectCommand(RemoteConnectCommandArgs),
+    #[command(about = "Diagnose local readiness and command lines for remote debugging")]
+    Doctor(RemoteDoctorArgs),
+    #[command(about = "Show remote-debugging prerequisite status and optional reachability")]
+    Status(RemoteStatusArgs),
+    #[command(
+        about = "Generate a lifecycle plan for starting, connecting, verifying, and cleanup"
+    )]
+    Plan(RemotePlanArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum DebugCommand {
+    #[command(about = "Show canonical per-backend debugging capability matrix")]
+    Capabilities(DebugCapabilitiesArgs),
+    #[command(about = "Capture a bounded cross-backend AI-agent debugging snapshot")]
+    Snapshot(DebugSnapshotArgs),
+    #[command(about = "Read optional agent action logs")]
+    Log {
+        #[command(subcommand)]
+        command: DebugLogCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DebugLogCommand {
+    #[command(about = "Summarize recent WINDBG_TOOL_ACTION_LOG JSONL entries")]
+    Summarize(DebugLogSummarizeArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum TriageCommand {
+    #[command(about = "Triage crash evidence from a TTD cursor or daemon-owned target")]
+    Crash(TriageArgs),
+    #[command(about = "Triage hang evidence from a TTD cursor or daemon-owned target")]
+    Hang(TriageArgs),
+    #[command(about = "Triage access-violation evidence from a TTD cursor or daemon-owned target")]
+    AccessViolation(TriageArgs),
+    #[command(
+        about = "Triage memory-corruption evidence from available stack/module/memory facts"
+    )]
+    MemoryCorruption(TriageArgs),
+    #[command(about = "Triage loader and suspicious-module evidence")]
+    Loader(TriageArgs),
+    #[command(about = "Triage symbol and source readiness")]
+    SymbolHealth(TriageArgs),
+    #[command(about = "Triage deadlock evidence where backend data is available")]
+    Deadlock(TriageArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -306,6 +374,8 @@ enum SymbolsCommand {
     Exports(SymbolExportsArgs),
     #[command(about = "Find the nearest exported symbol for a TTD address")]
     Nearest(SymbolNearestArgs),
+    #[command(about = "Diagnose symbol/source readiness for a TTD cursor or daemon-owned target")]
+    Doctor(SymbolDoctorArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -340,6 +410,8 @@ enum BreakpointCommand {
     Set(BreakpointSetArgs),
     #[command(about = "Remove a breakpoint from a daemon-owned live target")]
     Remove(BreakpointRemoveArgs),
+    #[command(about = "Plan a breakpoint or watchpoint without mutating the target")]
+    Plan(BreakpointPlanArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -500,6 +572,67 @@ struct DbgEngServerArgs {
 }
 
 #[derive(Debug, Args)]
+struct RemoteDoctorArgs {
+    #[arg(long, value_enum, default_value_t = RemoteKind::Dbgsrv)]
+    kind: RemoteKind,
+    #[arg(
+        long,
+        help = "Target machine name or address for generated host commands"
+    )]
+    server: Option<String>,
+    #[arg(short = 't', long, default_value = "tcp:port=5005")]
+    transport: String,
+    #[arg(long, help = "Target process id for NTSD/CDB -server attach recipes")]
+    pid: Option<u32>,
+    #[arg(
+        long,
+        help = "Target executable or command line for NTSD/CDB -server launch recipes"
+    )]
+    executable: Option<String>,
+    #[arg(long, help = "Run an opt-in bounded TCP connect probe to --server")]
+    probe_connect: bool,
+    #[arg(long, default_value_t = 1000)]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct RemoteStatusArgs {
+    #[arg(long, value_enum, default_value_t = RemoteKind::Dbgsrv)]
+    kind: RemoteKind,
+    #[arg(
+        long,
+        help = "Target machine name or address for optional connect probe"
+    )]
+    server: Option<String>,
+    #[arg(short = 't', long, default_value = "tcp:port=5005")]
+    transport: String,
+    #[arg(long, help = "Run an opt-in bounded TCP connect probe to --server")]
+    probe_connect: bool,
+    #[arg(long, default_value_t = 1000)]
+    timeout_ms: u64,
+}
+
+#[derive(Debug, Args)]
+struct RemotePlanArgs {
+    #[arg(long, value_enum, default_value_t = RemoteKind::Dbgsrv)]
+    kind: RemoteKind,
+    #[arg(
+        long,
+        help = "Target machine name or address for generated host commands"
+    )]
+    server: Option<String>,
+    #[arg(short = 't', long, default_value = "tcp:port=5005")]
+    transport: String,
+    #[arg(long, help = "Target process id for NTSD/CDB -server attach recipes")]
+    pid: Option<u32>,
+    #[arg(
+        long,
+        help = "Target executable or command line for NTSD/CDB -server launch recipes"
+    )]
+    executable: Option<String>,
+}
+
+#[derive(Debug, Args)]
 struct LiveLaunchArgs {
     #[arg(long, help = "Full command line to launch under DbgEng")]
     command_line: String,
@@ -647,6 +780,69 @@ struct ContextSnapshotArgs {
     cursor: Option<u64>,
 }
 
+#[derive(Debug, Args, Clone)]
+struct DebugSubjectArgs {
+    #[arg(short = 's', long, help = "TTD session id")]
+    session: Option<u64>,
+    #[arg(short = 'c', long, help = "TTD cursor id")]
+    cursor: Option<u64>,
+    #[arg(
+        short = 't',
+        long = "target",
+        help = "Daemon-owned live or dump target id"
+    )]
+    target: Option<u64>,
+}
+
+#[derive(Debug, Args)]
+struct DebugCapabilitiesArgs {
+    #[command(flatten)]
+    subject: DebugSubjectArgs,
+}
+
+#[derive(Debug, Args)]
+struct DebugSnapshotArgs {
+    #[command(flatten)]
+    subject: DebugSubjectArgs,
+    #[arg(long, default_value_t = 16)]
+    max_frames: u32,
+    #[arg(long, default_value_t = 64)]
+    max_modules: usize,
+    #[arg(long, default_value_t = 64)]
+    max_threads: usize,
+    #[arg(long, default_value_t = 8)]
+    disasm_count: u32,
+    #[arg(long, default_value_t = 2000)]
+    section_timeout_ms: u64,
+    #[arg(long, help = "Only include these snapshot sections; can be repeated")]
+    include: Vec<String>,
+    #[arg(long, help = "Exclude these snapshot sections; can be repeated")]
+    exclude: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct DebugLogSummarizeArgs {
+    #[arg(
+        long,
+        help = "JSONL action log path; defaults to WINDBG_TOOL_ACTION_LOG"
+    )]
+    path: Option<PathBuf>,
+    #[arg(long, default_value_t = 20)]
+    max: usize,
+}
+
+#[derive(Debug, Args)]
+struct TriageArgs {
+    #[command(flatten)]
+    subject: DebugSubjectArgs,
+    #[arg(long, default_value_t = 16)]
+    max_frames: u32,
+    #[arg(long, default_value_t = 32)]
+    max_modules: usize,
+    #[arg(long, default_value_t = 32)]
+    max_threads: usize,
+}
+
 #[derive(Debug, Args)]
 struct SymbolDiagnoseArgs {
     #[arg(short = 's', long)]
@@ -687,6 +883,14 @@ struct SymbolNearestArgs {
         help = "Include a bounded export sample from the selected module"
     )]
     include_exports: bool,
+}
+
+#[derive(Debug, Args)]
+struct SymbolDoctorArgs {
+    #[command(flatten)]
+    subject: DebugSubjectArgs,
+    #[arg(long, help = "Optional address for nearest symbol/source checks")]
+    address: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -814,6 +1018,26 @@ struct BreakpointRemoveArgs {
 }
 
 #[derive(Debug, Args)]
+struct BreakpointPlanArgs {
+    #[command(flatten)]
+    subject: DebugSubjectArgs,
+    #[arg(long, help = "Address for the planned breakpoint/watchpoint")]
+    address: Option<String>,
+    #[arg(long, help = "Symbol expression for future symbol-breakpoint support")]
+    symbol: Option<String>,
+    #[arg(long, help = "Module constraint for the plan")]
+    module: Option<String>,
+    #[arg(long, default_value = "code", value_parser = ["code", "read", "write", "execute", "read_write"])]
+    kind: String,
+    #[arg(long)]
+    size: Option<u32>,
+    #[arg(long, value_parser = ["previous", "next"])]
+    direction: Option<String>,
+    #[arg(long)]
+    thread_unique_id: Option<u64>,
+}
+
+#[derive(Debug, Args)]
 struct DataModelEvalArgs {
     #[arg(short = 't', long = "target")]
     target: u64,
@@ -923,6 +1147,17 @@ struct CursorArgs {
 #[derive(Debug, Args)]
 struct SchemaArgs {
     tool: String,
+}
+
+#[derive(Debug, Args)]
+struct CliSchemaArgs {
+    #[arg(
+        value_name = "COMMAND",
+        num_args = 0..,
+        trailing_var_arg = true,
+        help = "Optional command path to describe, for example: memory read"
+    )]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1320,8 +1555,25 @@ struct SweepWatchMemoryArgs {
     background: bool,
 }
 
-pub async fn run() -> anyhow::Result<()> {
-    dispatch::run_cli().await
+pub async fn run() -> i32 {
+    let started = Instant::now();
+    let result = dispatch::run_cli().await;
+    let exit_code = match result {
+        Ok(()) => 0,
+        Err(error) => {
+            let output = OutputOptions::from_env_and_args();
+            let failure = classify_error(error);
+            if let Err(print_error) = print_failure(&failure, &output) {
+                eprintln!("Error: {}", failure.message);
+                eprintln!("Caused by: {print_error}");
+            }
+            failure.exit_code()
+        }
+    };
+    if let Err(error) = append_action_log(exit_code, started) {
+        eprintln!("Warning: failed to append action log: {error}");
+    }
+    exit_code
 }
 
 async fn target_capabilities_and_print(
@@ -1439,6 +1691,372 @@ async fn target_capabilities_and_print(
     )
 }
 
+async fn debug_capabilities_and_print(
+    pipe: String,
+    args: DebugCapabilitiesArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    let client = DaemonClient::new(pipe);
+    let subject = resolve_debug_subject(&args.subject, false)?;
+    let selected = match subject {
+        Some(DebugSubject::Ttd { session, cursor }) => {
+            let capabilities = call_status_value(
+                client
+                    .call_tool(session_call("ttd_capabilities", SessionArgs { session }))
+                    .await,
+            );
+            let architecture = if let Some(cursor) = cursor {
+                Some(call_status_value(
+                    architecture_state_value(
+                        &client,
+                        ArchitectureStateArgs {
+                            session,
+                            cursor,
+                            thread_id: None,
+                        },
+                    )
+                    .await,
+                ))
+            } else {
+                None
+            };
+            Some(json!({
+                "subject": debug_subject_value(&DebugSubject::Ttd { session, cursor }),
+                "capabilities": capabilities,
+                "architecture": architecture,
+                "matrix": backend_capability("ttd_cursor")
+            }))
+        }
+        Some(DebugSubject::Target { target }) => Some(json!({
+            "subject": debug_subject_value(&DebugSubject::Target { target }),
+            "status": call_status_value(client.call_tool(target_call("target_status", target)).await),
+            "matrix": backend_capability("dbgeng_target")
+        })),
+        None => None,
+    };
+    print_value(
+        json!({
+            "schema_version": 1,
+            "canonical_command": "debug capabilities",
+            "selected": selected,
+            "backend_matrix": [
+                backend_capability("ttd_cursor"),
+                backend_capability("dbgeng_live"),
+                backend_capability("dbgeng_dump"),
+                backend_capability("dbgeng_remote_plan")
+            ],
+            "safe_command_taxonomy": safe_command_taxonomy()
+        }),
+        output,
+    )
+}
+
+async fn debug_snapshot_and_print(
+    pipe: String,
+    args: DebugSnapshotArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    print_value(debug_snapshot_value(pipe, args).await?, output)
+}
+
+fn debug_log_summarize_and_print(
+    args: DebugLogSummarizeArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    print_value(debug_log_summary_value(args)?, output)
+}
+
+async fn debug_snapshot_value(pipe: String, args: DebugSnapshotArgs) -> anyhow::Result<Value> {
+    let subject = resolve_debug_subject(&args.subject, true)?
+        .context("debug snapshot requires either --target or --session plus --cursor")?;
+    match subject {
+        DebugSubject::Ttd { session, cursor } => {
+            let cursor = cursor.context("debug snapshot requires --cursor with --session")?;
+            debug_ttd_snapshot_value(pipe, session, cursor, args).await
+        }
+        DebugSubject::Target { target } => debug_target_snapshot_value(pipe, target, args).await,
+    }
+}
+
+async fn debug_ttd_snapshot_value(
+    pipe: String,
+    session: u64,
+    cursor: u64,
+    args: DebugSnapshotArgs,
+) -> anyhow::Result<Value> {
+    let legacy = context_snapshot_value(
+        pipe,
+        ContextSnapshotArgs {
+            session: Some(session),
+            cursor: Some(cursor),
+        },
+    )
+    .await?;
+    let mut sections = Map::new();
+    add_legacy_section(&mut sections, "trace_info", &legacy, "info");
+    add_legacy_section(&mut sections, "capabilities", &legacy, "debug capabilities");
+    add_legacy_section(&mut sections, "position", &legacy, "position get");
+    add_legacy_section(&mut sections, "active_threads", &legacy, "active-threads");
+    add_legacy_section(&mut sections, "stack", &legacy, "stack info");
+    add_legacy_section(
+        &mut sections,
+        "architecture_state",
+        &legacy,
+        "architecture state",
+    );
+    add_legacy_section(
+        &mut sections,
+        "current_disassembly",
+        &legacy,
+        "disasm --session <id> --cursor <id>",
+    );
+    add_legacy_section(&mut sections, "nearest_symbol", &legacy, "symbols nearest");
+    add_legacy_section(&mut sections, "command_line", &legacy, "command-line");
+    add_legacy_section(
+        &mut sections,
+        "timeline_summary",
+        &legacy,
+        "timeline events",
+    );
+    filter_sections(&mut sections, &args.include, &args.exclude);
+    Ok(json!({
+        "schema_version": 1,
+        "canonical_command": "debug snapshot",
+        "subject": debug_subject_value(&DebugSubject::Ttd { session, cursor: Some(cursor) }),
+        "stability": "replayable_cursor",
+        "section_timeout_ms": args.section_timeout_ms,
+        "sections": sections,
+        "diagnostics": [],
+        "next_recommended_safe_commands": [
+            format!("windbg-tool debug capabilities --session {session} --cursor {cursor}"),
+            format!("windbg-tool timeline events --session {session}"),
+            format!("windbg-tool stack backtrace --session {session} --cursor {cursor}")
+        ],
+        "legacy_snapshot": legacy
+    }))
+}
+
+async fn debug_target_snapshot_value(
+    pipe: String,
+    target: u64,
+    args: DebugSnapshotArgs,
+) -> anyhow::Result<Value> {
+    let client = DaemonClient::new(pipe);
+    let mut sections = Map::new();
+    let subject = DebugSubject::Target { target };
+    if snapshot_section_enabled(&args, "status") {
+        let started = Instant::now();
+        sections.insert(
+            "status".to_string(),
+            composite_section(
+                started,
+                call_status_value(client.call_tool(target_call("target_status", target)).await),
+                Some("target status --target <id>"),
+                None,
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "capabilities") {
+        sections.insert(
+            "capabilities".to_string(),
+            json!({
+                "status": "ok",
+                "duration_ms": 0,
+                "truncated": false,
+                "value": backend_capability("dbgeng_target"),
+                "diagnostics": [],
+                "command": "debug capabilities --target <id>"
+            }),
+        );
+    }
+    if snapshot_section_enabled(&args, "registers") {
+        let started = Instant::now();
+        sections.insert(
+            "registers".to_string(),
+            composite_section(
+                started,
+                call_status_value(
+                    client
+                        .call_tool(target_call("target_core_registers", target))
+                        .await,
+                ),
+                Some("target registers --target <id>"),
+                None,
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "threads") {
+        let started = Instant::now();
+        sections.insert(
+            "threads".to_string(),
+            composite_section(
+                started,
+                call_status_value(
+                    client
+                        .call_tool(target_call("target_list_threads", target))
+                        .await,
+                ),
+                Some("target threads --target <id>"),
+                Some(args.max_threads),
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "modules") {
+        let started = Instant::now();
+        sections.insert(
+            "modules".to_string(),
+            composite_section(
+                started,
+                call_status_value(
+                    client
+                        .call_tool(target_call("target_list_modules", target))
+                        .await,
+                ),
+                Some("target modules --target <id>"),
+                Some(args.max_modules),
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "stack") {
+        let started = Instant::now();
+        sections.insert(
+            "stack".to_string(),
+            composite_section(
+                started,
+                call_status_value(
+                    client
+                        .call_tool(target_stack_call(TargetStackTraceArgs {
+                            target,
+                            max_frames: args.max_frames,
+                        }))
+                        .await,
+                ),
+                Some("target stack --target <id>"),
+                Some(args.max_frames as usize),
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "disassembly") {
+        let started = Instant::now();
+        sections.insert(
+            "disassembly".to_string(),
+            composite_section(
+                started,
+                call_status_value(
+                    client
+                        .call_tool(target_disasm_call(TargetDisasmArgs {
+                            target,
+                            address: None,
+                            count: args.disasm_count,
+                        })?)
+                        .await,
+                ),
+                Some("target disasm --target <id>"),
+                Some(args.disasm_count as usize),
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "breakpoints") {
+        let started = Instant::now();
+        sections.insert(
+            "breakpoints".to_string(),
+            composite_section(
+                started,
+                call_status_value(
+                    client
+                        .call_tool(target_call("target_list_breakpoints", target))
+                        .await,
+                ),
+                Some("breakpoint list --target <id>"),
+                None,
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "symbol_source") {
+        sections.insert(
+            "symbol_source".to_string(),
+            symbol_source_doctor_value(&client, &subject, None).await,
+        );
+    }
+    Ok(json!({
+        "schema_version": 1,
+        "canonical_command": "debug snapshot",
+        "subject": debug_subject_value(&subject),
+        "stability": "stopped_or_best_effort_live_state",
+        "section_timeout_ms": args.section_timeout_ms,
+        "sections": sections,
+        "diagnostics": [
+            diagnostic_item(
+                "debug.snapshot.live_consistency",
+                "info",
+                "Live target sections are best-effort.",
+                "If another actor continues or steps the target while the snapshot is collected, sections may describe adjacent target states.",
+                "high",
+                None,
+            )
+        ],
+        "next_recommended_safe_commands": [
+            format!("windbg-tool debug capabilities --target {target}"),
+            format!("windbg-tool target stack --target {target}"),
+            format!("windbg-tool breakpoint plan --target {target} --address <addr>")
+        ]
+    }))
+}
+
+async fn symbols_doctor_and_print(
+    pipe: String,
+    args: SymbolDoctorArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    let client = DaemonClient::new(pipe);
+    let subject = resolve_debug_subject(&args.subject, true)?
+        .context("symbols doctor requires either --target or --session plus --cursor")?;
+    let address = args
+        .address
+        .as_deref()
+        .map(parse_u64_argument)
+        .transpose()?;
+    print_value(
+        json!({
+            "schema_version": 1,
+            "subject": debug_subject_value(&subject),
+            "doctor": symbol_source_doctor_value(&client, &subject, address).await
+        }),
+        output,
+    )
+}
+
+async fn triage_and_print(
+    pipe: String,
+    kind: &'static str,
+    args: TriageArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    let snapshot = debug_snapshot_value(
+        pipe,
+        DebugSnapshotArgs {
+            subject: args.subject,
+            max_frames: args.max_frames,
+            max_modules: args.max_modules,
+            max_threads: args.max_threads,
+            disasm_count: 8,
+            section_timeout_ms: 2000,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        },
+    )
+    .await?;
+    print_value(triage_value(kind, snapshot), output)
+}
+
+async fn breakpoint_plan_and_print(
+    _pipe: String,
+    args: BreakpointPlanArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    print_value(breakpoint_plan_value(args)?, output)
+}
+
 async fn run_mcp_stdio() -> anyhow::Result<()> {
     let server = TtdMcpServer::default();
     let service = server
@@ -1515,6 +2133,10 @@ async fn context_snapshot_and_print(
     args: ContextSnapshotArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
+    print_value(context_snapshot_value(pipe, args).await?, output)
+}
+
+async fn context_snapshot_value(pipe: String, args: ContextSnapshotArgs) -> anyhow::Result<Value> {
     let client = DaemonClient::new(pipe.clone());
     let sessions = client.sessions().await?;
     let selected = select_snapshot_handles(&sessions, args)?;
@@ -1630,7 +2252,7 @@ async fn context_snapshot_and_print(
         );
     }
 
-    print_value(snapshot, output)
+    Ok(snapshot)
 }
 
 async fn symbols_diagnose_and_print(
@@ -1766,6 +2388,8 @@ fn symbols_exports_and_print(
             "total_exports": exports.len(),
             "filtered_exports": filtered.len(),
             "max": args.max,
+            "returned": values.len(),
+            "limit": args.max,
             "truncated": filtered.len() > args.max,
             "exports": values,
         }),
@@ -2562,6 +3186,709 @@ fn call_status_value(result: anyhow::Result<Value>) -> Value {
     }
 }
 
+#[derive(Debug, Clone)]
+enum DebugSubject {
+    Ttd { session: u64, cursor: Option<u64> },
+    Target { target: u64 },
+}
+
+fn resolve_debug_subject(
+    args: &DebugSubjectArgs,
+    require_cursor: bool,
+) -> anyhow::Result<Option<DebugSubject>> {
+    if args.target.is_some() && (args.session.is_some() || args.cursor.is_some()) {
+        bail!("choose either --target or --session/--cursor, not both");
+    }
+    if let Some(target) = args.target {
+        return Ok(Some(DebugSubject::Target { target }));
+    }
+    match (args.session, args.cursor) {
+        (Some(session), Some(cursor)) => Ok(Some(DebugSubject::Ttd {
+            session,
+            cursor: Some(cursor),
+        })),
+        (Some(session), None) if !require_cursor => Ok(Some(DebugSubject::Ttd {
+            session,
+            cursor: None,
+        })),
+        (Some(_), None) => bail!("--cursor is required with --session for this command"),
+        (None, Some(_)) => bail!("--session is required with --cursor"),
+        (None, None) => Ok(None),
+    }
+}
+
+fn debug_subject_value(subject: &DebugSubject) -> Value {
+    match subject {
+        DebugSubject::Ttd { session, cursor } => json!({
+            "kind": if cursor.is_some() { "ttd_cursor" } else { "ttd_session" },
+            "backend": "ttd_replay",
+            "ids": {
+                "session_id": session,
+                "cursor_id": cursor
+            },
+            "stability": "replayable"
+        }),
+        DebugSubject::Target { target } => json!({
+            "kind": "target",
+            "backend": "dbgeng_target",
+            "ids": {
+                "target_id": target
+            },
+            "stability": "target_state"
+        }),
+    }
+}
+
+pub(super) fn fix_item(
+    description: impl Into<String>,
+    command: Option<impl Into<String>>,
+) -> Value {
+    json!({
+        "description": description.into(),
+        "command": command.map(Into::into)
+    })
+}
+
+pub(super) fn diagnostic_item(
+    id: impl Into<String>,
+    severity: impl Into<String>,
+    summary: impl Into<String>,
+    detail: impl Into<String>,
+    confidence: impl Into<String>,
+    fix: Option<Value>,
+) -> Value {
+    json!({
+        "id": id.into(),
+        "severity": severity.into(),
+        "summary": summary.into(),
+        "detail": detail.into(),
+        "confidence": confidence.into(),
+        "fix": fix
+    })
+}
+
+fn composite_section(
+    started: Instant,
+    result: Value,
+    command: Option<&str>,
+    limit: Option<usize>,
+) -> Value {
+    let ok = result["ok"].as_bool().unwrap_or(false);
+    let value = result.get("value").cloned().unwrap_or(Value::Null);
+    let returned = estimate_returned(&value);
+    let diagnostics = if ok {
+        Vec::new()
+    } else {
+        vec![diagnostic_item(
+            "debug.section.error",
+            "warning",
+            "Snapshot section failed.",
+            result["error"].as_str().unwrap_or("unknown error"),
+            "high",
+            None,
+        )]
+    };
+    json!({
+        "status": if ok { "ok" } else { "error" },
+        "duration_ms": started.elapsed().as_millis(),
+        "truncated": limit.zip(returned).is_some_and(|(limit, returned)| returned >= limit),
+        "returned": returned,
+        "limit": limit,
+        "value": if ok { value } else { Value::Null },
+        "error": if ok { Value::Null } else { result["error"].clone() },
+        "diagnostics": diagnostics,
+        "command": command
+    })
+}
+
+fn add_legacy_section(
+    sections: &mut Map<String, Value>,
+    name: &str,
+    legacy: &Value,
+    command: &str,
+) {
+    if let Some(value) = legacy.get(name) {
+        let ok = value["ok"].as_bool().unwrap_or(!value.is_null());
+        sections.insert(
+            name.to_string(),
+            json!({
+                "status": if ok { "ok" } else { "error" },
+                "duration_ms": Value::Null,
+                "truncated": value["value"]["truncated"].as_bool().unwrap_or(false),
+                "returned": estimate_returned(value.get("value").unwrap_or(value)),
+                "limit": Value::Null,
+                "value": value.get("value").cloned().unwrap_or_else(|| value.clone()),
+                "error": if ok { Value::Null } else { value["error"].clone() },
+                "diagnostics": [],
+                "command": command
+            }),
+        );
+    }
+}
+
+fn estimate_returned(value: &Value) -> Option<usize> {
+    if let Some(returned) = value.get("returned").and_then(Value::as_u64) {
+        return Some(returned as usize);
+    }
+    if let Some(array) = value.as_array() {
+        return Some(array.len());
+    }
+    if let Some(object) = value.as_object() {
+        for key in [
+            "frames",
+            "modules",
+            "threads",
+            "breakpoints",
+            "events",
+            "instructions",
+            "exports",
+            "strings",
+        ] {
+            if let Some(array) = object.get(key).and_then(Value::as_array) {
+                return Some(array.len());
+            }
+        }
+    }
+    None
+}
+
+fn snapshot_section_enabled(args: &DebugSnapshotArgs, name: &str) -> bool {
+    (args.include.is_empty() || args.include.iter().any(|item| item == name))
+        && !args.exclude.iter().any(|item| item == name)
+}
+
+fn filter_sections(sections: &mut Map<String, Value>, include: &[String], exclude: &[String]) {
+    if !include.is_empty() {
+        sections.retain(|name, _| include.iter().any(|item| item == name));
+    }
+    if !exclude.is_empty() {
+        sections.retain(|name, _| !exclude.iter().any(|item| item == name));
+    }
+}
+
+fn backend_capability(kind: &str) -> Value {
+    match kind {
+        "ttd_cursor" => json!({
+            "backend": "ttd_cursor",
+            "can_read_memory": true,
+            "can_disassemble": true,
+            "can_stack": true,
+            "can_query_symbols": true,
+            "can_query_source": true,
+            "can_step": true,
+            "can_continue": false,
+            "can_set_breakpoint": false,
+            "can_set_data_breakpoint": true,
+            "can_write_dump": false,
+            "can_time_travel": true,
+            "supports_jobs": true,
+            "supports_timeline": true,
+            "required_identifiers": ["session_id", "cursor_id"],
+            "safe_commands": ["debug snapshot", "timeline events", "memory read", "stack backtrace", "symbols nearest"],
+            "mutating_commands": ["position set", "step"],
+            "destructive_commands": ["close"],
+            "unsupported_operations": [
+                { "operation": "live_continue", "reason": "TTD cursors replay; they do not continue a live process." }
+            ]
+        }),
+        "dbgeng_live" | "dbgeng_target" => json!({
+            "backend": "dbgeng_live",
+            "can_read_memory": true,
+            "can_disassemble": true,
+            "can_stack": true,
+            "can_query_symbols": true,
+            "can_query_source": true,
+            "can_step": true,
+            "can_continue": true,
+            "can_set_breakpoint": true,
+            "can_set_data_breakpoint": false,
+            "can_write_dump": true,
+            "can_time_travel": false,
+            "supports_jobs": false,
+            "supports_timeline": false,
+            "required_identifiers": ["target_id"],
+            "safe_commands": ["debug snapshot", "target status", "target stack", "target disasm", "breakpoint plan"],
+            "mutating_commands": ["target continue", "target step", "breakpoint set", "target dump"],
+            "destructive_commands": ["target terminate", "target close"],
+            "unsupported_operations": [
+                { "operation": "time_travel", "reason": "Live DbgEng targets are not TTD replay cursors." }
+            ]
+        }),
+        "dbgeng_dump" => json!({
+            "backend": "dbgeng_dump",
+            "can_read_memory": true,
+            "can_disassemble": true,
+            "can_stack": true,
+            "can_query_symbols": true,
+            "can_query_source": true,
+            "can_step": false,
+            "can_continue": false,
+            "can_set_breakpoint": false,
+            "can_set_data_breakpoint": false,
+            "can_write_dump": false,
+            "can_time_travel": false,
+            "supports_jobs": false,
+            "supports_timeline": false,
+            "required_identifiers": ["target_id"],
+            "safe_commands": ["debug snapshot", "target status", "target stack", "target disasm"],
+            "mutating_commands": [],
+            "destructive_commands": ["target close"],
+            "unsupported_operations": [
+                { "operation": "execution_control", "reason": "Dump targets are immutable snapshots." }
+            ]
+        }),
+        "dbgeng_remote_plan" => json!({
+            "backend": "dbgeng_remote_plan",
+            "can_read_memory": false,
+            "can_disassemble": false,
+            "can_stack": false,
+            "can_query_symbols": false,
+            "can_query_source": false,
+            "can_step": false,
+            "can_continue": false,
+            "can_set_breakpoint": false,
+            "can_set_data_breakpoint": false,
+            "can_write_dump": false,
+            "can_time_travel": false,
+            "supports_jobs": false,
+            "supports_timeline": false,
+            "required_identifiers": ["transport"],
+            "safe_commands": ["remote doctor", "remote status", "remote plan", "remote server-command", "remote connect-command"],
+            "mutating_commands": [],
+            "destructive_commands": [],
+            "unsupported_operations": [
+                { "operation": "debugger_actions", "reason": "Remote plan commands generate connection instructions; attach/launch happens after connecting." }
+            ]
+        }),
+        _ => json!({ "backend": kind, "status": "unknown" }),
+    }
+}
+
+fn safe_command_taxonomy() -> Value {
+    json!({
+        "safe": "Read-only commands that inspect local state, debugger state, or generate command lines.",
+        "mutating": "Commands that alter cursor position, target execution, breakpoints, or write dumps.",
+        "destructive": "Commands that terminate, close, cancel, or otherwise end target/debugger resources."
+    })
+}
+
+async fn symbol_source_doctor_value(
+    client: &DaemonClient,
+    subject: &DebugSubject,
+    address: Option<u64>,
+) -> Value {
+    match subject {
+        DebugSubject::Ttd { session, cursor } => {
+            let nearest = if let (Some(cursor), Some(address)) = (cursor, address) {
+                call_status_value(
+                    nearest_symbol_value(
+                        client,
+                        &SymbolNearestArgs {
+                            session: *session,
+                            cursor: *cursor,
+                            address: format!("0x{address:X}"),
+                            include_exports: false,
+                        },
+                    )
+                    .await,
+                )
+            } else {
+                json!({
+                    "ok": false,
+                    "error": "Pass --cursor and --address for nearest-symbol/source quality checks."
+                })
+            };
+            json!({
+                "status": "ok",
+                "duration_ms": Value::Null,
+                "truncated": false,
+                "value": {
+                    "trace_info": call_status_value(client.call_tool(session_call("ttd_trace_info", SessionArgs { session: *session })).await),
+                    "nearest_symbol": nearest
+                },
+                "diagnostics": [
+                    diagnostic_item(
+                        "symbols.source.follow_up",
+                        "info",
+                        "Use focused symbol/source commands for deeper diagnosis.",
+                        "This doctor composes currently available trace and nearest-symbol checks.",
+                        "high",
+                        Some(fix_item(
+                            "Run symbols diagnose or symbols nearest with the current address.",
+                            Some("windbg-tool symbols diagnose --session <id>")
+                        ))
+                    )
+                ],
+                "command": "symbols doctor"
+            })
+        }
+        DebugSubject::Target { target } => {
+            let symbol = if let Some(address) = address {
+                call_status_value(
+                    client
+                        .call_tool(
+                            target_address_call(
+                                "target_symbol_by_offset",
+                                TargetAddressArgs {
+                                    target: *target,
+                                    address: format!("0x{address:X}"),
+                                },
+                            )
+                            .expect("address was formatted as hex"),
+                        )
+                        .await,
+                )
+            } else {
+                json!({ "ok": false, "error": "Pass --address for target symbol/source checks." })
+            };
+            let source = if let Some(address) = address {
+                call_status_value(
+                    client
+                        .call_tool(
+                            target_address_call(
+                                "target_source_by_offset",
+                                TargetAddressArgs {
+                                    target: *target,
+                                    address: format!("0x{address:X}"),
+                                },
+                            )
+                            .expect("address was formatted as hex"),
+                        )
+                        .await,
+                )
+            } else {
+                json!({ "ok": false, "error": "Pass --address for target source checks." })
+            };
+            json!({
+                "status": "ok",
+                "duration_ms": Value::Null,
+                "truncated": false,
+                "value": {
+                    "symbol": symbol,
+                    "source": source
+                },
+                "diagnostics": [
+                    diagnostic_item(
+                        "symbols.source.address_optional",
+                        "info",
+                        "Current-PC symbol/source checks need an address when registers do not expose one.",
+                        "Pass --address or use debug snapshot disassembly to identify a program counter.",
+                        "medium",
+                        Some(fix_item(
+                            "Run target registers or target disasm, then pass --address.",
+                            Some("windbg-tool symbols doctor --target <id> --address <pc>")
+                        ))
+                    )
+                ],
+                "command": "symbols doctor"
+            })
+        }
+    }
+}
+
+fn triage_value(kind: &'static str, snapshot: Value) -> Value {
+    let mut hypotheses = Vec::new();
+    let diagnostics = snapshot["diagnostics"].clone();
+    match kind {
+        "symbol_health" => hypotheses.push(json!({
+            "id": "symbol_health.requires_review",
+            "confidence": "medium",
+            "summary": "Review symbol_source and nearest_symbol evidence before trusting names or source paths.",
+            "supporting_sections": ["symbol_source", "nearest_symbol"]
+        })),
+        "loader" => hypotheses.push(json!({
+            "id": "loader.module_review",
+            "confidence": "medium",
+            "summary": "Review module paths, duplicate module names, and recently loaded modules for loader anomalies.",
+            "supporting_sections": ["modules", "timeline_summary"]
+        })),
+        "deadlock" | "hang" => hypotheses.push(json!({
+            "id": "hang.stack_threads_review",
+            "confidence": "low",
+            "summary": "Thread and stack evidence can identify waits, but this command does not yet prove lock ownership.",
+            "supporting_sections": ["threads", "stack"]
+        })),
+        "access_violation" | "crash" => hypotheses.push(json!({
+            "id": "crash.exception_stack_review",
+            "confidence": "medium",
+            "summary": "Inspect exception/timeline, current disassembly, stack, and symbol quality before assigning root cause.",
+            "supporting_sections": ["timeline_summary", "current_disassembly", "stack", "symbol_source"]
+        })),
+        "memory_corruption" => hypotheses.push(json!({
+            "id": "memory_corruption.needs_watchpoint",
+            "confidence": "low",
+            "summary": "Snapshot evidence can identify suspicious pointers or stacks; use watchpoint planning before replaying or mutating.",
+            "supporting_sections": ["stack", "modules", "disassembly"]
+        })),
+        _ => {}
+    }
+    json!({
+        "schema_version": 1,
+        "kind": kind,
+        "evidence": {
+            "snapshot": snapshot
+        },
+        "hypotheses": hypotheses,
+        "diagnostics": diagnostics,
+        "next_actions": [
+            { "safety": "safe", "command": "windbg-tool debug snapshot", "reason": "Refresh bounded evidence." },
+            { "safety": "safe", "command": "windbg-tool symbols doctor", "reason": "Validate symbol/source quality." },
+            { "safety": "safe", "command": "windbg-tool breakpoint plan", "reason": "Plan breakpoints/watchpoints before mutating the target." }
+        ],
+        "limitations": [
+            "Triage commands report evidence and hypotheses, not final root-cause verdicts.",
+            "Backend support varies; inspect debug capabilities for unsupported operations."
+        ]
+    })
+}
+
+fn breakpoint_plan_value(args: BreakpointPlanArgs) -> anyhow::Result<Value> {
+    let subject = resolve_debug_subject(&args.subject, false)?
+        .context("breakpoint plan requires --target or --session/--cursor")?;
+    if args.address.is_none() && args.symbol.is_none() {
+        bail!("breakpoint plan requires --address or --symbol");
+    }
+    let address = args
+        .address
+        .as_deref()
+        .map(parse_u64_argument)
+        .transpose()?;
+    let kind = args.kind.as_str();
+    let subject_value = debug_subject_value(&subject);
+    let (supported, command, reason, safety) = match (&subject, kind) {
+        (DebugSubject::Target { target }, "code") => (
+            args.address.is_some(),
+            json!(["windbg-tool", "breakpoint", "set", "--target", target, "--address", args.address.clone().unwrap_or_else(|| "<address>".to_string())]),
+            if args.symbol.is_some() {
+                "Symbol breakpoint setting is not first-class yet; resolve the symbol to an address first."
+            } else {
+                "DbgEng live targets support code breakpoints by address."
+            },
+            "mutating",
+        ),
+        (DebugSubject::Target { .. }, _) => (
+            false,
+            Value::Null,
+            "Data watchpoints are not currently exposed for daemon-owned live targets.",
+            "unsupported",
+        ),
+        (DebugSubject::Ttd { session, cursor }, "write" | "read" | "read_write") => (
+            args.address.is_some() && cursor.is_some(),
+            json!(["windbg-tool", "replay", "watch-memory", "--session", session, "--cursor", cursor, "--address", args.address.clone().unwrap_or_else(|| "<address>".to_string()), "--size", args.size.unwrap_or(1), "--access", kind, "--direction", args.direction.clone().unwrap_or_else(|| "previous".to_string())]),
+            "TTD memory watchpoints replay to the next or previous matching access.",
+            "bounded_replay",
+        ),
+        (DebugSubject::Ttd { .. }, "code" | "execute") => (
+            false,
+            Value::Null,
+            "TTD code breakpoints are not exposed as persistent breakpoints; use position/disassembly/replay commands instead.",
+            "unsupported",
+        ),
+        _ => (
+            false,
+            Value::Null,
+            "Requested breakpoint/watchpoint kind is not supported on this subject.",
+            "unsupported",
+        ),
+    };
+    Ok(json!({
+        "schema_version": 1,
+        "subject": subject_value,
+        "request": {
+            "address": address.map(|value| format!("0x{value:X}")),
+            "symbol": args.symbol,
+            "module": args.module,
+            "kind": kind,
+            "size": args.size,
+            "direction": args.direction,
+            "thread_unique_id": args.thread_unique_id
+        },
+        "supported": supported,
+        "safety": safety,
+        "reason": reason,
+        "command": command,
+        "diagnostics": if supported {
+            Vec::<Value>::new()
+        } else {
+            vec![diagnostic_item(
+                "breakpoint.plan.unsupported",
+                "warning",
+                "Requested plan is not directly supported.",
+                reason,
+                "high",
+                None,
+            )]
+        }
+    }))
+}
+
+fn action_log_path_from_env() -> Option<PathBuf> {
+    std::env::var_os("WINDBG_TOOL_ACTION_LOG")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn append_action_log(exit_code: i32, started: Instant) -> anyhow::Result<()> {
+    let Some(path) = action_log_path_from_env() else {
+        return Ok(());
+    };
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating action log directory {}", parent.display()))?;
+    }
+    let full_args = std::env::var_os("WINDBG_TOOL_ACTION_LOG_FULL").is_some();
+    let entry = json!({
+        "schema_version": 1,
+        "timestamp_unix_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis(),
+        "command_path": command_path_from_args(std::env::args().skip(1)),
+        "args": if full_args {
+            std::env::args().skip(1).collect::<Vec<_>>()
+        } else {
+            Vec::<String>::new()
+        },
+        "args_redacted": !full_args,
+        "ok": exit_code == 0,
+        "exit_code": exit_code,
+        "duration_ms": started.elapsed().as_millis()
+    });
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+        .with_context(|| format!("opening action log {}", path.display()))?;
+    writeln!(file, "{}", serde_json::to_string(&entry)?)
+        .with_context(|| format!("writing action log {}", path.display()))
+}
+
+fn command_path_from_args(args: impl IntoIterator<Item = String>) -> Vec<String> {
+    let mut path = Vec::new();
+    let mut skip_next = false;
+    for arg in args {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+        if arg == "--" {
+            break;
+        }
+        if arg.starts_with("--") {
+            if !path.is_empty() {
+                break;
+            }
+            if !arg.contains('=') && option_takes_value(&arg) {
+                skip_next = true;
+            }
+            continue;
+        }
+        if arg.starts_with('-') {
+            if !path.is_empty() {
+                break;
+            }
+            continue;
+        }
+        path.push(arg);
+        if path.len() >= expected_command_path_depth(&path) {
+            break;
+        }
+    }
+    path
+}
+
+fn expected_command_path_depth(path: &[String]) -> usize {
+    match path {
+        [] => 1,
+        [command] if command_requires_subcommand(command) => 2,
+        [command, subcommand] if command == "debug" && subcommand == "log" => 3,
+        [command, ..] if command_requires_subcommand(command) => 2,
+        _ => 1,
+    }
+}
+
+fn command_requires_subcommand(command: &str) -> bool {
+    matches!(
+        command,
+        "trace"
+            | "daemon"
+            | "dbgeng"
+            | "live"
+            | "dump"
+            | "remote"
+            | "debug"
+            | "triage"
+            | "windbg"
+            | "context"
+            | "symbols"
+            | "source"
+            | "architecture"
+            | "arch"
+            | "index"
+            | "events"
+            | "timeline"
+            | "module"
+            | "cursor"
+            | "position"
+            | "replay"
+            | "sweep"
+            | "job"
+            | "breakpoint"
+            | "datamodel"
+            | "target"
+            | "stack"
+            | "memory"
+            | "object"
+    )
+}
+
+fn option_takes_value(arg: &str) -> bool {
+    !matches!(
+        arg,
+        "--compact" | "--raw" | "--envelope" | "--probe-connect" | "--background" | "--overwrite"
+    )
+}
+
+fn debug_log_summary_value(args: DebugLogSummarizeArgs) -> anyhow::Result<Value> {
+    let path = args
+        .path
+        .or_else(action_log_path_from_env)
+        .context("debug log summarize requires --path or WINDBG_TOOL_ACTION_LOG")?;
+    let file =
+        fs::File::open(&path).with_context(|| format!("opening action log {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut entries = Vec::new();
+    let mut malformed = 0_usize;
+    for line in reader.lines() {
+        let line = line.with_context(|| format!("reading action log {}", path.display()))?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match serde_json::from_str::<Value>(&line) {
+            Ok(value) => entries.push(value),
+            Err(_) => malformed += 1,
+        }
+    }
+    let total = entries.len();
+    let failed = entries
+        .iter()
+        .filter(|entry| !entry["ok"].as_bool().unwrap_or(false))
+        .count();
+    let mut recent = entries.into_iter().rev().take(args.max).collect::<Vec<_>>();
+    recent.reverse();
+    Ok(json!({
+        "schema_version": 1,
+        "path": path,
+        "total_entries": total,
+        "malformed_entries": malformed,
+        "failed_entries": failed,
+        "returned": recent.len(),
+        "limit": args.max,
+        "truncated": total > recent.len(),
+        "recent": recent
+    }))
+}
+
 async fn call_and_print(
     pipe: String,
     call: ToolCall,
@@ -2685,6 +4012,195 @@ fn tool_schema(name: &str) -> anyhow::Result<Value> {
         .with_context(|| format!("unknown MCP tool: {name}"))
 }
 
+fn cli_schema(args: CliSchemaArgs) -> anyhow::Result<Value> {
+    let command = Cli::command();
+    let metadata = command_metadata();
+    if args.command.is_empty() {
+        let mut commands = Vec::new();
+        collect_leaf_command_schemas(&command, Vec::new(), &metadata, &mut commands);
+        let documented = metadata
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item["command"].as_str())
+                    .count()
+            })
+            .unwrap_or_default();
+        Ok(json!({
+            "schema_version": 1,
+            "binary": command.get_name(),
+            "commands": commands,
+            "metadata_coverage": {
+                "leaf_commands": commands.len(),
+                "documented_commands": documented
+            }
+        }))
+    } else {
+        let (selected, path) = resolve_command_path(&command, &args.command)?;
+        Ok(json!({
+            "schema_version": 1,
+            "binary": command.get_name(),
+            "command": command_schema(selected, &path, &metadata)
+        }))
+    }
+}
+
+fn collect_leaf_command_schemas(
+    command: &Command,
+    prefix: Vec<String>,
+    metadata: &Value,
+    commands: &mut Vec<Value>,
+) {
+    for subcommand in command.get_subcommands() {
+        let mut path = prefix.clone();
+        path.push(subcommand.get_name().to_string());
+        if subcommand.has_subcommands() {
+            collect_leaf_command_schemas(subcommand, path, metadata, commands);
+        } else {
+            commands.push(command_schema(subcommand, &path, metadata));
+        }
+    }
+}
+
+fn resolve_command_path<'a>(
+    command: &'a Command,
+    path: &[String],
+) -> anyhow::Result<(&'a Command, Vec<String>)> {
+    let mut current = command;
+    let mut canonical = Vec::new();
+    for segment in path {
+        let next = current
+            .get_subcommands()
+            .find(|subcommand| {
+                subcommand.get_name() == segment
+                    || subcommand.get_all_aliases().any(|alias| alias == segment)
+            })
+            .with_context(|| format!("unknown CLI command path: {}", path.join(" ")))?;
+        canonical.push(next.get_name().to_string());
+        current = next;
+    }
+    Ok((current, canonical))
+}
+
+fn command_schema(command: &Command, path: &[String], metadata: &Value) -> Value {
+    let path_string = path.join(" ");
+    json!({
+        "path": path_string,
+        "aliases": command.get_visible_aliases().collect::<Vec<_>>(),
+        "about": command.get_about().map(ToString::to_string),
+        "long_about": command.get_long_about().map(ToString::to_string),
+        "arguments": command
+            .get_arguments()
+            .filter(|arg| !arg.is_hide_set())
+            .map(|arg| argument_schema(command, arg))
+            .collect::<Vec<_>>(),
+        "subcommands": command
+            .get_subcommands()
+            .map(|subcommand| subcommand.get_name())
+            .collect::<Vec<_>>(),
+        "metadata": command_metadata_for(metadata, &path_string)
+            .unwrap_or_else(|| inferred_command_metadata(command, path))
+    })
+}
+
+fn argument_schema(command: &Command, arg: &Arg) -> Value {
+    let possible_values = arg
+        .get_possible_values()
+        .into_iter()
+        .filter(|value| !value.is_hide_set())
+        .map(|value| {
+            json!({
+                "name": value.get_name(),
+                "help": value.get_help().map(ToString::to_string),
+                "aliases": value.get_name_and_aliases().skip(1).collect::<Vec<_>>()
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "id": arg.get_id().as_str(),
+        "kind": if arg.is_positional() { "positional" } else if arg.get_long().is_some() || arg.get_short().is_some() { "option_or_flag" } else { "internal" },
+        "long": arg.get_long(),
+        "short": arg.get_short().map(|value| value.to_string()),
+        "aliases": arg.get_aliases().unwrap_or_default(),
+        "help": arg.get_help().map(ToString::to_string),
+        "required": arg.is_required_set(),
+        "global": arg.is_global_set(),
+        "action": format!("{:?}", arg.get_action()),
+        "num_args": arg.get_num_args().map(|range| format!("{range:?}")),
+        "value_names": arg
+            .get_value_names()
+            .map(|names| names.iter().map(ToString::to_string).collect::<Vec<_>>())
+            .unwrap_or_default(),
+        "default_values": arg
+            .get_default_values()
+            .iter()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>(),
+        "possible_values": possible_values,
+        "conflicts_with": command
+            .get_arg_conflicts_with(arg)
+            .into_iter()
+            .map(|arg| arg.get_id().as_str())
+            .collect::<Vec<_>>()
+    })
+}
+
+fn command_metadata_for(metadata: &Value, path: &str) -> Option<Value> {
+    metadata
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["command"].as_str() == Some(path))
+        })
+        .cloned()
+}
+
+fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
+    let path_string = path.join(" ");
+    let first = path.first().map(String::as_str).unwrap_or_default();
+    let no_daemon = matches!(
+        first,
+        "discover" | "cli-schema" | "recipes" | "schema" | "tools" | "remote" | "source"
+    ) || matches!(
+        path_string.as_str(),
+        "symbols inspect"
+            | "symbols exports"
+            | "dbgeng server"
+            | "dbgsrv"
+            | "windbg status"
+            | "windbg install"
+            | "windbg update"
+            | "windbg path"
+            | "windbg run"
+            | "dump inspect"
+            | "dump create"
+            | "live capabilities"
+            | "live launch"
+            | "breakpoint capabilities"
+            | "datamodel capabilities"
+    );
+    let has_session = command.get_arguments().any(|arg| arg.get_id() == "session");
+    let has_cursor = command.get_arguments().any(|arg| arg.get_id() == "cursor");
+    json!({
+        "command": path_string,
+        "requires_daemon": !no_daemon,
+        "requires_native_ttd": has_session || has_cursor,
+        "session_required": has_session,
+        "cursor_required": has_cursor,
+        "cost": if has_session || has_cursor { "depends_on_trace_and_bounds" } else { "low" },
+        "safety": if path_string.contains("terminate") || path_string.contains("remove") || path_string.contains("cancel") {
+            "destructive"
+        } else if path_string.contains("write") || path_string.contains("dump") || path_string.contains("set") || path_string.contains("continue") || path_string.contains("step") {
+            "mutating_or_side_effecting"
+        } else {
+            "read_only"
+        },
+        "source": "inferred_from_cli_shape"
+    })
+}
+
 fn discover_manifest() -> Value {
     json!({
         "name": "windbg-tool",
@@ -2698,9 +4214,23 @@ fn discover_manifest() -> Value {
         },
         "output_controls": {
             "default": "pretty JSON",
+            "envelope": "--envelope or WINDBG_TOOL_ENVELOPE=1 wraps success and error output in a stable agent contract",
             "compact": "--compact emits single-line JSON",
-            "field": "--field path.to.value extracts a JSON field",
-            "raw": "--raw prints selected scalar fields without JSON quoting"
+            "field": "--field path.to.value extracts a JSON field; with --envelope it selects from data",
+            "raw": "--raw prints selected scalar fields without JSON quoting; error envelopes remain JSON"
+        },
+        "error_contract": {
+            "envelope": { "schema_version": 1, "ok": false, "error": { "code": "daemon_unavailable", "kind": "daemon_unavailable", "message": "...", "retryable": true, "hint": "..." } },
+            "exit_codes": {
+                "invalid_argument": 2,
+                "daemon_unavailable": 3,
+                "daemon_error": 4,
+                "session_not_found": 5,
+                "cursor_not_found": 6,
+                "timeout": 7,
+                "tool_error": 8,
+                "internal": 1
+            }
         },
         "recommended_flow": [
             "windbg-tool daemon ensure",
@@ -2710,10 +4240,12 @@ fn discover_manifest() -> Value {
             "windbg-tool registers --session <id> --cursor <id>"
         ],
         "command_groups": {
-            "discovery": ["discover", "recipes [topic]", "advise [topic]", "tools", "schema <tool>"],
+            "discovery": ["discover", "cli-schema [command...]", "recipes [topic]", "advise [topic]", "tools", "schema <tool>"],
             "daemon": ["daemon ensure", "daemon status", "daemon shutdown", "sessions"],
+            "debug": ["debug capabilities", "debug capabilities --session <id> --cursor <id>", "debug capabilities --target <id>", "debug snapshot --session <id> --cursor <id>", "debug snapshot --target <id>", "debug log summarize"],
             "context": ["context snapshot", "context snapshot --session <id> --cursor <id>"],
-            "remote": ["remote explain", "remote server-command", "remote connect-command"],
+            "triage": ["triage crash", "triage hang", "triage access-violation", "triage memory-corruption", "triage loader", "triage symbol-health", "triage deadlock"],
+            "remote": ["remote explain", "remote doctor", "remote status", "remote plan", "remote server-command", "remote connect-command"],
             "live": [
                 "live capabilities",
                 "live launch --command-line <cmd> --end detach|terminate",
@@ -2733,6 +4265,8 @@ fn discover_manifest() -> Value {
                 "breakpoint list --target <id>",
                 "breakpoint set --target <id> --address <addr>",
                 "breakpoint remove --target <id> --breakpoint-id <id>",
+                "breakpoint plan --target <id> --address <addr>",
+                "breakpoint plan --session <id> --cursor <id> --address <addr> --kind write",
                 "memory watchpoint",
                 "sweep watch-memory"
             ],
@@ -2757,7 +4291,7 @@ fn discover_manifest() -> Value {
                 "target symbol --target <id> --address <addr>",
                 "target source --target <id> --address <addr>"
             ],
-            "symbols": ["symbols diagnose --session <id>", "symbols diagnose --session <id> --name <module>", "symbols diagnose --session <id> --address <addr>", "symbols inspect <path>", "symbols exports <path>", "symbols nearest --session <id> --cursor <id> --address <addr>"],
+            "symbols": ["symbols diagnose --session <id>", "symbols doctor --session <id> --cursor <id>", "symbols doctor --target <id> --address <addr>", "symbols diagnose --session <id> --name <module>", "symbols diagnose --session <id> --address <addr>", "symbols inspect <path>", "symbols exports <path>", "symbols nearest --session <id> --cursor <id> --address <addr>"],
             "source": ["source resolve <recorded-path> --search-path <root>"],
             "architecture": ["architecture state --session <id> --cursor <id>", "arch state --session <id> --cursor <id>"],
             "dbgeng": ["dbgeng server --transport <transport>", "dbgsrv --transport <transport>"],
@@ -2774,6 +4308,12 @@ fn discover_manifest() -> Value {
         },
         "tool_command_map": tool_command_map(),
         "command_metadata": command_metadata(),
+        "action_log": {
+            "enable": "Set WINDBG_TOOL_ACTION_LOG to a JSONL path.",
+            "privacy_default": "Logs command path, ok/exit status, and duration; raw arguments are redacted by default.",
+            "include_full_args": "Set WINDBG_TOOL_ACTION_LOG_FULL=1 only when full command-line logging is safe.",
+            "summarize": "windbg-tool debug log summarize --path <log.jsonl>"
+        },
         "recipes": recipes_manifest(),
         "diagnostic_guidance": diagnostic_guidance(),
         "ttd_api_coverage": ttd_api_coverage_manifest(),
@@ -2784,7 +4324,19 @@ fn discover_manifest() -> Value {
             },
             {
                 "goal": "Capture a one-shot agent context summary",
-                "command": "windbg-tool context snapshot --session 1 --cursor 1"
+                "command": "windbg-tool debug snapshot --session 1 --cursor 1"
+            },
+            {
+                "goal": "Discover backend-safe debugging operations",
+                "command": "windbg-tool debug capabilities"
+            },
+            {
+                "goal": "Diagnose remote-debugging readiness without mutating the remote machine",
+                "command": "windbg-tool remote doctor --transport tcp:port=5005"
+            },
+            {
+                "goal": "Plan a live breakpoint or TTD watchpoint before changing debugger state",
+                "command": "windbg-tool breakpoint plan --target 1 --address 0x7ff600001000"
             },
             {
                 "goal": "Start a DbgEng TCP process server",
@@ -3160,7 +4712,86 @@ fn command_metadata() -> Value {
             "requires_native_ttd": false,
             "session_required": "optional_but_recommended",
             "cost": "medium",
+            "safety": "read_only",
+            "canonical_command": "debug snapshot"
+        },
+        {
+            "command": "debug capabilities",
+            "requires_daemon": "only when selecting a live, dump, or TTD subject",
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only_discovery",
+            "canonical_command": "debug capabilities"
+        },
+        {
+            "command": "debug snapshot",
+            "requires_daemon": true,
+            "requires_native_ttd": "TTD subjects require native replay; live/dump subjects use DbgEng target primitives",
+            "session_required": "TTD subjects require --session and --cursor; live/dump subjects require --target",
+            "cost": "bounded_composite",
+            "safety": "read_only",
+            "bounds": ["--max-frames", "--max-modules", "--max-threads", "--disasm-count", "--include", "--exclude"]
+        },
+        {
+            "command": "triage",
+            "requires_daemon": true,
+            "requires_native_ttd": "depends on selected subject",
+            "session_required": "TTD subjects require --session and --cursor; live/dump subjects require --target",
+            "cost": "bounded_composite",
+            "safety": "read_only_hypothesis_generation",
+            "canonical_command": "triage <kind>"
+        },
+        {
+            "command": "remote doctor",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only_local_diagnostics",
+            "bounds": ["--probe-connect opt-in", "--timeout-ms"]
+        },
+        {
+            "command": "remote status",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only_local_diagnostics",
+            "bounds": ["--probe-connect opt-in", "--timeout-ms"]
+        },
+        {
+            "command": "remote plan",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "low",
+            "safety": "read_only_command_generation"
+        },
+        {
+            "command": "symbols doctor",
+            "requires_daemon": true,
+            "requires_native_ttd": "depends on selected subject",
+            "session_required": "TTD subjects require --session and --cursor; live/dump subjects require --target",
+            "cost": "low_to_medium",
             "safety": "read_only"
+        },
+        {
+            "command": "breakpoint plan",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": "requires --target or --session/--cursor identifiers",
+            "cost": "low",
+            "safety": "read_only_planner"
+        },
+        {
+            "command": "debug log summarize",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "local_file_read",
+            "safety": "read_only_log_summary",
+            "privacy": "Action logging is opt-in through WINDBG_TOOL_ACTION_LOG; full argv logging requires WINDBG_TOOL_ACTION_LOG_FULL=1."
         },
         {
             "command": "timeline events",
@@ -3870,6 +5501,8 @@ async fn timeline_events_value(
         "kind": args.kind,
         "total_events": total_events,
         "max_events": args.max_events,
+        "returned": events.len(),
+        "limit": args.max_events,
         "truncated": total_events > args.max_events,
         "events": events,
         "sources": Value::Object(sources),
@@ -4935,6 +6568,8 @@ async fn memory_strings_and_print(
             "min_len": args.min_len,
             "total_strings": total_strings,
             "max_strings": args.max_strings,
+            "returned": strings.len(),
+            "limit": args.max_strings,
             "truncated": total_strings > args.max_strings,
             "strings": strings,
             "unavailable_bytes": if read["complete"].as_bool() == Some(false) { read["requested_size"].as_u64().unwrap_or_default().saturating_sub(read["bytes_read"].as_u64().unwrap_or_default()) } else { 0 }
@@ -5460,6 +7095,114 @@ fn query_policy_values() -> [&'static str; 5] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resolves_debug_subject_exclusively() -> anyhow::Result<()> {
+        let subject = resolve_debug_subject(
+            &DebugSubjectArgs {
+                session: Some(7),
+                cursor: Some(9),
+                target: None,
+            },
+            true,
+        )?;
+        assert!(matches!(
+            subject,
+            Some(DebugSubject::Ttd {
+                session: 7,
+                cursor: Some(9)
+            })
+        ));
+
+        let conflict = resolve_debug_subject(
+            &DebugSubjectArgs {
+                session: Some(7),
+                cursor: None,
+                target: Some(3),
+            },
+            false,
+        );
+        assert!(conflict.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn builds_standard_diagnostic_shape() {
+        let diagnostic = diagnostic_item(
+            "daemon.unavailable",
+            "blocker",
+            "Daemon is unavailable.",
+            "The daemon pipe could not be reached.",
+            "high",
+            Some(fix_item(
+                "Start the daemon.",
+                Some("windbg-tool daemon ensure"),
+            )),
+        );
+        assert_eq!(diagnostic["id"], "daemon.unavailable");
+        assert_eq!(diagnostic["severity"], "blocker");
+        assert_eq!(diagnostic["fix"]["command"], "windbg-tool daemon ensure");
+    }
+
+    #[test]
+    fn breakpoint_plan_supports_ttd_write_watchpoint() -> anyhow::Result<()> {
+        let plan = breakpoint_plan_value(BreakpointPlanArgs {
+            subject: DebugSubjectArgs {
+                session: Some(1),
+                cursor: Some(2),
+                target: None,
+            },
+            address: Some("0x1000".to_string()),
+            symbol: None,
+            module: None,
+            kind: "write".to_string(),
+            size: Some(8),
+            direction: Some("previous".to_string()),
+            thread_unique_id: None,
+        })?;
+        assert_eq!(plan["supported"], true);
+        assert_eq!(plan["safety"], "bounded_replay");
+        assert_eq!(plan["request"]["address"], "0x1000");
+        Ok(())
+    }
+
+    #[test]
+    fn action_log_command_path_redacts_option_values() {
+        let path = command_path_from_args(
+            [
+                "--compact",
+                "debug",
+                "snapshot",
+                "--session",
+                "7",
+                "--cursor",
+                "9",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        assert_eq!(path, vec!["debug", "snapshot"]);
+
+        let path = command_path_from_args(
+            ["--compact", "open", "C:\\sensitive\\trace.run"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        assert_eq!(path, vec!["open"]);
+
+        let path = command_path_from_args(
+            [
+                "debug",
+                "log",
+                "summarize",
+                "--path",
+                "C:\\logs\\actions.jsonl",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        assert_eq!(path, vec!["debug", "log", "summarize"]);
+    }
 
     #[test]
     fn classifies_strings_fill_and_pointers() {

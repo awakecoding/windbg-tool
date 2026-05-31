@@ -13,7 +13,7 @@ use crate::ttd_replay::{
     RegisterContextRequest, SessionId, StackReadRequest, StepRequest, TraceListRequest,
 };
 use anyhow::{bail, Context};
-use rmcp::model::{JsonObject, Tool};
+use rmcp::model::{JsonObject, Tool, ToolAnnotations};
 use schemars::{schema_for, JsonSchema};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -560,6 +560,87 @@ fn tool<T: JsonSchema>(name: &str, description: &str) -> Tool {
         name.to_string(),
         description.to_string(),
         Arc::new(input_schema),
+    )
+    .annotate(tool_annotations(name))
+}
+
+fn tool_annotations(name: &str) -> ToolAnnotations {
+    let mut annotations = ToolAnnotations::new()
+        .read_only(tool_is_read_only(name))
+        .destructive(tool_is_destructive(name))
+        .idempotent(tool_is_idempotent(name))
+        .open_world(tool_is_open_world(name));
+    annotations.title = Some(name.replace('_', " "));
+    annotations
+}
+
+fn tool_is_read_only(name: &str) -> bool {
+    !matches!(
+        name,
+        "ttd_load_trace"
+            | "ttd_close_trace"
+            | "ttd_index_build"
+            | "ttd_position_set"
+            | "ttd_step"
+            | "job_cancel"
+            | "target_write_dump"
+            | "target_close"
+            | "target_terminate"
+            | "target_continue"
+            | "target_step"
+            | "target_breakpoint_set"
+            | "target_breakpoint_remove"
+            | "live_launch"
+            | "live_attach"
+            | "dump_open"
+            | "sweep_watch_memory_start"
+    )
+}
+
+fn tool_is_destructive(name: &str) -> bool {
+    matches!(
+        name,
+        "ttd_close_trace"
+            | "job_cancel"
+            | "target_close"
+            | "target_terminate"
+            | "target_continue"
+            | "target_step"
+            | "target_breakpoint_remove"
+    )
+}
+
+fn tool_is_idempotent(name: &str) -> bool {
+    matches!(
+        name,
+        "ttd_trace_info"
+            | "ttd_capabilities"
+            | "ttd_index_status"
+            | "ttd_index_stats"
+            | "ttd_list_threads"
+            | "ttd_list_modules"
+            | "ttd_list_keyframes"
+            | "ttd_list_exceptions"
+            | "ttd_position_get"
+            | "ttd_read_memory"
+            | "job_list"
+            | "job_status"
+            | "job_result"
+            | "target_capabilities"
+            | "target_list"
+            | "target_status"
+    )
+}
+
+fn tool_is_open_world(name: &str) -> bool {
+    matches!(
+        name,
+        "ttd_load_trace"
+            | "ttd_trace_list"
+            | "live_launch"
+            | "live_attach"
+            | "dump_open"
+            | "target_write_dump"
     )
 }
 
