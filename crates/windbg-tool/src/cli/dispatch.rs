@@ -147,6 +147,9 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         Some(Commands::Exceptions(args)) => {
             call_and_print(pipe, session_call("ttd_list_exceptions", args), &output).await
         }
+        Some(Commands::Exception { command }) => match command {
+            ExceptionCommand::Focus(args) => exception_focus_and_print(pipe, args, &output).await,
+        },
         Some(Commands::Events { command }) => match command {
             EventsCommand::Modules(args) => {
                 call_and_print(pipe, session_call("ttd_module_events", args), &output).await

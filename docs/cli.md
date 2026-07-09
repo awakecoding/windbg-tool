@@ -36,6 +36,7 @@ Use the returned handles with analysis commands:
 target\debug\windbg-tool.exe info --session 1
 target\debug\windbg-tool.exe debug snapshot --session 1 --cursor 1
 target\debug\windbg-tool.exe position set --session 1 --cursor 1 --position 50
+target\debug\windbg-tool.exe exception focus --session 1 --cursor 1 --index 0
 target\debug\windbg-tool.exe registers --session 1 --cursor 1
 target\debug\windbg-tool.exe disasm --session 1 --cursor 1
 target\debug\windbg-tool.exe memory strings --session 1 --cursor 1 --address 0x12345678 --size 256 --encoding both
@@ -123,6 +124,8 @@ target\debug\windbg-tool.exe --compact debug log summarize --path D:\logs\windbg
 - `cursor_id` identifies a replay cursor inside that trace
 - Many commands accept `-s` for `--session` and `-c` for `--cursor`
 - `position set` accepts either a structured position, a WinDbg-style `HEX:HEX` string, or a percentage from `0` to `100`
+- `exception focus` accepts a zero-based exception index, seeks with the recorded JSON position and owning TTD thread, and reports a pasteable `requested_position_hex`; use it instead of manually transcribing decimal positions from `exceptions`.
+- `timeline events` reports `event_counts` before applying its event limit, and limits source payloads. Its `sources` entries report source status and counts; run `modules`, `events modules`, `events threads`, `exceptions`, or `keyframes` for the full metadata list.
 
 ## Output shaping
 

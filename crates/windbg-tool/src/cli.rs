@@ -165,6 +165,10 @@ enum Commands {
     Keyframes(SessionArgs),
     #[command(about = "List trace exception events")]
     Exceptions(SessionArgs),
+    Exception {
+        #[command(subcommand)]
+        command: ExceptionCommand,
+    },
     Events {
         #[command(subcommand)]
         command: EventsCommand,
@@ -510,6 +514,12 @@ enum EventsCommand {
 enum TimelineCommand {
     #[command(about = "Merge trace events into a single chronological timeline")]
     Events(TimelineEventsArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum ExceptionCommand {
+    #[command(about = "Seek a cursor to an indexed exception event on its owning thread")]
+    Focus(ExceptionFocusArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1238,6 +1248,20 @@ struct TimelineEventsArgs {
     kind: String,
     #[arg(long, default_value_t = 512)]
     max_events: usize,
+}
+
+#[derive(Debug, Args)]
+struct ExceptionFocusArgs {
+    #[arg(short = 's', long)]
+    session: u64,
+    #[arg(short = 'c', long)]
+    cursor: u64,
+    #[arg(
+        long,
+        default_value_t = 0,
+        help = "Zero-based index from `exceptions --session <id>`"
+    )]
+    index: usize,
 }
 
 #[derive(Debug, Args)]
@@ -2731,7 +2755,7 @@ fn push_suspicious_module(
 }
 
 fn collect_timeline_events(events: &mut Vec<Value>, kind: &str, source: &Value, array_key: &str) {
-    let Some(items) = source["value"][array_key].as_array() else {
+    let Some(items) = timeline_source_items(source, array_key) else {
         return;
     };
     for item in items {
@@ -2755,7 +2779,7 @@ fn collect_timeline_events(events: &mut Vec<Value>, kind: &str, source: &Value, 
 }
 
 fn collect_keyframe_events(events: &mut Vec<Value>, source: &Value) {
-    let Some(items) = source["value"]["keyframes"].as_array() else {
+    let Some(items) = timeline_source_items(source, "keyframes") else {
         return;
     };
     for position in items {
@@ -2767,6 +2791,27 @@ fn collect_keyframe_events(events: &mut Vec<Value>, source: &Value) {
             "payload": position,
         }));
     }
+}
+
+fn timeline_source_items<'a>(source: &'a Value, array_key: &str) -> Option<&'a Vec<Value>> {
+    let value = source.get("value")?;
+    value
+        .get(array_key)
+        .and_then(Value::as_array)
+        .or_else(|| value.as_array())
+}
+
+fn timeline_source_summary(source: &Value, array_key: &str) -> Value {
+    if source["ok"].as_bool() != Some(true) {
+        return source.clone();
+    }
+
+    let item_count = timeline_source_items(source, array_key).map_or(0, Vec::len);
+    json!({
+        "ok": true,
+        "item_count": item_count,
+        "items_omitted": true
+    })
 }
 
 fn timeline_sequence(event: &Value) -> u64 {
@@ -5484,7 +5529,10 @@ async fn timeline_events_value(
                 .await,
         );
         collect_timeline_events(&mut events, "module", &value, "events");
-        sources.insert("modules".to_string(), value);
+        sources.insert(
+            "modules".to_string(),
+            timeline_source_summary(&value, "events"),
+        );
     }
     if include("threads") {
         let value = call_status_value(
@@ -5498,7 +5546,10 @@ async fn timeline_events_value(
                 .await,
         );
         collect_timeline_events(&mut events, "thread", &value, "events");
-        sources.insert("threads".to_string(), value);
+        sources.insert(
+            "threads".to_string(),
+            timeline_source_summary(&value, "events"),
+        );
     }
     if include("exceptions") {
         let value = call_status_value(
@@ -5512,7 +5563,10 @@ async fn timeline_events_value(
                 .await,
         );
         collect_timeline_events(&mut events, "exception", &value, "exceptions");
-        sources.insert("exceptions".to_string(), value);
+        sources.insert(
+            "exceptions".to_string(),
+            timeline_source_summary(&value, "exceptions"),
+        );
     }
     if include("keyframes") {
         let value = call_status_value(
@@ -5526,7 +5580,10 @@ async fn timeline_events_value(
                 .await,
         );
         collect_keyframe_events(&mut events, &value);
-        sources.insert("keyframes".to_string(), value);
+        sources.insert(
+            "keyframes".to_string(),
+            timeline_source_summary(&value, "keyframes"),
+        );
     }
 
     events.sort_by(|left, right| {
@@ -5535,6 +5592,15 @@ async fn timeline_events_value(
             .then_with(|| left["kind"].as_str().cmp(&right["kind"].as_str()))
     });
     let total_events = events.len();
+    let mut event_counts = Map::new();
+    for event in &events {
+        if let Some(kind) = event["kind"].as_str() {
+            let count = event_counts
+                .entry(kind.to_string())
+                .or_insert_with(|| Value::from(0_u64));
+            *count = Value::from(count.as_u64().unwrap_or(0) + 1);
+        }
+    }
     if events.len() > args.max_events {
         events.truncate(args.max_events);
     }
@@ -5542,6 +5608,7 @@ async fn timeline_events_value(
         "session_id": args.session,
         "kind": args.kind,
         "total_events": total_events,
+        "event_counts": event_counts,
         "max_events": args.max_events,
         "returned": events.len(),
         "limit": args.max_events,
@@ -5557,6 +5624,7 @@ async fn timeline_events_value(
         ],
         "notes": [
             "This timeline merges currently exposed trace metadata.",
+            "Sources include only status and item counts; use the corresponding metadata command for full source data.",
             "Recording-client/custom-event/activity/island metadata requires additional native TTD bridge coverage."
         ]
     }))
@@ -5775,6 +5843,91 @@ async fn replay_to_and_print(
         }),
         output,
     )
+}
+
+async fn exception_focus_and_print(
+    pipe: String,
+    args: ExceptionFocusArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    let client = DaemonClient::new(pipe);
+    let exceptions = client
+        .call_tool(session_call(
+            "ttd_list_exceptions",
+            SessionArgs {
+                session: args.session,
+            },
+        ))
+        .await?;
+    let exception_items = exceptions
+        .as_array()
+        .context("ttd_list_exceptions response did not include an exception array")?;
+    let exception = exception_items.get(args.index).cloned().with_context(|| {
+        format!(
+            "exception index {} is outside the {} recorded exception events",
+            args.index,
+            exception_items.len()
+        )
+    })?;
+    let requested_position = exception["position"].clone();
+    let requested_position_hex = position_hex_text(&requested_position)?;
+    let thread_unique_id = exception["thread_unique_id"].as_u64();
+    let after = client
+        .call_tool(exception_focus_call(args.session, args.cursor, &exception)?)
+        .await?;
+    let exception_code_hex = exception["code"]
+        .as_u64()
+        .map(|code| format!("0x{code:08X}"));
+
+    print_value(
+        json!({
+            "session_id": args.session,
+            "cursor_id": args.cursor,
+            "exception_index": args.index,
+            "exception": exception,
+            "exception_code_hex": exception_code_hex,
+            "requested_position": requested_position,
+            "requested_position_hex": requested_position_hex,
+            "thread_unique_id": thread_unique_id,
+            "position": after,
+            "notes": [
+                "This command uses the exception's JSON position directly, avoiding decimal/hexadecimal transcription errors.",
+                "When the trace records an owning thread, the cursor seeks on that TTD thread."
+            ],
+            "next_recommended_safe_commands": [
+                format!("windbg-tool registers --session {} --cursor {}", args.session, args.cursor),
+                format!("windbg-tool stack backtrace --session {} --cursor {}", args.session, args.cursor),
+                format!("windbg-tool disasm --session {} --cursor {}", args.session, args.cursor)
+            ]
+        }),
+        output,
+    )
+}
+
+fn exception_focus_call(session: u64, cursor: u64, exception: &Value) -> anyhow::Result<ToolCall> {
+    let position = exception["position"].clone();
+    position_hex_text(&position)?;
+    let mut arguments = cursor_object(session, cursor);
+    arguments.insert("position".to_string(), position);
+    insert_option(
+        &mut arguments,
+        "thread_unique_id",
+        exception["thread_unique_id"].as_u64().map(Value::from),
+    );
+    Ok(ToolCall {
+        name: "ttd_position_set".to_string(),
+        arguments: Value::Object(arguments),
+    })
+}
+
+fn position_hex_text(position: &Value) -> anyhow::Result<String> {
+    let sequence = position["sequence"]
+        .as_u64()
+        .context("position did not include a numeric sequence")?;
+    let steps = position["steps"]
+        .as_u64()
+        .context("position did not include numeric steps")?;
+    Ok(format!("{sequence:X}:{steps:X}"))
 }
 
 async fn sweep_watch_memory_and_print(
@@ -7206,6 +7359,56 @@ mod tests {
         assert_eq!(plan["safety"], "bounded_replay");
         assert_eq!(plan["request"]["address"], "0x1000");
         Ok(())
+    }
+
+    #[test]
+    fn exception_focus_uses_json_position_and_owning_thread() -> anyhow::Result<()> {
+        let exception = json!({
+            "position": { "sequence": 479966, "steps": 0 },
+            "thread_unique_id": 13,
+            "code": 0xE06D7363u64
+        });
+        let call = exception_focus_call(7, 9, &exception)?;
+
+        assert_eq!(call.name, "ttd_position_set");
+        assert_eq!(call.arguments["session_id"], 7);
+        assert_eq!(call.arguments["cursor_id"], 9);
+        assert_eq!(call.arguments["position"]["sequence"], 479966);
+        assert_eq!(call.arguments["thread_unique_id"], 13);
+        assert_eq!(position_hex_text(&exception["position"])?, "752DE:0");
+        Ok(())
+    }
+
+    #[test]
+    fn timeline_source_summary_omits_unbounded_items() {
+        let source = json!({
+            "ok": true,
+            "value": [{ "sequence": 1 }, { "sequence": 2 }]
+        });
+        let summary = timeline_source_summary(&source, "keyframes");
+
+        assert_eq!(summary["ok"], true);
+        assert_eq!(summary["item_count"], 2);
+        assert_eq!(summary["items_omitted"], true);
+        assert!(summary.get("value").is_none());
+    }
+
+    #[test]
+    fn timeline_collects_top_level_exception_arrays() {
+        let source = json!({
+            "ok": true,
+            "value": [{
+                "position": { "sequence": 479966, "steps": 0 },
+                "code": 0xE06D7363u64
+            }]
+        });
+        let mut events = Vec::new();
+
+        collect_timeline_events(&mut events, "exception", &source, "exceptions");
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["kind"], "exception");
+        assert_eq!(events[0]["sequence"], 479966);
     }
 
     #[test]
