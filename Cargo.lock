@@ -1821,6 +1821,7 @@ dependencies = [
  "windbg-dbgeng",
  "windbg-install",
  "windbg-ttd",
+ "windows",
 ]
 
 [[package]]
