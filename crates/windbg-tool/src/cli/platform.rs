@@ -18,8 +18,8 @@ use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVAT
 use windows::Win32::System::Threading::{
     CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
     InitializeProcThreadAttributeList, OpenProcessToken, UpdateProcThreadAttribute,
-    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
-    STARTUPINFOEXW,
+    WaitForInputIdle, EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST,
+    PROCESS_INFORMATION, STARTUPINFOEXW,
 };
 
 use super::output::{print_value, OutputOptions};
@@ -302,6 +302,7 @@ fn command_from_trace_record_plan(
 
 const CET_USER_SHADOW_STACKS_ALWAYS_OFF: u64 = 0x0000_0000_2000_0000;
 const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
+const WAIT_FAILED: u32 = u32::MAX;
 
 fn launch_target_with_shadow_stacks_disabled(command_line: &str) -> anyhow::Result<u32> {
     let mut attribute_list_size = 0usize;
@@ -361,8 +362,13 @@ fn launch_target_with_shadow_stacks_disabled(command_line: &str) -> anyhow::Resu
         );
         DeleteProcThreadAttributeList(attribute_list);
         created.context("launching the target with CET shadow stacks disabled")?;
+        let input_idle = WaitForInputIdle(process_information.hProcess, 10_000);
         CloseHandle(process_information.hThread).context("closing the target thread handle")?;
         CloseHandle(process_information.hProcess).context("closing the target process handle")?;
+        ensure!(
+            input_idle != WAIT_FAILED,
+            "waiting for the target process to initialize"
+        );
     }
 
     Ok(process_information.dwProcessId)
