@@ -45,7 +45,7 @@ target\debug\windbg-tool.exe memory strings --session 1 --cursor 1 --address 0x1
 
 ## Record a trace
 
-`trace record` launches a target with the Microsoft `TTD.exe` command-line recorder, waits for it to exit, and emits the resulting `.run` path. It uses TTD's documented `-noUI -out <path> -launch <target command line>` invocation; the target command line is passed directly, not through a shell. Because TTD recording requires elevation, it runs TTD directly from an elevated terminal or automatically invokes enabled Windows 11 `sudo` from an unelevated terminal.
+`trace record` launches a target with the Microsoft `TTD.exe` command-line recorder, waits for it to exit, and emits the resulting `.run` path. It uses TTD's documented `-noUI -out <path> -launch <target command line>` invocation; the target command line is passed directly, not through a shell. Because TTD recording requires elevation, it runs TTD directly from an elevated terminal or automatically invokes Windows 11 `sudo` when it is configured for the synchronous **Input Closed** or **Inline** mode. Force New Window mode is rejected because it returns before the recorder completes.
 
 Install the standalone TTD recorder with `winget install --id Microsoft.TimeTravelDebugging`, then open a new elevated terminal so `ttd.exe` is on `PATH`. You can also set `TTD_EXE` or pass `--ttd-exe`. `trace record` always passes TTD's `-accepteula` option.
 
@@ -56,6 +56,12 @@ target\debug\windbg-tool.exe --compact trace record `
 ```
 
 The output directory must already exist and the `.run` path must not already exist. `--max-file-mb` bounds trace growth; combine it with `--ring` to retain only the most recent recording window. TTD traces include process-memory data and should be handled as sensitive artifacts.
+
+To enable synchronous sudo recording, choose **Input Closed** or **Inline** in **Settings > System > Advanced > Enable sudo**, or from an elevated terminal run:
+
+```powershell
+sudo config --enable disableInput
+```
 
 ## Canonical agent debugging commands
 

@@ -165,6 +165,7 @@ enum TraceRecordLauncher {
     Sudo {
         executable: PathBuf,
         working_directory: PathBuf,
+        mode: WindowsSudoMode,
     },
 }
 
@@ -172,9 +173,27 @@ impl TraceRecordLauncher {
     fn name(&self) -> &'static str {
         match self {
             Self::Direct => "already_elevated",
-            Self::Sudo { .. } => "windows_sudo",
+            Self::Sudo {
+                mode: WindowsSudoMode::Inline,
+                ..
+            } => "windows_sudo_inline",
+            Self::Sudo {
+                mode: WindowsSudoMode::DisableInput,
+                ..
+            } => "windows_sudo_disable_input",
+            Self::Sudo {
+                mode: WindowsSudoMode::ForceNewWindow,
+                ..
+            } => "windows_sudo_force_new_window",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WindowsSudoMode {
+    DisableInput,
+    Inline,
+    ForceNewWindow,
 }
 
 fn trace_record_launcher() -> anyhow::Result<TraceRecordLauncher> {
@@ -182,14 +201,20 @@ fn trace_record_launcher() -> anyhow::Result<TraceRecordLauncher> {
         return Ok(TraceRecordLauncher::Direct);
     }
 
-    let sudo = find_enabled_sudo().context(
+    let (sudo, mode) = find_enabled_sudo()?.context(
         "TTD recording requires elevation, but Windows sudo is unavailable or disabled; run windbg-tool from an elevated terminal or enable sudo in Settings > System > Advanced",
     )?;
+    if mode == WindowsSudoMode::ForceNewWindow {
+        bail!(
+            "Windows sudo is configured for Force New Window mode, which cannot synchronously wait for TTD recording; run windbg-tool from an elevated terminal or configure sudo for Input Closed or Inline mode in Settings > System > Advanced"
+        );
+    }
     let working_directory =
         env::current_dir().context("resolving the current working directory")?;
     Ok(TraceRecordLauncher::Sudo {
         executable: sudo,
         working_directory,
+        mode,
     })
 }
 
@@ -202,13 +227,25 @@ fn command_from_trace_record_plan(
         TraceRecordLauncher::Sudo {
             executable,
             working_directory,
+            mode,
         } => {
             let mut command = Command::new(executable);
             command
                 .arg("--preserve-env")
                 .arg("--chdir")
-                .arg(working_directory)
-                .arg(&plan.ttd_exe);
+                .arg(working_directory);
+            match mode {
+                WindowsSudoMode::DisableInput => {
+                    command.arg("--disable-input");
+                }
+                WindowsSudoMode::Inline => {
+                    command.arg("--inline");
+                }
+                WindowsSudoMode::ForceNewWindow => {
+                    unreachable!("asynchronous sudo mode is rejected")
+                }
+            }
+            command.arg(&plan.ttd_exe);
             command
         }
     };
@@ -240,14 +277,36 @@ fn current_process_is_elevated() -> anyhow::Result<bool> {
     }
 }
 
-fn find_enabled_sudo() -> Option<PathBuf> {
-    let sudo = find_executable_on_path("sudo.exe")?;
-    Command::new(&sudo)
+fn find_enabled_sudo() -> anyhow::Result<Option<(PathBuf, WindowsSudoMode)>> {
+    let Some(sudo) = find_executable_on_path("sudo.exe") else {
+        return Ok(None);
+    };
+    let output = Command::new(&sudo)
         .arg("config")
-        .status()
-        .ok()
-        .filter(|status| status.success())
-        .map(|_| sudo)
+        .output()
+        .context("checking Windows sudo configuration")?;
+    ensure!(
+        output.status.success(),
+        "Windows sudo configuration check failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let mode = parse_windows_sudo_mode(&String::from_utf8_lossy(&output.stdout)).context(
+        "Windows sudo returned an unrecognized configuration; run `sudo config` to inspect it",
+    )?;
+    Ok(Some((sudo, mode)))
+}
+
+fn parse_windows_sudo_mode(output: &str) -> Option<WindowsSudoMode> {
+    let normalized = output.to_ascii_lowercase().replace([' ', '-'], "");
+    if normalized.contains("forcenewwindow") {
+        Some(WindowsSudoMode::ForceNewWindow)
+    } else if normalized.contains("disableinput") || normalized.contains("inputclosed") {
+        Some(WindowsSudoMode::DisableInput)
+    } else if normalized.contains("inline") || normalized.contains("normal") {
+        Some(WindowsSudoMode::Inline)
+    } else {
+        None
+    }
 }
 
 fn resolve_ttd_exe(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -589,6 +648,7 @@ mod tests {
         let launcher = TraceRecordLauncher::Sudo {
             executable: PathBuf::from(r"C:\Windows\System32\sudo.exe"),
             working_directory: PathBuf::from(r"D:\work"),
+            mode: WindowsSudoMode::DisableInput,
         };
 
         let command = command_from_trace_record_plan(&plan, &launcher);
@@ -602,18 +662,35 @@ mod tests {
             Path::new(r"C:\Windows\System32\sudo.exe").as_os_str()
         );
         assert_eq!(
-            arguments[..5],
+            arguments[..6],
             [
                 "--preserve-env",
                 "--chdir",
                 r"D:\work",
+                "--disable-input",
                 plan.ttd_exe.to_string_lossy().as_ref(),
                 "-noUI",
             ]
         );
-        assert_eq!(launcher.name(), "windows_sudo");
+        assert_eq!(launcher.name(), "windows_sudo_disable_input");
 
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn parses_windows_sudo_modes() {
+        assert_eq!(
+            parse_windows_sudo_mode("Sudo is currently in Force New Window mode"),
+            Some(WindowsSudoMode::ForceNewWindow)
+        );
+        assert_eq!(
+            parse_windows_sudo_mode("Sudo is currently in Input Closed mode"),
+            Some(WindowsSudoMode::DisableInput)
+        );
+        assert_eq!(
+            parse_windows_sudo_mode("Sudo is currently in Inline mode"),
+            Some(WindowsSudoMode::Inline)
+        );
     }
 
     #[test]
