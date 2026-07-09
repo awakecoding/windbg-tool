@@ -486,6 +486,8 @@ enum ArchitectureCommand {
 enum TraceCommand {
     #[command(about = "Enumerate traces in a .run/.idx/.ttd file without opening a session")]
     List(TraceListArgs),
+    #[command(about = "Launch a process through TTD.exe and wait for its trace to be finalized")]
+    Record(TraceRecordArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -640,6 +642,46 @@ struct LiveLaunchArgs {
     initial_break_timeout_ms: u32,
     #[arg(long, default_value = "detach", value_parser = ["detach", "terminate"])]
     end: String,
+}
+
+#[derive(Debug, Args, Clone)]
+struct TraceRecordArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Output .run trace path; its parent directory must already exist"
+    )]
+    output: PathBuf,
+    #[arg(
+        long,
+        help = "Full target command line; it is passed directly to TTD.exe without a shell"
+    )]
+    command_line: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "TTD.exe path; defaults to TTD_EXE or ttd.exe found on PATH"
+    )]
+    ttd_exe: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Pass -accepteula to TTD.exe after you have reviewed and accepted its EULA"
+    )]
+    accept_eula: bool,
+    #[arg(long, help = "Record child processes created by the launch target")]
+    children: bool,
+    #[arg(
+        long,
+        value_name = "MEGABYTES",
+        help = "Pass -maxFile to bound the trace size"
+    )]
+    max_file_mb: Option<u32>,
+    #[arg(
+        long,
+        requires = "max_file_mb",
+        help = "Use a fixed-size ring buffer; requires --max-file-mb"
+    )]
+    ring: bool,
 }
 
 #[derive(Debug, Args)]

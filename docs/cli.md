@@ -6,6 +6,7 @@
 
 - **Discovery commands** do not require the daemon: `discover`, `cli-schema`, `recipes`, `tools`, `schema`, `trace-list`, `symbols inspect`
 - **Replay commands** usually talk to the local daemon and operate on a `session_id` and `cursor_id`
+- **Recording commands** use the separately installed Microsoft `TTD.exe` recorder and do not require the daemon
 - **Canonical agent debugging commands** start with `debug`, `triage`, `symbols doctor`, and `breakpoint plan`
 - **Platform helper commands** cover DbgEng, remote debugging doctors/plans, live-launch probing, and WinDbg installation
 
@@ -41,6 +42,21 @@ target\debug\windbg-tool.exe memory strings --session 1 --cursor 1 --address 0x1
 ```
 
 `open` is the preferred starting point because it loads the trace, creates a cursor, and optionally seeks to a position in one response. `debug snapshot` is the canonical cross-backend snapshot for agents; `context snapshot` remains available as the legacy TTD-focused snapshot.
+
+## Record a trace
+
+`trace record` launches a target with the Microsoft `TTD.exe` command-line recorder, waits for it to exit, and emits the resulting `.run` path. It uses TTD's documented `-noUI -out <path> -launch <target command line>` invocation; the target command line is passed directly, not through a shell.
+
+Install the standalone TTD recorder so `ttd.exe` is on `PATH`, set `TTD_EXE`, or pass `--ttd-exe`. TTD generally requires an elevated console. Review the recorder EULA before using `--accept-eula`.
+
+```powershell
+target\debug\windbg-tool.exe --compact trace record `
+  --output C:\traces\rdm.run `
+  --command-line '"C:\apps\RemoteDesktopManager.exe" /AutoCloseAfter:10' `
+  --accept-eula
+```
+
+The output directory must already exist and the `.run` path must not already exist. `--max-file-mb` bounds trace growth; combine it with `--ring` to retain only the most recent recording window. TTD traces include process-memory data and should be handled as sensitive artifacts.
 
 ## Canonical agent debugging commands
 
@@ -153,6 +169,7 @@ The schema includes curated metadata where available and inferred metadata for o
 | Discover capabilities | `discover`, `cli-schema [command...]`, `recipes`, `tools`, `schema <tool>` |
 | Canonical agent context | `debug capabilities`, `debug snapshot`, `triage <kind>`, `symbols doctor`, `breakpoint plan`, `debug log summarize` |
 | Manage daemon/session state | `daemon ensure`, `daemon status`, `sessions`, `open`, `load`, `close`, `info` |
+| Capture a new trace | `trace record --output <trace.run> --command-line <target-command-line>` |
 | Move through a trace | `cursor create`, `position get`, `position set`, `step`, `replay to`, `replay watch-memory`, `sweep watch-memory` |
 | Inspect trace metadata | `threads`, `modules`, `exceptions`, `keyframes`, `timeline events`, `module info`, `module audit` |
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |

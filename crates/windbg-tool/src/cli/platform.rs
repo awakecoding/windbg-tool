@@ -1,5 +1,9 @@
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
+use std::env;
+use std::ffi::OsString;
+use std::os::windows::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use windbg_dbgeng::{
     live_launch_initial_break, open_dump_session, start_process_server, write_process_dump,
@@ -10,7 +14,8 @@ use windbg_install::WindbgManager;
 
 use super::output::{print_value, OutputOptions};
 use super::{
-    CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs, WindbgCommand,
+    CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
+    TraceRecordArgs, WindbgCommand,
 };
 
 pub(super) fn run_dbgeng_server(
@@ -45,6 +50,157 @@ pub(super) fn run_live_launch(args: LiveLaunchArgs, output: &OutputOptions) -> a
         }),
         output,
     )
+}
+
+pub(super) fn run_trace_record(
+    args: TraceRecordArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    let plan = trace_record_plan(&args)?;
+    let status = command_from_trace_record_plan(&plan)
+        .status()
+        .with_context(|| format!("launching TTD recorder {}", plan.ttd_exe.display()))?;
+    ensure!(
+        status.success(),
+        "TTD recorder exited with {}",
+        status
+            .code()
+            .map_or_else(|| "no exit code".to_string(), |code| code.to_string())
+    );
+    ensure!(
+        plan.output.is_file(),
+        "TTD recorder completed without creating {}",
+        plan.output.display()
+    );
+
+    let artifact_paths = trace_artifact_paths(&plan.output);
+    print_value(
+        json!({
+            "recorder": plan.ttd_exe,
+            "output": plan.output,
+            "command_line": plan.command_line,
+            "exit_code": status.code(),
+            "artifacts": artifact_paths,
+            "notes": [
+                "TTD recording is invasive and can significantly slow the target process.",
+                "The trace is finalized after the launched target exits.",
+                "TTD traces can contain sensitive process-memory data."
+            ]
+        }),
+        output,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceRecordPlan {
+    ttd_exe: PathBuf,
+    output: PathBuf,
+    command_line: String,
+    recorder_args: Vec<OsString>,
+}
+
+fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> {
+    ensure!(
+        !args.command_line.trim().is_empty(),
+        "--command-line must not be empty"
+    );
+    ensure!(
+        args.output
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("run")),
+        "--output must name a .run trace file"
+    );
+    let output_parent = args
+        .output
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    ensure!(
+        output_parent.is_dir(),
+        "trace output directory does not exist: {}",
+        output_parent.display()
+    );
+    ensure!(
+        !args.output.exists(),
+        "trace output already exists: {}",
+        args.output.display()
+    );
+
+    let ttd_exe = resolve_ttd_exe(args.ttd_exe.as_deref())?;
+    let mut recorder_args = vec![
+        OsString::from("-noUI"),
+        OsString::from("-out"),
+        args.output.as_os_str().to_os_string(),
+    ];
+    if args.accept_eula {
+        recorder_args.push(OsString::from("-accepteula"));
+    }
+    if args.children {
+        recorder_args.push(OsString::from("-children"));
+    }
+    if let Some(max_file_mb) = args.max_file_mb {
+        ensure!(max_file_mb > 0, "--max-file-mb must be greater than zero");
+        recorder_args.push(OsString::from("-maxFile"));
+        recorder_args.push(OsString::from(max_file_mb.to_string()));
+    }
+    if args.ring {
+        recorder_args.push(OsString::from("-ring"));
+    }
+    recorder_args.push(OsString::from("-launch"));
+
+    Ok(TraceRecordPlan {
+        ttd_exe,
+        output: args.output.clone(),
+        command_line: args.command_line.clone(),
+        recorder_args,
+    })
+}
+
+fn command_from_trace_record_plan(plan: &TraceRecordPlan) -> Command {
+    let mut command = Command::new(&plan.ttd_exe);
+    command.args(&plan.recorder_args);
+    // TTD requires its target command line after -launch. raw_arg preserves the caller's
+    // Windows command-line quoting without introducing a shell.
+    command.raw_arg(&plan.command_line);
+    command
+}
+
+fn resolve_ttd_exe(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return validate_ttd_exe(path);
+    }
+    if let Some(path) = env::var_os("TTD_EXE") {
+        return validate_ttd_exe(Path::new(&path));
+    }
+    find_executable_on_path("ttd.exe").context(
+        "could not find TTD.exe; install the Microsoft Time Travel Debugging command-line utility, add it to PATH, set TTD_EXE, or pass --ttd-exe",
+    )
+}
+
+fn validate_ttd_exe(path: &Path) -> anyhow::Result<PathBuf> {
+    ensure!(
+        path.is_file(),
+        "TTD recorder executable does not exist: {}",
+        path.display()
+    );
+    Ok(path.to_path_buf())
+}
+
+fn find_executable_on_path(name: &str) -> Option<PathBuf> {
+    env::var_os("PATH").and_then(|paths| {
+        env::split_paths(&paths)
+            .map(|directory| directory.join(name))
+            .find(|candidate| candidate.is_file())
+    })
+}
+
+fn trace_artifact_paths(output: &Path) -> Vec<PathBuf> {
+    let mut artifacts = vec![output.to_path_buf()];
+    let index = output.with_extension("idx");
+    if index.exists() {
+        artifacts.push(index);
+    }
+    artifacts
 }
 
 pub(super) fn run_dump_create(args: DumpCreateArgs, output: &OutputOptions) -> anyhow::Result<()> {
@@ -265,5 +421,77 @@ pub(super) fn run_windbg_command(
                 output,
             )
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn record_args(output: PathBuf) -> TraceRecordArgs {
+        TraceRecordArgs {
+            output,
+            command_line: r#""C:\Program Files\App\app.exe" --flag "two words""#.to_string(),
+            ttd_exe: Some(env::current_exe().unwrap()),
+            accept_eula: true,
+            children: true,
+            max_file_mb: Some(128),
+            ring: true,
+        }
+    }
+
+    fn test_directory() -> PathBuf {
+        env::temp_dir().join(format!(
+            "windbg-tool-record-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn trace_record_plan_uses_documented_ttd_arguments() {
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let output = temp.join("capture.run");
+
+        let plan = trace_record_plan(&record_args(output.clone())).unwrap();
+
+        assert_eq!(plan.output, output);
+        assert_eq!(
+            plan.recorder_args,
+            vec![
+                "-noUI",
+                "-out",
+                output.to_string_lossy().as_ref(),
+                "-accepteula",
+                "-children",
+                "-maxFile",
+                "128",
+                "-ring",
+                "-launch",
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>()
+        );
+        assert_eq!(plan.command_line, record_args(output).command_line);
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn trace_record_plan_rejects_existing_or_non_run_output() {
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let existing = temp.join("capture.run");
+        fs::write(&existing, []).unwrap();
+        assert!(trace_record_plan(&record_args(existing)).is_err());
+        assert!(trace_record_plan(&record_args(temp.join("capture.ttd"))).is_err());
+        fs::remove_dir_all(temp).unwrap();
     }
 }

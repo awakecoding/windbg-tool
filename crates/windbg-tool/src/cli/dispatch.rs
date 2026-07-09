@@ -32,6 +32,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         Some(Commands::CliSchema(args)) => print_value(cli_schema(args)?, &output),
         Some(Commands::Trace { command }) => match command {
             TraceCommand::List(args) => call_and_print(pipe, trace_list_call(args), &output).await,
+            TraceCommand::Record(args) => platform::run_trace_record(args, &output),
         },
         Some(Commands::TraceList(args)) => {
             call_and_print(pipe, trace_list_call(args), &output).await
