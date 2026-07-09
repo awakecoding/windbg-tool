@@ -16,3 +16,10 @@ tracing-subscriber.workspace = true
 windbg-dbgeng = { path = "..\\windbg-dbgeng" }
 windbg-install = { path = "..\\windbg-install" }
 windbg-ttd = { path = "..\\windbg-ttd" }
+
+[target.'cfg(windows)'.dependencies]
+windows = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+] }

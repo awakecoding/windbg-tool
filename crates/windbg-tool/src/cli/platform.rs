@@ -11,6 +11,9 @@ use windbg_dbgeng::{
     ProcessDumpOptions, ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
+use windows::Win32::Foundation::{CloseHandle, HANDLE};
+use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use super::output::{print_value, OutputOptions};
 use super::{
@@ -57,7 +60,8 @@ pub(super) fn run_trace_record(
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
     let plan = trace_record_plan(&args)?;
-    let status = command_from_trace_record_plan(&plan)
+    let launcher = trace_record_launcher()?;
+    let status = command_from_trace_record_plan(&plan, &launcher)
         .status()
         .with_context(|| format!("launching TTD recorder {}", plan.ttd_exe.display()))?;
     ensure!(
@@ -80,6 +84,7 @@ pub(super) fn run_trace_record(
             "output": plan.output,
             "command_line": plan.command_line,
             "exit_code": status.code(),
+            "elevation": launcher.name(),
             "artifacts": artifact_paths,
             "notes": [
                 "TTD recording is invasive and can significantly slow the target process.",
@@ -154,13 +159,95 @@ fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> 
     })
 }
 
-fn command_from_trace_record_plan(plan: &TraceRecordPlan) -> Command {
-    let mut command = Command::new(&plan.ttd_exe);
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraceRecordLauncher {
+    Direct,
+    Sudo {
+        executable: PathBuf,
+        working_directory: PathBuf,
+    },
+}
+
+impl TraceRecordLauncher {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Direct => "already_elevated",
+            Self::Sudo { .. } => "windows_sudo",
+        }
+    }
+}
+
+fn trace_record_launcher() -> anyhow::Result<TraceRecordLauncher> {
+    if current_process_is_elevated()? {
+        return Ok(TraceRecordLauncher::Direct);
+    }
+
+    let sudo = find_enabled_sudo().context(
+        "TTD recording requires elevation, but Windows sudo is unavailable or disabled; run windbg-tool from an elevated terminal or enable sudo in Settings > System > Advanced",
+    )?;
+    let working_directory =
+        env::current_dir().context("resolving the current working directory")?;
+    Ok(TraceRecordLauncher::Sudo {
+        executable: sudo,
+        working_directory,
+    })
+}
+
+fn command_from_trace_record_plan(
+    plan: &TraceRecordPlan,
+    launcher: &TraceRecordLauncher,
+) -> Command {
+    let mut command = match launcher {
+        TraceRecordLauncher::Direct => Command::new(&plan.ttd_exe),
+        TraceRecordLauncher::Sudo {
+            executable,
+            working_directory,
+        } => {
+            let mut command = Command::new(executable);
+            command
+                .arg("--preserve-env")
+                .arg("--chdir")
+                .arg(working_directory)
+                .arg(&plan.ttd_exe);
+            command
+        }
+    };
     command.args(&plan.recorder_args);
     // TTD requires its target command line after -launch. raw_arg preserves the caller's
     // Windows command-line quoting without introducing a shell.
     command.raw_arg(&plan.command_line);
     command
+}
+
+fn current_process_is_elevated() -> anyhow::Result<bool> {
+    unsafe {
+        let mut token = HANDLE::default();
+        OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token)
+            .context("opening the current process token")?;
+
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut returned = 0;
+        let result = GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut elevation as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut returned,
+        );
+        CloseHandle(token).context("closing the current process token")?;
+        result.context("querying the current process elevation")?;
+        Ok(elevation.TokenIsElevated != 0)
+    }
+}
+
+fn find_enabled_sudo() -> Option<PathBuf> {
+    let sudo = find_executable_on_path("sudo.exe")?;
+    Command::new(&sudo)
+        .arg("config")
+        .status()
+        .ok()
+        .filter(|status| status.success())
+        .map(|_| sudo)
 }
 
 fn resolve_ttd_exe(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
@@ -491,6 +578,41 @@ mod tests {
         fs::write(&existing, []).unwrap();
         assert!(trace_record_plan(&record_args(existing)).is_err());
         assert!(trace_record_plan(&record_args(temp.join("capture.ttd"))).is_err());
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn sudo_launcher_wraps_ttd_and_preserves_working_directory() {
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let plan = trace_record_plan(&record_args(temp.join("capture.run"))).unwrap();
+        let launcher = TraceRecordLauncher::Sudo {
+            executable: PathBuf::from(r"C:\Windows\System32\sudo.exe"),
+            working_directory: PathBuf::from(r"D:\work"),
+        };
+
+        let command = command_from_trace_record_plan(&plan, &launcher);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            command.get_program(),
+            Path::new(r"C:\Windows\System32\sudo.exe").as_os_str()
+        );
+        assert_eq!(
+            arguments[..5],
+            [
+                "--preserve-env",
+                "--chdir",
+                r"D:\work",
+                plan.ttd_exe.to_string_lossy().as_ref(),
+                "-noUI",
+            ]
+        );
+        assert_eq!(launcher.name(), "windows_sudo");
+
         fs::remove_dir_all(temp).unwrap();
     }
 
