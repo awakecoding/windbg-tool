@@ -172,9 +172,11 @@ fn resolve_ttd_exe(explicit: Option<&Path>) -> anyhow::Result<PathBuf> {
     if let Some(path) = env::var_os("TTD_EXE") {
         return validate_ttd_exe(Path::new(&path));
     }
-    find_executable_on_path("ttd.exe").context(
-        "could not find TTD.exe; install the Microsoft Time Travel Debugging command-line utility, add it to PATH, set TTD_EXE, or pass --ttd-exe",
-    )
+    find_executable_on_path("ttd.exe").context(ttd_not_found_message())
+}
+
+fn ttd_not_found_message() -> &'static str {
+    "could not find TTD.exe; install it with `winget install --id Microsoft.TimeTravelDebugging`, then open a new elevated terminal. Alternatively, add it to PATH, set TTD_EXE, or pass --ttd-exe"
 }
 
 fn validate_ttd_exe(path: &Path) -> anyhow::Result<PathBuf> {
@@ -493,5 +495,12 @@ mod tests {
         assert!(trace_record_plan(&record_args(existing)).is_err());
         assert!(trace_record_plan(&record_args(temp.join("capture.ttd"))).is_err());
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn ttd_not_found_message_includes_official_install_command() {
+        assert!(
+            ttd_not_found_message().contains("winget install --id Microsoft.TimeTravelDebugging")
+        );
     }
 }

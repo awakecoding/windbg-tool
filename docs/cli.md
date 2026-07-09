@@ -47,7 +47,7 @@ target\debug\windbg-tool.exe memory strings --session 1 --cursor 1 --address 0x1
 
 `trace record` launches a target with the Microsoft `TTD.exe` command-line recorder, waits for it to exit, and emits the resulting `.run` path. It uses TTD's documented `-noUI -out <path> -launch <target command line>` invocation; the target command line is passed directly, not through a shell.
 
-Install the standalone TTD recorder so `ttd.exe` is on `PATH`, set `TTD_EXE`, or pass `--ttd-exe`. TTD generally requires an elevated console. Review the recorder EULA before using `--accept-eula`.
+Install the standalone TTD recorder with `winget install --id Microsoft.TimeTravelDebugging`, then open a new elevated terminal so `ttd.exe` is on `PATH`. You can also set `TTD_EXE` or pass `--ttd-exe`. Review the recorder EULA before using `--accept-eula`.
 
 ```powershell
 target\debug\windbg-tool.exe --compact trace record `
