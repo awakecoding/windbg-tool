@@ -5,7 +5,10 @@ use std::ffi::OsString;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 use windbg_dbgeng::{
     live_launch_initial_break, open_dump_session, start_process_server, write_process_dump,
     DumpKind, DumpOpenOptions, DumpWriteOptions, LiveLaunchEnd, LiveLaunchOptions,
@@ -25,7 +28,7 @@ use windows::Win32::System::Threading::{
 use super::output::{print_value, OutputOptions};
 use super::{
     CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
-    TraceRecordArgs, WindbgCommand,
+    TraceRecordArgs, TraceRecordProfile, TraceReplayCpuSupport, WindbgCommand,
 };
 
 pub(super) fn run_dbgeng_server(
@@ -73,9 +76,9 @@ pub(super) fn run_trace_record(
             process_id: launch_target_with_shadow_stacks_disabled(&plan.command_line)?,
         };
     }
-    let status = command_from_trace_record_plan(&plan, &launcher)
-        .status()
-        .with_context(|| format!("launching TTD recorder {}", plan.ttd_exe.display()))?;
+    let started = Instant::now();
+    let execution = execute_trace_recording(&plan, &launcher)?;
+    let status = execution.status;
     ensure!(
         status.success(),
         "TTD recorder exited with {}",
@@ -90,6 +93,12 @@ pub(super) fn run_trace_record(
     );
 
     let artifact_paths = trace_artifact_paths(&plan.output);
+    let diagnostics = trace_record_diagnostics(&plan, started.elapsed())?;
+    let completion_note = if plan.capture.record_for_seconds.is_some() {
+        "The bounded stop finalizes TTD recording without terminating the target process."
+    } else {
+        "The trace is finalized after the launched target exits."
+    };
     print_value(
         json!({
             "recorder": plan.ttd_exe,
@@ -99,10 +108,17 @@ pub(super) fn run_trace_record(
             "target_process_id": plan.target.process_id(),
             "exit_code": status.code(),
             "elevation": launcher.name(),
+            "capture": trace_capture_value(&plan.capture),
+            "lifecycle": {
+                "record_for_seconds": plan.capture.record_for_seconds,
+                "stopped_after_limit": execution.stopped_after_limit,
+                "stop_exit_code": execution.stop_exit_code,
+            },
             "artifacts": artifact_paths,
+            "diagnostics": diagnostics,
             "notes": [
                 "TTD recording is invasive and can significantly slow the target process.",
-                "The trace is finalized after the launched target exits.",
+                completion_note,
                 "TTD traces can contain sensitive process-memory data."
             ]
         }),
@@ -117,6 +133,24 @@ struct TraceRecordPlan {
     command_line: String,
     recorder_args: Vec<OsString>,
     target: TraceRecordTarget,
+    capture: TraceCaptureSettings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TraceCaptureSettings {
+    profile: Option<TraceRecordProfile>,
+    modules: Vec<String>,
+    max_file_mb: Option<u32>,
+    ring: bool,
+    replay_cpu_support: Option<TraceReplayCpuSupport>,
+    num_vcpu: Option<u32>,
+    record_for_seconds: Option<u32>,
+}
+
+struct TraceRecordExecution {
+    status: ExitStatus,
+    stopped_after_limit: bool,
+    stop_exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -167,6 +201,20 @@ fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> 
         "trace output already exists: {}",
         args.output.display()
     );
+    ensure!(
+        args.profile.is_none() || (args.max_file_mb.is_none() && !args.ring),
+        "--profile cannot be combined with --max-file-mb or --ring"
+    );
+    if let Some(record_for_seconds) = args.record_for_seconds {
+        ensure!(
+            record_for_seconds > 0,
+            "--record-for-seconds must be greater than zero"
+        );
+        ensure!(
+            args.disable_user_shadow_stack,
+            "--record-for-seconds requires --disable-user-shadow-stack so windbg-tool knows the target PID"
+        );
+    }
 
     let ttd_exe = resolve_ttd_exe(args.ttd_exe.as_deref())?;
     let mut recorder_args = vec![
@@ -175,16 +223,35 @@ fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> 
         args.output.as_os_str().to_os_string(),
         OsString::from("-accepteula"),
     ];
+    let (max_file_mb, ring) = trace_size_settings(args)?;
+    let modules = args
+        .modules
+        .iter()
+        .map(|module| validate_ttd_module_name(module))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+
     if args.children {
         recorder_args.push(OsString::from("-children"));
     }
-    if let Some(max_file_mb) = args.max_file_mb {
-        ensure!(max_file_mb > 0, "--max-file-mb must be greater than zero");
+    for module in &modules {
+        recorder_args.push(OsString::from("-module"));
+        recorder_args.push(OsString::from(module));
+    }
+    if let Some(max_file_mb) = max_file_mb {
         recorder_args.push(OsString::from("-maxFile"));
         recorder_args.push(OsString::from(max_file_mb.to_string()));
     }
-    if args.ring {
+    if ring {
         recorder_args.push(OsString::from("-ring"));
+    }
+    if let Some(replay_cpu_support) = args.replay_cpu_support {
+        recorder_args.push(OsString::from("-replayCpuSupport"));
+        recorder_args.push(OsString::from(replay_cpu_support.ttd_value()));
+    }
+    if let Some(num_vcpu) = args.num_vcpu {
+        ensure!(num_vcpu > 0, "--num-vcpu must be greater than zero");
+        recorder_args.push(OsString::from("-numVCpu"));
+        recorder_args.push(OsString::from(num_vcpu.to_string()));
     }
     Ok(TraceRecordPlan {
         ttd_exe,
@@ -192,7 +259,159 @@ fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> 
         command_line: args.command_line.clone(),
         recorder_args,
         target: TraceRecordTarget::Launch,
+        capture: TraceCaptureSettings {
+            profile: args.profile,
+            modules,
+            max_file_mb,
+            ring,
+            replay_cpu_support: args.replay_cpu_support,
+            num_vcpu: args.num_vcpu,
+            record_for_seconds: args.record_for_seconds,
+        },
     })
+}
+
+fn trace_size_settings(args: &TraceRecordArgs) -> anyhow::Result<(Option<u32>, bool)> {
+    if let Some(profile) = args.profile {
+        return Ok(match profile {
+            TraceRecordProfile::Startup => (Some(1024), false),
+            TraceRecordProfile::Recent => (Some(2048), true),
+        });
+    }
+
+    if let Some(max_file_mb) = args.max_file_mb {
+        ensure!(max_file_mb > 0, "--max-file-mb must be greater than zero");
+    }
+    ensure!(
+        !args.ring || args.max_file_mb.is_some(),
+        "--ring requires --max-file-mb"
+    );
+    Ok((args.max_file_mb, args.ring))
+}
+
+fn validate_ttd_module_name(module: &str) -> anyhow::Result<String> {
+    let module = module.trim();
+    ensure!(!module.is_empty(), "--module must not be empty");
+    ensure!(
+        !module.contains(['\\', '/']),
+        "--module must be a native module basename, not a path: {module}"
+    );
+    Ok(module.to_string())
+}
+
+fn trace_capture_value(capture: &TraceCaptureSettings) -> Value {
+    json!({
+        "profile": capture.profile.map(TraceRecordProfile::name),
+        "modules": capture.modules,
+        "max_file_mb": capture.max_file_mb,
+        "ring": capture.ring,
+        "replay_cpu_support": capture.replay_cpu_support.map(TraceReplayCpuSupport::ttd_value),
+        "num_vcpu": capture.num_vcpu,
+        "record_for_seconds": capture.record_for_seconds,
+    })
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TtdSidecarSummary {
+    allocated_vcpus: Option<u32>,
+    running_threads: Option<u32>,
+    simulation_duration_ms: Option<u64>,
+    recording_engine_initialized: bool,
+    tracing_started: bool,
+    tracing_completed: bool,
+    trace_dumped: bool,
+}
+
+fn trace_record_diagnostics(plan: &TraceRecordPlan, elapsed: Duration) -> anyhow::Result<Value> {
+    let metadata = std::fs::metadata(&plan.output)
+        .with_context(|| format!("reading trace metadata from {}", plan.output.display()))?;
+    let trace_size_bytes = metadata.len();
+    let elapsed_ms = elapsed.as_millis() as u64;
+    let write_rate_mib_per_second = if elapsed.is_zero() {
+        None
+    } else {
+        Some((trace_size_bytes as f64 / 1024.0 / 1024.0) / elapsed.as_secs_f64())
+    };
+    let sidecar_path = plan.output.with_extension("out");
+    let (sidecar, sidecar_read_error) = match std::fs::read_to_string(&sidecar_path) {
+        Ok(contents) => (Some(parse_ttd_sidecar(&contents)), None),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (None, None),
+        Err(error) => (None, Some(error.to_string())),
+    };
+    let mut warnings = Vec::new();
+    if let Some(rate) = write_rate_mib_per_second {
+        if rate >= 32.0 {
+            warnings.push(format!(
+                "Trace growth is high at {rate:.1} MiB/s; use --max-file-mb, --ring, --record-for-seconds, or --module to bound future captures."
+            ));
+        }
+    }
+    if trace_size_bytes >= 1024 * 1024 * 1024 {
+        warnings.push(
+            "The trace exceeds 1 GiB. Keep it local and use bounded capture settings for exploratory recordings."
+                .to_string(),
+        );
+    }
+    if plan.capture.ring {
+        warnings.push(
+            "Ring mode retains only the newest portion of the recording once the size limit is reached."
+                .to_string(),
+        );
+    }
+    if let Some(sidecar) = sidecar.as_ref() {
+        if !sidecar.recording_engine_initialized || !sidecar.trace_dumped {
+            warnings.push(
+                "TTD sidecar did not confirm both recording-engine initialization and trace finalization; inspect the .out file before relying on this capture."
+                    .to_string(),
+            );
+        }
+    }
+
+    Ok(json!({
+        "trace_size_bytes": trace_size_bytes,
+        "trace_size_mib": trace_size_bytes as f64 / 1024.0 / 1024.0,
+        "elapsed_ms": elapsed_ms,
+        "write_rate_mib_per_second": write_rate_mib_per_second,
+        "sidecar": {
+            "path": sidecar_path,
+            "available": sidecar.is_some(),
+            "read_error": sidecar_read_error,
+            "allocated_vcpus": sidecar.as_ref().and_then(|summary| summary.allocated_vcpus),
+            "running_threads": sidecar.as_ref().and_then(|summary| summary.running_threads),
+            "simulation_duration_ms": sidecar.as_ref().and_then(|summary| summary.simulation_duration_ms),
+            "recording_engine_initialized": sidecar.as_ref().map(|summary| summary.recording_engine_initialized),
+            "tracing_started": sidecar.as_ref().map(|summary| summary.tracing_started),
+            "tracing_completed": sidecar.as_ref().map(|summary| summary.tracing_completed),
+            "trace_dumped": sidecar.as_ref().map(|summary| summary.trace_dumped),
+        },
+        "warnings": warnings,
+    }))
+}
+
+fn parse_ttd_sidecar(contents: &str) -> TtdSidecarSummary {
+    let mut summary = TtdSidecarSummary {
+        recording_engine_initialized: contents
+            .contains("RecordingEngine initialization successful."),
+        tracing_started: contents.contains("Tracing started at:"),
+        tracing_completed: contents.contains("Tracing completed at:"),
+        trace_dumped: contents.contains("Trace dumped to "),
+        ..Default::default()
+    };
+    for line in contents.lines() {
+        if let Some(values) = line.strip_prefix("Allocated processors:") {
+            if let Some((vcpus, threads)) = values.split_once(", running threads:") {
+                summary.allocated_vcpus = vcpus.trim().parse().ok();
+                summary.running_threads = threads.trim_end_matches('.').trim().parse().ok();
+            }
+        }
+        if line.starts_with("Simulation time of ") {
+            summary.simulation_duration_ms = line
+                .rsplit_once(':')
+                .and_then(|(_, duration)| duration.trim().strip_suffix("ms."))
+                .and_then(|duration| duration.parse().ok());
+        }
+    }
+    summary
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -258,8 +477,25 @@ fn command_from_trace_record_plan(
     plan: &TraceRecordPlan,
     launcher: &TraceRecordLauncher,
 ) -> Command {
-    let mut command = match launcher {
-        TraceRecordLauncher::Direct => Command::new(&plan.ttd_exe),
+    let mut command = ttd_command(&plan.ttd_exe, launcher);
+    command.args(&plan.recorder_args);
+    match plan.target {
+        TraceRecordTarget::Launch => {
+            command.arg("-launch");
+            // TTD requires its target command line after -launch. raw_arg preserves the caller's
+            // Windows command-line quoting without introducing a shell.
+            command.raw_arg(&plan.command_line);
+        }
+        TraceRecordTarget::Attach { process_id } => {
+            command.arg("-attach").arg(process_id.to_string());
+        }
+    }
+    command
+}
+
+fn ttd_command(ttd_exe: &Path, launcher: &TraceRecordLauncher) -> Command {
+    match launcher {
+        TraceRecordLauncher::Direct => Command::new(ttd_exe),
         TraceRecordLauncher::Sudo {
             executable,
             working_directory,
@@ -281,22 +517,79 @@ fn command_from_trace_record_plan(
                     unreachable!("asynchronous sudo mode is rejected")
                 }
             }
-            command.arg(&plan.ttd_exe);
+            command.arg(ttd_exe);
             command
         }
+    }
+}
+
+fn execute_trace_recording(
+    plan: &TraceRecordPlan,
+    launcher: &TraceRecordLauncher,
+) -> anyhow::Result<TraceRecordExecution> {
+    let mut child = command_from_trace_record_plan(plan, launcher)
+        .spawn()
+        .with_context(|| format!("launching TTD recorder {}", plan.ttd_exe.display()))?;
+    let (sender, receiver) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let _ = sender.send(child.wait());
+    });
+
+    let Some(record_for_seconds) = plan.capture.record_for_seconds else {
+        return Ok(TraceRecordExecution {
+            status: receiver
+                .recv()
+                .context("waiting for the TTD recorder process")??,
+            stopped_after_limit: false,
+            stop_exit_code: None,
+        });
     };
-    command.args(&plan.recorder_args);
-    match plan.target {
-        TraceRecordTarget::Launch => {
-            command.arg("-launch");
-            // TTD requires its target command line after -launch. raw_arg preserves the caller's
-            // Windows command-line quoting without introducing a shell.
-            command.raw_arg(&plan.command_line);
+
+    match receiver.recv_timeout(Duration::from_secs(record_for_seconds.into())) {
+        Ok(status) => Ok(TraceRecordExecution {
+            status: status.context("waiting for the TTD recorder process")?,
+            stopped_after_limit: false,
+            stop_exit_code: None,
+        }),
+        Err(mpsc::RecvTimeoutError::Timeout) => {
+            let process_id = plan
+                .target
+                .process_id()
+                .context("--record-for-seconds requires a trace target with a known process id")?;
+            let stop_status = command_from_ttd_stop(&plan.ttd_exe, launcher, process_id)
+                .status()
+                .context("stopping the bounded TTD recording")?;
+            ensure!(
+                stop_status.success(),
+                "TTD recorder stop request exited with {}; the recording may still be active",
+                stop_status
+                    .code()
+                    .map_or_else(|| "no exit code".to_string(), |code| code.to_string())
+            );
+            Ok(TraceRecordExecution {
+                status: receiver
+                    .recv()
+                    .context("waiting for TTD trace finalization after the stop request")??,
+                stopped_after_limit: true,
+                stop_exit_code: stop_status.code(),
+            })
         }
-        TraceRecordTarget::Attach { process_id } => {
-            command.arg("-attach").arg(process_id.to_string());
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            bail!("TTD recorder wait worker disconnected unexpectedly")
         }
     }
+}
+
+fn command_from_ttd_stop(
+    ttd_exe: &Path,
+    launcher: &TraceRecordLauncher,
+    process_id: u32,
+) -> Command {
+    let mut command = ttd_command(ttd_exe, launcher);
+    command
+        .arg("-accepteula")
+        .arg("-stop")
+        .arg(process_id.to_string());
     command
 }
 
@@ -464,6 +757,10 @@ fn find_executable_on_path(name: &str) -> Option<PathBuf> {
 
 fn trace_artifact_paths(output: &Path) -> Vec<PathBuf> {
     let mut artifacts = vec![output.to_path_buf()];
+    let sidecar = output.with_extension("out");
+    if sidecar.exists() {
+        artifacts.push(sidecar);
+    }
     let index = output.with_extension("idx");
     if index.exists() {
         artifacts.push(index);
@@ -704,8 +1001,16 @@ mod tests {
             command_line: r#""C:\Program Files\App\app.exe" --flag "two words""#.to_string(),
             ttd_exe: Some(env::current_exe().unwrap()),
             children: true,
+            modules: vec![
+                "RemoteDesktopManager_x64.exe".to_string(),
+                "coreclr.dll".to_string(),
+            ],
             max_file_mb: Some(128),
             ring: true,
+            replay_cpu_support: Some(TraceReplayCpuSupport::MostAggressive),
+            num_vcpu: Some(16),
+            profile: None,
+            record_for_seconds: None,
             disable_user_shadow_stack: false,
         }
     }
@@ -738,9 +1043,17 @@ mod tests {
                 output.to_string_lossy().as_ref(),
                 "-accepteula",
                 "-children",
+                "-module",
+                "RemoteDesktopManager_x64.exe",
+                "-module",
+                "coreclr.dll",
                 "-maxFile",
                 "128",
                 "-ring",
+                "-replayCpuSupport",
+                "MostAggressive",
+                "-numVCpu",
+                "16",
             ]
             .into_iter()
             .map(OsString::from)
@@ -760,6 +1073,120 @@ mod tests {
         assert!(trace_record_plan(&record_args(existing)).is_err());
         assert!(trace_record_plan(&record_args(temp.join("capture.ttd"))).is_err());
         fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn trace_record_profiles_resolve_bounded_capture_settings() {
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let output = temp.join("capture.run");
+        let mut args = record_args(output);
+        args.children = false;
+        args.modules.clear();
+        args.max_file_mb = None;
+        args.ring = false;
+        args.replay_cpu_support = None;
+        args.num_vcpu = None;
+        args.profile = Some(TraceRecordProfile::Startup);
+
+        let startup = trace_record_plan(&args).unwrap();
+        assert_eq!(startup.capture.max_file_mb, Some(1024));
+        assert!(!startup.capture.ring);
+        assert_eq!(startup.capture.profile, Some(TraceRecordProfile::Startup));
+
+        args.profile = Some(TraceRecordProfile::Recent);
+        let recent = trace_record_plan(&args).unwrap();
+        assert_eq!(recent.capture.max_file_mb, Some(2048));
+        assert!(recent.capture.ring);
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn trace_record_plan_rejects_module_paths_and_zero_vcpus() {
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let output = temp.join("capture.run");
+        let mut args = record_args(output);
+        args.modules = vec![r"C:\Windows\System32\kernel32.dll".to_string()];
+        assert!(trace_record_plan(&args).is_err());
+
+        args.modules = vec!["kernel32.dll".to_string()];
+        args.num_vcpu = Some(0);
+        assert!(trace_record_plan(&args).is_err());
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn trace_record_plan_rejects_unbounded_profile_conflicts_and_invalid_duration() {
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let output = temp.join("capture.run");
+        let mut args = record_args(output);
+        args.profile = Some(TraceRecordProfile::Startup);
+        assert!(trace_record_plan(&args).is_err());
+
+        args.profile = None;
+        args.max_file_mb = None;
+        args.ring = false;
+        args.record_for_seconds = Some(0);
+        assert!(trace_record_plan(&args).is_err());
+
+        args.record_for_seconds = Some(10);
+        assert!(trace_record_plan(&args).is_err());
+
+        args.disable_user_shadow_stack = true;
+        assert_eq!(
+            trace_record_plan(&args).unwrap().capture.record_for_seconds,
+            Some(10)
+        );
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn ttd_sidecar_parser_extracts_recording_summary() {
+        let summary = parse_ttd_sidecar(
+            "Allocated processors:55, running threads:16.\n\
+             RecordingEngine initialization successful.\n\
+             Tracing started at: Thu Jul  9 20:04:35 2026 (UTC)\n\
+             Simulation time of '' (x64): 188031ms.\n\
+             Tracing completed at: Thu Jul  9 20:07:43 2026 (UTC)\n\
+             Trace dumped to C:\\trace\\capture.run\n",
+        );
+
+        assert_eq!(
+            summary,
+            TtdSidecarSummary {
+                allocated_vcpus: Some(55),
+                running_threads: Some(16),
+                simulation_duration_ms: Some(188031),
+                recording_engine_initialized: true,
+                tracing_started: true,
+                tracing_completed: true,
+                trace_dumped: true,
+            }
+        );
+    }
+
+    #[test]
+    fn ttd_stop_command_uses_the_target_process_id() {
+        let command = command_from_ttd_stop(
+            Path::new(r"C:\tools\TTD.exe"),
+            &TraceRecordLauncher::Direct,
+            4242,
+        );
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            command.get_program(),
+            Path::new(r"C:\tools\TTD.exe").as_os_str()
+        );
+        assert_eq!(arguments, ["-accepteula", "-stop", "4242"]);
     }
 
     #[test]

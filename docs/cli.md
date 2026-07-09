@@ -56,9 +56,31 @@ target\debug\windbg-tool.exe --compact trace record `
   --command-line '"C:\apps\RemoteDesktopManager.exe" /AutoCloseAfter:10'
 ```
 
-The output directory must already exist and the `.run` path must not already exist. `--max-file-mb` bounds trace growth; combine it with `--ring` to retain only the most recent recording window. TTD traces include process-memory data and should be handled as sensitive artifacts.
+The output directory must already exist and the `.run` path must not already exist. TTD traces include process-memory data and should be handled as sensitive artifacts.
+
+For high-overhead startup captures, first choose a bounded capture strategy:
+
+```powershell
+# Preserve the earliest startup data, up to 1 GiB.
+target\debug\windbg-tool.exe trace record --profile startup `
+  --output C:\traces\rdm-startup.run `
+  --command-line '"C:\apps\RemoteDesktopManager.exe" /AutoCloseAfter:10'
+
+# Retain only the newest data in a 2 GiB rolling window.
+target\debug\windbg-tool.exe trace record --profile recent `
+  --output C:\traces\rdm-recent.run `
+  --command-line '"C:\apps\RemoteDesktopManager.exe" /AutoCloseAfter:10'
+```
+
+`--max-file-mb <size>` provides a custom cap; add `--ring` to retain the newest data after the cap is reached. `--profile` is a convenience preset and cannot be combined with either custom size option.
+
+Use repeatable `--module <basename>` to ask TTD to record only selected native modules, for example `--module RemoteDesktopManager_x64.exe --module coreclr.dll`. The values must be basenames, not paths. Module filtering is an experiment: managed code often executes as JIT-generated code associated with `coreclr.dll`, so filtering only the application executable can omit needed behavior.
+
+`--replay-cpu-support <default|most-aggressive|...>` forwards TTD's replay CPU compatibility setting. `--num-vcpu <count>` can reduce recorder memory pressure, but TTD warns that lowering it can severely slow recording; do not use it as a performance optimization.
 
 If TTD reports that the target has CET shadow stacks enabled, use `--disable-user-shadow-stack` to launch only that new target process with the official Windows process-creation mitigation set to **always off**, then have TTD attach by PID. This is an explicit, per-process compatibility override; it does not change system policy or the target binary. Attaching begins after process creation, so it can miss the earliest startup instructions.
+
+When using that CET-compatible attach mode, `--record-for-seconds <seconds>` asks TTD to stop recording after the requested window without terminating the target. This bounds a hung or slowed startup capture but necessarily retains the attach-mode earliest-startup limitation. After a successful recording, the result includes trace size, elapsed time, output rate, and parsed `.out` sidecar data such as allocated vCPUs, active threads, simulation duration, and finalization state.
 
 To enable synchronous sudo recording, choose **Input Closed** or **Inline** in **Settings > System > Advanced > Enable sudo**, or from an elevated terminal run:
 

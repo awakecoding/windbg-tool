@@ -676,6 +676,12 @@ struct TraceRecordArgs {
     #[arg(long, help = "Record child processes created by the launch target")]
     children: bool,
     #[arg(
+        long = "module",
+        value_name = "MODULE",
+        help = "Restrict recording to a native module basename; repeat for each module"
+    )]
+    modules: Vec<String>,
+    #[arg(
         long,
         value_name = "MEGABYTES",
         help = "Pass -maxFile to bound the trace size"
@@ -689,9 +695,71 @@ struct TraceRecordArgs {
     ring: bool,
     #[arg(
         long,
+        value_enum,
+        help = "TTD replay CPU compatibility contract; defaults to TTD's Default mode"
+    )]
+    replay_cpu_support: Option<TraceReplayCpuSupport>,
+    #[arg(
+        long,
+        value_name = "COUNT",
+        help = "Reserve this many TTD virtual CPUs; lower values reduce memory pressure but can slow recording"
+    )]
+    num_vcpu: Option<u32>,
+    #[arg(
+        long,
+        value_enum,
+        conflicts_with_all = ["max_file_mb", "ring"],
+        help = "Apply a bounded capture preset: startup retains early trace data; recent retains the newest window"
+    )]
+    profile: Option<TraceRecordProfile>,
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        requires = "disable_user_shadow_stack",
+        help = "Stop recording after this duration without terminating the CET-compatible launch target"
+    )]
+    record_for_seconds: Option<u32>,
+    #[arg(
+        long,
         help = "Launch only this target with CET user shadow stacks disabled, then record by PID attach"
     )]
     disable_user_shadow_stack: bool,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum TraceRecordProfile {
+    Startup,
+    Recent,
+}
+
+impl TraceRecordProfile {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Startup => "startup",
+            Self::Recent => "recent",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum TraceReplayCpuSupport {
+    Default,
+    MostConservative,
+    MostAggressive,
+    IntelAvxRequired,
+    IntelAvx2Required,
+}
+
+impl TraceReplayCpuSupport {
+    fn ttd_value(self) -> &'static str {
+        match self {
+            Self::Default => "Default",
+            Self::MostConservative => "MostConservative",
+            Self::MostAggressive => "MostAggressive",
+            Self::IntelAvxRequired => "IntelAvxRequired",
+            Self::IntelAvx2Required => "IntelAvx2Required",
+        }
+    }
 }
 
 #[derive(Debug, Args)]
