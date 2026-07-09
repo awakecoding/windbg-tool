@@ -677,6 +677,11 @@ struct TraceRecordArgs {
         help = "Use a fixed-size ring buffer; requires --max-file-mb"
     )]
     ring: bool,
+    #[arg(
+        long,
+        help = "Launch only this target with CET user shadow stacks disabled, then record by PID attach"
+    )]
+    disable_user_shadow_stack: bool,
 }
 
 #[derive(Debug, Args)]

@@ -2,6 +2,7 @@ use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
 use std::env;
 use std::ffi::OsString;
+use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -11,9 +12,15 @@ use windbg_dbgeng::{
     ProcessDumpOptions, ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
+use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
-use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+use windows::Win32::System::Threading::{
+    CreateProcessW, DeleteProcThreadAttributeList, GetCurrentProcess,
+    InitializeProcThreadAttributeList, OpenProcessToken, UpdateProcThreadAttribute,
+    EXTENDED_STARTUPINFO_PRESENT, LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION,
+    STARTUPINFOEXW,
+};
 
 use super::output::{print_value, OutputOptions};
 use super::{
@@ -59,8 +66,13 @@ pub(super) fn run_trace_record(
     args: TraceRecordArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let plan = trace_record_plan(&args)?;
+    let mut plan = trace_record_plan(&args)?;
     let launcher = trace_record_launcher()?;
+    if args.disable_user_shadow_stack {
+        plan.target = TraceRecordTarget::Attach {
+            process_id: launch_target_with_shadow_stacks_disabled(&plan.command_line)?,
+        };
+    }
     let status = command_from_trace_record_plan(&plan, &launcher)
         .status()
         .with_context(|| format!("launching TTD recorder {}", plan.ttd_exe.display()))?;
@@ -83,6 +95,8 @@ pub(super) fn run_trace_record(
             "recorder": plan.ttd_exe,
             "output": plan.output,
             "command_line": plan.command_line,
+            "recording_mode": plan.target.name(),
+            "target_process_id": plan.target.process_id(),
             "exit_code": status.code(),
             "elevation": launcher.name(),
             "artifacts": artifact_paths,
@@ -102,6 +116,29 @@ struct TraceRecordPlan {
     output: PathBuf,
     command_line: String,
     recorder_args: Vec<OsString>,
+    target: TraceRecordTarget,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TraceRecordTarget {
+    Launch,
+    Attach { process_id: u32 },
+}
+
+impl TraceRecordTarget {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Launch => "launch",
+            Self::Attach { .. } => "attach_after_cet_disabled_launch",
+        }
+    }
+
+    fn process_id(&self) -> Option<u32> {
+        match self {
+            Self::Launch => None,
+            Self::Attach { process_id } => Some(*process_id),
+        }
+    }
 }
 
 fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> {
@@ -149,13 +186,12 @@ fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> 
     if args.ring {
         recorder_args.push(OsString::from("-ring"));
     }
-    recorder_args.push(OsString::from("-launch"));
-
     Ok(TraceRecordPlan {
         ttd_exe,
         output: args.output.clone(),
         command_line: args.command_line.clone(),
         recorder_args,
+        target: TraceRecordTarget::Launch,
     })
 }
 
@@ -250,10 +286,90 @@ fn command_from_trace_record_plan(
         }
     };
     command.args(&plan.recorder_args);
-    // TTD requires its target command line after -launch. raw_arg preserves the caller's
-    // Windows command-line quoting without introducing a shell.
-    command.raw_arg(&plan.command_line);
+    match plan.target {
+        TraceRecordTarget::Launch => {
+            command.arg("-launch");
+            // TTD requires its target command line after -launch. raw_arg preserves the caller's
+            // Windows command-line quoting without introducing a shell.
+            command.raw_arg(&plan.command_line);
+        }
+        TraceRecordTarget::Attach { process_id } => {
+            command.arg("-attach").arg(process_id.to_string());
+        }
+    }
     command
+}
+
+const CET_USER_SHADOW_STACKS_ALWAYS_OFF: u64 = 0x0000_0000_2000_0000;
+const PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY: usize = 0x0002_0007;
+
+fn launch_target_with_shadow_stacks_disabled(command_line: &str) -> anyhow::Result<u32> {
+    let mut attribute_list_size = 0usize;
+    unsafe {
+        let _ = InitializeProcThreadAttributeList(
+            LPPROC_THREAD_ATTRIBUTE_LIST::default(),
+            1,
+            0,
+            &mut attribute_list_size,
+        );
+    }
+    ensure!(
+        attribute_list_size > 0,
+        "allocating the process mitigation attribute list"
+    );
+    let mut attribute_list_storage =
+        vec![0usize; attribute_list_size.div_ceil(std::mem::size_of::<usize>())];
+    let attribute_list = LPPROC_THREAD_ATTRIBUTE_LIST(attribute_list_storage.as_mut_ptr().cast());
+    let mut mitigation_policy = [0u64, CET_USER_SHADOW_STACKS_ALWAYS_OFF];
+    let mut startup = STARTUPINFOEXW::default();
+    let mut process_information = PROCESS_INFORMATION::default();
+    let mut command_line = wide_null(command_line);
+    let current_directory =
+        env::current_dir().context("resolving the current working directory")?;
+    let current_directory = wide_null(current_directory.as_os_str());
+
+    unsafe {
+        InitializeProcThreadAttributeList(attribute_list, 1, 0, &mut attribute_list_size)
+            .context("initializing the process mitigation attribute list")?;
+        let update = UpdateProcThreadAttribute(
+            attribute_list,
+            0,
+            PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
+            Some(mitigation_policy.as_mut_ptr().cast()),
+            std::mem::size_of_val(&mitigation_policy),
+            None,
+            None,
+        );
+        if let Err(error) = update {
+            DeleteProcThreadAttributeList(attribute_list);
+            return Err(error).context("setting the per-process CET mitigation");
+        }
+
+        startup.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+        startup.lpAttributeList = attribute_list;
+        let created = CreateProcessW(
+            None,
+            PWSTR(command_line.as_mut_ptr()),
+            None,
+            None,
+            false,
+            EXTENDED_STARTUPINFO_PRESENT,
+            None,
+            PCWSTR(current_directory.as_ptr()),
+            &startup.StartupInfo,
+            &mut process_information,
+        );
+        DeleteProcThreadAttributeList(attribute_list);
+        created.context("launching the target with CET shadow stacks disabled")?;
+        CloseHandle(process_information.hThread).context("closing the target thread handle")?;
+        CloseHandle(process_information.hProcess).context("closing the target process handle")?;
+    }
+
+    Ok(process_information.dwProcessId)
+}
+
+fn wide_null(value: impl AsRef<std::ffi::OsStr>) -> Vec<u16> {
+    value.as_ref().encode_wide().chain(Some(0)).collect()
 }
 
 fn current_process_is_elevated() -> anyhow::Result<bool> {
@@ -584,6 +700,7 @@ mod tests {
             children: true,
             max_file_mb: Some(128),
             ring: true,
+            disable_user_shadow_stack: false,
         }
     }
 
@@ -618,7 +735,6 @@ mod tests {
                 "-maxFile",
                 "128",
                 "-ring",
-                "-launch",
             ]
             .into_iter()
             .map(OsString::from)
@@ -673,6 +789,26 @@ mod tests {
             ]
         );
         assert_eq!(launcher.name(), "windows_sudo_disable_input");
+
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn cet_compatibility_mode_records_by_target_attach() {
+        let temp = test_directory();
+        fs::create_dir_all(&temp).unwrap();
+        let mut plan = trace_record_plan(&record_args(temp.join("capture.run"))).unwrap();
+        plan.target = TraceRecordTarget::Attach { process_id: 4242 };
+
+        let command = command_from_trace_record_plan(&plan, &TraceRecordLauncher::Direct);
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(arguments[arguments.len() - 2..], ["-attach", "4242"]);
+        assert_eq!(plan.target.name(), "attach_after_cet_disabled_launch");
+        assert_eq!(plan.target.process_id(), Some(4242));
 
         fs::remove_dir_all(temp).unwrap();
     }

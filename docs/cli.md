@@ -57,6 +57,8 @@ target\debug\windbg-tool.exe --compact trace record `
 
 The output directory must already exist and the `.run` path must not already exist. `--max-file-mb` bounds trace growth; combine it with `--ring` to retain only the most recent recording window. TTD traces include process-memory data and should be handled as sensitive artifacts.
 
+If TTD reports that the target has CET shadow stacks enabled, use `--disable-user-shadow-stack` to launch only that new target process with the official Windows process-creation mitigation set to **always off**, then have TTD attach by PID. This is an explicit, per-process compatibility override; it does not change system policy or the target binary. Attaching begins after process creation, so it can miss the earliest startup instructions.
+
 To enable synchronous sudo recording, choose **Input Closed** or **Inline** in **Settings > System > Advanced > Enable sudo**, or from an elevated terminal run:
 
 ```powershell
