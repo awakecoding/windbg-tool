@@ -663,11 +663,6 @@ struct TraceRecordArgs {
         help = "TTD.exe path; defaults to TTD_EXE or ttd.exe found on PATH"
     )]
     ttd_exe: Option<PathBuf>,
-    #[arg(
-        long,
-        help = "Pass -accepteula to TTD.exe after you have reviewed and accepted its EULA"
-    )]
-    accept_eula: bool,
     #[arg(long, help = "Record child processes created by the launch target")]
     children: bool,
     #[arg(

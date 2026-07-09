@@ -131,10 +131,8 @@ fn trace_record_plan(args: &TraceRecordArgs) -> anyhow::Result<TraceRecordPlan> 
         OsString::from("-noUI"),
         OsString::from("-out"),
         args.output.as_os_str().to_os_string(),
+        OsString::from("-accepteula"),
     ];
-    if args.accept_eula {
-        recorder_args.push(OsString::from("-accepteula"));
-    }
     if args.children {
         recorder_args.push(OsString::from("-children"));
     }
@@ -437,7 +435,6 @@ mod tests {
             output,
             command_line: r#""C:\Program Files\App\app.exe" --flag "two words""#.to_string(),
             ttd_exe: Some(env::current_exe().unwrap()),
-            accept_eula: true,
             children: true,
             max_file_mb: Some(128),
             ring: true,
