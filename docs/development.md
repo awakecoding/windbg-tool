@@ -13,6 +13,7 @@ This page keeps the deeper setup and contributor-oriented material out of the ma
 | `crates\windbg-install` | WinDbg package install/update/launch support |
 | `xtask` | Developer workflow commands |
 | `native\ttd-replay-bridge` | C++ bridge to the TTD Replay API |
+| `native\coreclr-dac-bridge` | C++ bridge hosting a CoreCLR DAC over an active DbgEng client |
 | `scripts\Get-TtdReplayRuntime.ps1` | Runtime acquisition helper |
 | `docs\architecture.md` | Architecture notes and layering details |
 
@@ -44,7 +45,7 @@ cargo xtask native-build
 - stages DbgEng runtime DLLs into `target\dbgeng-runtime`
 - downloads `TTDReplay.dll` and `TTDReplayCPU.dll` into `target\ttd-runtime`
 
-`cargo xtask native-build` configures and builds the C++ bridge under `target\native\ttd-replay-bridge`.
+`cargo xtask native-build` configures and builds the TTD bridge under `target\native\ttd-replay-bridge` and the x64 CoreCLR DAC bridge under `target\native\coreclr-dac-bridge`. Packaging copies both bridge DLLs beside `windbg-tool.exe`.
 
 For release packaging, use explicit target architecture inputs so the Rust binary, native bridge, and staged debugger runtime DLLs all match:
 
@@ -57,7 +58,7 @@ cargo build -p windbg-tool --release --target x86_64-pc-windows-msvc
 cargo xtask package --arch amd64 --target x86_64-pc-windows-msvc --profile release --out target\package\windbg-tool-x64
 ```
 
-Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64 package. Architecture-specific dependency staging uses `target\runtime\<arch>\...`, while the legacy no-argument `cargo xtask deps`, `cargo xtask native-build`, and `cargo xtask package` commands keep using the existing host-architecture directories.
+Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64 package. The CoreCLR DAC bridge currently supports only x64, so ARM64 packages do not include direct managed-break support. Architecture-specific dependency staging uses `target\runtime\<arch>\...`, while the legacy no-argument `cargo xtask deps`, `cargo xtask native-build`, and `cargo xtask package` commands keep using the existing host-architecture directories.
 
 Release packages statically link the MSVC C runtime into Rust code with `RUSTFLAGS=-C target-feature=+crt-static` and into the native bridge with `cargo xtask native-build --static-crt`. WinDbg, DbgEng, symbol, and TTD replay runtime DLLs remain dynamic dependencies and are copied into the package directory.
 
@@ -69,6 +70,8 @@ target\debug\windbg-tool.exe live capabilities
 ```
 
 The live backend securely preloads `dbgeng.dll` from this directory (or from beside `windbg-tool.exe` in a package) so its dependent DLLs resolve from the matching runtime set. It does not alter global DLL-search or security policy.
+
+For a direct managed breakpoint, the DAC bridge loads `mscordaccore.dll` only from the same directory as the CoreCLR module loaded by the target and requires exact file-version equality. It does not bundle a DAC or SOS. Enabling CLR module/code notifications requires `--allow-runtime-write`, which causes the DAC to write CLR debugger-notification state through DbgEng; run that workflow only in an approved test VM.
 
 Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
 

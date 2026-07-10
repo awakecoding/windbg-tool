@@ -278,7 +278,7 @@ enum LiveCommand {
     )]
     StartupBreak(LiveStartupBreakArgs),
     #[command(
-        about = "Launch .NET under DbgEng, use SOS bpmd for a managed method, and emit bounded hit evidence"
+        about = "Launch .NET under DbgEng, bind the matching CoreCLR DAC, and emit a managed method hit"
     )]
     ManagedBreak(LiveManagedBreakArgs),
     #[command(about = "Launch a process under DbgEng and keep it as a daemon-owned live target")]
@@ -698,6 +698,12 @@ struct LiveStartupBreakArgs {
         help = "DbgEng symbol expression; remains deferred until its module and symbol resolve"
     )]
     symbol: Option<String>,
+    #[arg(
+        long,
+        value_name = "MODULE",
+        help = "Stop on a trusted module-load event before configuring the requested code breakpoint"
+    )]
+    wait_for_module: Option<String>,
     #[arg(long, default_value_t = 5000)]
     initial_break_timeout_ms: u32,
     #[arg(long, default_value_t = 10000)]
@@ -714,20 +720,20 @@ struct LiveManagedBreakArgs {
     command_line: String,
     #[arg(
         long,
-        value_name = "PATH",
-        help = "Path to the x64 SOS debugger extension DLL"
-    )]
-    sos: PathBuf,
-    #[arg(
-        long,
-        help = "Managed assembly name without the .dll extension, for example RemoteDesktopManager"
+        value_name = "MODULE",
+        help = "Managed assembly module basename, for example RemoteDesktopManager.dll"
     )]
     managed_module: String,
     #[arg(
         long,
-        help = "Fully qualified managed method name, for example Namespace.Type.Method"
+        help = "Fully qualified managed metadata method name, for example Namespace.Type.Method"
     )]
     method: String,
+    #[arg(
+        long,
+        help = "Allow the matching DAC to write CLR debugger-notification state; use only in an approved test VM"
+    )]
+    allow_runtime_write: bool,
     #[arg(long, default_value_t = 30000)]
     initial_break_timeout_ms: u32,
     #[arg(long, default_value_t = 60000)]

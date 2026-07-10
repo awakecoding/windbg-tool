@@ -27,7 +27,9 @@ cargo xtask deps
 
 or run [scripts/Get-TtdReplayRuntime.ps1](../scripts/Get-TtdReplayRuntime.ps1) directly.
 
-The native bridge has a CMake project at [native/ttd-replay-bridge/CMakeLists.txt](../native/ttd-replay-bridge/CMakeLists.txt). `cargo xtask native-build` configures it against the restored `Microsoft.TimeTravelDebugging.Apis` package and emits the bridge under `target/native/ttd-replay-bridge`. Release packaging can pass `--arch amd64` or `--arch arm64` plus `--static-crt` so cross-compiled packages use the matching native bridge and statically link the MSVC runtime.
+The native replay bridge has a CMake project at [native/ttd-replay-bridge/CMakeLists.txt](../native/ttd-replay-bridge/CMakeLists.txt). `cargo xtask native-build` configures it against the restored `Microsoft.TimeTravelDebugging.Apis` package and emits the bridge under `target/native/ttd-replay-bridge`. Release packaging can pass `--arch amd64` or `--arch arm64` plus `--static-crt` so cross-compiled packages use the matching native bridge and statically link the MSVC runtime.
+
+Live managed breakpoints use a separate [CoreCLR DAC bridge](../native/coreclr-dac-bridge/CMakeLists.txt), never the TTD bridge. It is a narrow C ABI that receives the active DbgEng client, hosts a version- and architecture-matched `mscordaccore.dll`, and implements `ICLRDataTarget` using DbgEng module, memory, thread, and context services. It exposes only opaque handles and POD output for module/method resolution, CLR notification registration, and representative generated-code addresses. It does not attach `ICorDebug`, load SOS, invoke debugger extension commands, or inject managed code. The x64 bridge is staged separately under `target/native/coreclr-dac-bridge`; the target DAC remains runtime-provided and is not redistributed.
 
 ## Symbols
 

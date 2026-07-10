@@ -8,6 +8,13 @@ use std::{
     sync::OnceLock,
 };
 
+#[cfg(windows)]
+mod coreclr_dac;
+#[cfg(windows)]
+pub use coreclr_dac::{
+    CoreClrDacBridge, ManagedCodeAvailability, ManagedMethodInfo, ManagedRuntimeInfo,
+};
+
 pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
 pub const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
 pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
@@ -125,36 +132,55 @@ fn ensure_dbgeng_runtime_loaded() -> anyhow::Result<()> {
     static LOAD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
 
     let result = LOAD_RESULT.get_or_init(|| {
-        let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
-        let executable_path = env::current_exe().ok();
-        let dll =
-            match dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref()) {
-                Ok(dll) => dll,
-                Err(error) => return Err(error.to_string()),
+        (|| -> anyhow::Result<()> {
+            let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
+            let executable_path = env::current_exe().ok();
+            let dll =
+                dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref())?;
+            let Some(dll) = dll else {
+                return Ok(());
             };
-        let Some(dll) = dll else {
-            return Ok(());
-        };
-        let mut dll_wide = dll.as_os_str().encode_wide().collect::<Vec<_>>();
-        dll_wide.push(0);
-
-        // Keep the explicitly loaded module alive so DbgEng resolves all of its runtime dependencies
-        // from its own directory before DebugCreate is invoked.
-        unsafe {
-            LoadLibraryExW(
-                PCWSTR(dll_wide.as_ptr()),
-                None,
-                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-            )
-        }
-        .with_context(|| format!("loading DbgEng runtime {}", dll.display()))
-        .map(|_| ())
-        .map_err(|error| error.to_string())
+            let mut dll_wide = dll.as_os_str().encode_wide().collect::<Vec<_>>();
+            dll_wide.push(0);
+            // Keep the explicitly loaded module alive so DbgEng resolves all of its runtime
+            // dependencies from its own directory before DebugCreate is invoked.
+            unsafe {
+                LoadLibraryExW(
+                    PCWSTR(dll_wide.as_ptr()),
+                    None,
+                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                )
+            }
+            .with_context(|| format!("loading DbgEng runtime {}", dll.display()))?;
+            Ok(())
+        })()
+        .map_err(|error| format!("{error:#}"))
     });
 
     if let Err(error) = result {
         bail!("{error}");
     }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn enable_create_process_stop(
+    control: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+) -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_THIS_CLIENT,
+    };
+
+    let command = "sxe cpr\0".encode_utf16().collect::<Vec<_>>();
+    unsafe {
+        control.ExecuteWide(
+            DEBUG_OUTCTL_THIS_CLIENT,
+            PCWSTR(command.as_ptr()),
+            DEBUG_EXECUTE_DEFAULT,
+        )
+    }
+    .context("configuring DbgEng to stop on the create-process debug event")?;
     Ok(())
 }
 
@@ -221,6 +247,13 @@ pub struct LiveLaunchOptions {
 pub struct LiveLaunchSessionOptions {
     pub command_line: String,
     pub initial_break_timeout_ms: u32,
+    pub initial_stop: LiveInitialStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveInitialStop {
+    SoftwareBreakpoint,
+    CreateProcessEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -514,6 +547,14 @@ impl DebuggerSession {
         }
     }
 
+    pub fn open_coreclr_dac_bridge(
+        &self,
+        coreclr_path: &Path,
+        allow_target_writes: bool,
+    ) -> anyhow::Result<CoreClrDacBridge> {
+        CoreClrDacBridge::open(self, coreclr_path, allow_target_writes)
+    }
+
     pub fn wait_for_event(&self, timeout_ms: u32) -> anyhow::Result<DebuggerExecutionStatus> {
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
             DEBUG_STATUS_TIMEOUT, DEBUG_WAIT_DEFAULT,
@@ -538,6 +579,15 @@ impl DebuggerSession {
 
         unsafe {
             self.control.SetExecutionStatus(DEBUG_STATUS_GO)?;
+        }
+        Ok(self.execution_status())
+    }
+
+    pub fn continue_execution_handled(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STATUS_GO_HANDLED;
+
+        unsafe {
+            self.control.SetExecutionStatus(DEBUG_STATUS_GO_HANDLED)?;
         }
         Ok(self.execution_status())
     }
@@ -1369,6 +1419,10 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn continue_execution_handled(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn add_code_breakpoint_expression(
         &self,
         _expression: &str,
@@ -1455,6 +1509,7 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
     let session = launch_live_session_impl(LiveLaunchSessionOptions {
         command_line: options.command_line.clone(),
         initial_break_timeout_ms: options.initial_break_timeout_ms,
+        initial_stop: LiveInitialStop::SoftwareBreakpoint,
     })?;
     let execution_status = session.execution_status();
     let symbol_path = session.symbol_path.clone();
@@ -1493,7 +1548,10 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
     let system_objects: IDebugSystemObjects =
         client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
-    enable_initial_break(&control)?;
+    match options.initial_stop {
+        LiveInitialStop::SoftwareBreakpoint => enable_initial_break(&control)?,
+        LiveInitialStop::CreateProcessEvent => enable_create_process_stop(&control)?,
+    }
     unsafe {
         // DbgEng can mutate the command buffer; command_line is owned and remains live for the call.
         client
@@ -1504,7 +1562,11 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
             )
             .context("DbgEng CreateProcessWide failed")?;
     }
-    wait_for_initial_event(&control, options.initial_break_timeout_ms, "launch")?;
+    let initial_stop = match options.initial_stop {
+        LiveInitialStop::SoftwareBreakpoint => "software initial-break",
+        LiveInitialStop::CreateProcessEvent => "create-process",
+    };
+    wait_for_initial_event(&control, options.initial_break_timeout_ms, initial_stop)?;
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Live,

@@ -2,19 +2,18 @@ use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
 use std::env;
 use std::ffi::OsString;
-use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 use windbg_dbgeng::{
     launch_live_session, live_launch_initial_break, open_dump_session, start_process_server,
     write_process_dump, BreakpointInfo, DebuggerSession, DumpKind, DumpOpenOptions,
-    DumpWriteOptions, LiveLaunchEnd, LiveLaunchOptions, LiveLaunchSessionOptions, ModuleInfo,
-    ProcessDumpOptions, ProcessServerOptions,
+    DumpWriteOptions, LiveInitialStop, LiveLaunchEnd, LiveLaunchOptions, LiveLaunchSessionOptions,
+    ManagedCodeAvailability, ModuleInfo, ProcessDumpOptions, ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
 use windows::core::{PCWSTR, PWSTR};
@@ -74,18 +73,47 @@ pub(super) fn run_live_startup_break(
 ) -> anyhow::Result<()> {
     let end = parse_live_launch_end(&args.end)?;
     let breakpoint_spec = startup_breakpoint_spec(&args)?;
+    let module_load_filter = args
+        .wait_for_module
+        .as_deref()
+        .map(validate_module_load_filter)
+        .transpose()?;
     let session = launch_live_session(LiveLaunchSessionOptions {
         command_line: args.command_line.clone(),
         initial_break_timeout_ms: args.initial_break_timeout_ms,
+        initial_stop: LiveInitialStop::SoftwareBreakpoint,
     })?;
 
     let result = (|| {
         let initial_event = session.summary();
+        let module_load = module_load_filter
+            .as_deref()
+            .map(|module| {
+                session
+                    .execute_command(&format!("sxe ld:{module}"))
+                    .with_context(|| format!("configuring DbgEng to stop when {module} loads"))?;
+                let continued = session.continue_execution()?;
+                let wait = session.wait_for_event(args.wait_timeout_ms)?;
+                let event = session
+                    .last_event()
+                    .context("reading the requested DbgEng module-load event")?;
+                ensure!(
+                    event.event_name == "load_module" && event.module_base.is_some(),
+                    "DbgEng did not stop on the requested {module} module-load event"
+                );
+                Ok::<_, anyhow::Error>(json!({
+                    "module": module,
+                    "continued": continued,
+                    "wait": wait,
+                    "event": event
+                }))
+            })
+            .transpose()?;
         let requested_breakpoint = match breakpoint_spec {
             StartupBreakpointSpec::InitialBreak => None,
             _ => Some(set_startup_breakpoint(&session, &breakpoint_spec)?),
         };
-        let continued = requested_breakpoint
+        let continued_to_breakpoint = requested_breakpoint
             .is_some()
             .then(|| session.continue_execution())
             .transpose()?;
@@ -119,7 +147,8 @@ pub(super) fn run_live_startup_break(
             "command_line": args.command_line,
             "breakpoint_spec": breakpoint_spec,
             "initial_event": initial_event,
-            "continued": continued,
+            "module_load": module_load,
+            "continued_to_breakpoint": continued_to_breakpoint,
             "event": event,
             "breakpoint": {
                 "requested": requested_breakpoint,
@@ -153,103 +182,206 @@ pub(super) fn run_live_managed_break(
     args: LiveManagedBreakArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    const RUNTIME_ENTRY_SYMBOL: &str = "coreclr!coreclr_execute_assembly";
+    const CORECLR_MODULE: &str = "coreclr.dll";
+    const CLR_NOTIFICATION_EXCEPTION: u32 = 0xe044_4143;
+    const CLR_NOTIFICATION_FILTER: &str = "clrn";
 
     let end = parse_live_launch_end(&args.end)?;
-    let managed_module =
-        validate_managed_breakpoint_token(&args.managed_module, "--managed-module")?;
+    let managed_module = validate_managed_module(&args.managed_module)?;
     let method = validate_managed_breakpoint_token(&args.method, "--method")?;
-    let sos_path = args
-        .sos
-        .canonicalize()
-        .with_context(|| format!("resolving SOS extension {}", args.sos.display()))?;
-    ensure!(sos_path.is_file(), "--sos must identify a file");
-    let sos_command_path = dbgeng_command_path(&sos_path)?;
     let session = launch_live_session(LiveLaunchSessionOptions {
         command_line: args.command_line.clone(),
         initial_break_timeout_ms: args.initial_break_timeout_ms,
+        initial_stop: LiveInitialStop::CreateProcessEvent,
     })?;
 
     let result = (|| {
         let initial_event = session.summary();
-        let runtime_entry_breakpoint =
-            session.add_code_breakpoint_expression(RUNTIME_ENTRY_SYMBOL)?;
-        let continued_to_runtime = session.continue_execution()?;
-        let runtime_wait = session
+        session
+            .execute_command(&format!("sxe ld:{CORECLR_MODULE}"))
+            .context("configuring the non-invasive CoreCLR module-load stop")?;
+        session
+            .execute_command(&format!("sxe {CLR_NOTIFICATION_FILTER}"))
+            .context("configuring CLR code-generation notification handling")?;
+
+        let continued_to_coreclr = session.continue_execution()?;
+        let coreclr_wait = session
             .wait_for_event(args.wait_timeout_ms)
-            .context("waiting for the CoreCLR runtime-entry breakpoint")?;
-        let runtime_event = session
+            .context("waiting for CoreCLR to load")?;
+        let coreclr_event = session
             .last_event()
-            .context("reading the CoreCLR runtime-entry event")?;
-        let runtime_hit = runtime_wait.name.as_deref() == Some("break")
-            && runtime_event.event_name == "breakpoint"
-            && runtime_event.breakpoint_id == Some(runtime_entry_breakpoint.id);
+            .context("reading the CoreCLR module-load event")?;
         ensure!(
-            runtime_hit,
-            "DbgEng did not stop at the CoreCLR runtime-entry breakpoint before configuring SOS"
+            coreclr_wait.name.as_deref() == Some("break")
+                && coreclr_event.event_name == "load_module"
+                && coreclr_event.module_base.is_some(),
+            "DbgEng did not stop on the requested CoreCLR module-load event"
         );
 
-        let load_sos_command = format!(r#".load "{sos_command_path}""#);
-        let set_managed_breakpoint_command = format!("!bpmd {managed_module} {method}");
-        let sos_output = execute_sos_breakpoint_commands(
-            &session,
-            &load_sos_command,
-            &set_managed_breakpoint_command,
-        )?;
-        let sos_output_excerpt = sos_output["text"]
-            .as_str()
-            .unwrap_or_default()
-            .chars()
-            .take(2048)
-            .collect::<String>();
+        let modules_after_coreclr_load = session.modules()?;
+        let coreclr_module = find_loaded_module(&modules_after_coreclr_load, CORECLR_MODULE)?;
+        let coreclr_path = module_image_path(coreclr_module, "CoreCLR")?;
+        let mut dac = session
+            .open_coreclr_dac_bridge(&coreclr_path, args.allow_runtime_write)
+            .context("initializing the exact-version CoreCLR DAC bridge")?;
+        dac.enable_module_load_notifications()
+            .context("requesting CLR managed-module load notifications")?;
 
-        let continued_to_managed = session.continue_execution()?;
-        let managed_wait = session
-            .wait_for_event(args.wait_timeout_ms)
+        session
+            .execute_command(&format!("sxe ld:{managed_module}"))
             .with_context(|| {
-                format!("waiting for the SOS managed breakpoint; SOS output: {sos_output_excerpt}")
+                format!("configuring the managed-module load stop for {managed_module}")
             })?;
-        let managed_event = session
+        let continued_to_managed_module = session.continue_execution()?;
+        let managed_module_wait = session
+            .wait_for_event(args.wait_timeout_ms)
+            .with_context(|| format!("waiting for managed module {managed_module} to load"))?;
+        let managed_module_event = session
             .last_event()
-            .context("reading the SOS managed-breakpoint event")?;
-        let managed_hit = managed_wait.name.as_deref() == Some("break")
-            && managed_event.event_name == "breakpoint"
-            && managed_event.breakpoint_id != Some(runtime_entry_breakpoint.id);
+            .context("reading the managed module-load event")?;
         ensure!(
-            managed_hit,
-            "SOS bpmd did not produce a distinct managed breakpoint event for {managed_module}!{method}"
+            managed_module_wait.name.as_deref() == Some("break")
+                && managed_module_event.event_name == "load_module"
+                && managed_module_event.module_base.is_some(),
+            "DbgEng did not stop on the requested managed module-load event"
         );
+        let modules_after_managed_load = session.modules()?;
+        let loaded_managed_module =
+            find_loaded_module(&modules_after_managed_load, &managed_module)?;
+        let managed_module_path = module_image_path(loaded_managed_module, "managed assembly")?;
+        let managed_module_observation = wait_for_managed_module_in_dac(
+            &session,
+            &dac,
+            &managed_module_path,
+            args.wait_timeout_ms,
+            CLR_NOTIFICATION_EXCEPTION,
+        )?;
+        let (resolved_method, availability) = dac
+            .resolve_and_notify(&managed_module_path, &method)
+            .with_context(|| {
+                format!(
+                    "resolving {method} in the selected managed module {managed_module} through the DAC"
+                )
+            })?;
 
+        let (code_notification, generated_method) = match availability {
+            ManagedCodeAvailability::Available => (None, resolved_method.clone()),
+            ManagedCodeAvailability::PendingJit => {
+                let continued = session.continue_execution()?;
+                let wait = session
+                    .wait_for_event(args.wait_timeout_ms)
+                    .context("waiting for the requested CLR code-generation notification")?;
+                let event = session
+                    .last_event()
+                    .context("reading the CLR code-generation notification")?;
+                ensure!(
+                    wait.name.as_deref() == Some("break")
+                        && event.event_name == "exception"
+                        && event
+                            .exception
+                            .as_ref()
+                            .is_some_and(|exception| exception.code == CLR_NOTIFICATION_EXCEPTION),
+                    "DbgEng did not stop on the requested CLR code-generation notification"
+                );
+                let generated = dac.refresh_method_code().context(
+                    "refreshing the selected method after its CLR code-generation notification",
+                )?;
+                ensure!(
+                    generated.representative_entry_address.is_some(),
+                    "the CLR notification did not produce a representative native entry address"
+                );
+                (
+                    Some(json!({
+                        "exception_code": format!("0x{CLR_NOTIFICATION_EXCEPTION:08X}"),
+                        "continued": continued,
+                        "wait": wait,
+                        "event": event,
+                        "selected_method_code_available": true
+                    })),
+                    generated,
+                )
+            }
+        };
+        ensure!(
+            generated_method.token == resolved_method.token,
+            "the DAC returned generated code for a different MethodDef token"
+        );
+        let native_entry_address = generated_method
+            .representative_entry_address
+            .context("the selected managed method has no generated native entry address")?;
+        let hardware_breakpoint = session.add_data_breakpoint(
+            native_entry_address,
+            1,
+            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_BREAK_EXECUTE,
+        )?;
+        let continued_to_hardware_breakpoint = if code_notification.is_some() {
+            session.continue_execution_handled()?
+        } else {
+            session.continue_execution()?
+        };
+        let hardware_wait = session
+            .wait_for_event(args.wait_timeout_ms)
+            .context("waiting for the managed hardware execute breakpoint")?;
+        let hardware_event = session
+            .last_event()
+            .context("reading the managed hardware execute-breakpoint event")?;
         let registers = session.core_registers()?;
+        let hardware_breakpoint_hit = hardware_wait.name.as_deref() == Some("break")
+            && hardware_event.event_name == "breakpoint"
+            && hardware_event.breakpoint_id == Some(hardware_breakpoint.id)
+            && registers.instruction_offset == Some(native_entry_address);
         let context = live_stop_context(&session, registers, args.max_frames)?;
         Ok(json!({
-            "workflow": "live_managed_break",
+            "workflow": "live_managed_break_dac",
             "command_line": args.command_line,
             "initial_event": initial_event,
-            "runtime_entry_breakpoint": {
-                "expression": RUNTIME_ENTRY_SYMBOL,
-                "configured": runtime_entry_breakpoint,
-                "continued": continued_to_runtime,
-                "wait": runtime_wait,
-                "event": runtime_event,
-                "hit": runtime_hit,
-                "hit_evidence": "DbgEng breakpoint event ID matches the CoreCLR runtime-entry breakpoint"
+            "coreclr_module_load": {
+                "module": CORECLR_MODULE,
+                "continued": continued_to_coreclr,
+                "wait": coreclr_wait,
+                "event": coreclr_event,
+                "loaded_module": coreclr_module,
+                "runtime": dac.runtime_info()
+            },
+            "managed_module_load": {
+                "managed_module": managed_module,
+                "continued_to_dbgeng_load_event": continued_to_managed_module,
+                "dbgeng_load_wait": managed_module_wait,
+                "dbgeng_load_event": managed_module_event,
+                "observation": managed_module_observation,
+                "loaded_module": loaded_managed_module
+            },
+            "managed_resolution": {
+                "method_request": method,
+                "resolved_method": resolved_method,
+                "method_after_code_generation": generated_method,
+                "runtime_writes_explicitly_allowed": args.allow_runtime_write,
+                "exact_overload_signature_selection": false,
+                "private_methods_supported": true
+            },
+            "code_generation": {
+                "notification_filter": CLR_NOTIFICATION_FILTER,
+                "notification": code_notification,
+                "representative_native_entry_address": format!("0x{native_entry_address:X}")
             },
             "managed_breakpoint": {
-                "kind": "sos_bpmd",
-                "sos_path": sos_path,
-                "managed_module": managed_module,
-                "method": method,
-                "load_command": load_sos_command,
-                "set_command": set_managed_breakpoint_command,
-                "output": sos_output,
-                "continued": continued_to_managed,
-                "wait": managed_wait,
-                "event": managed_event,
-                "hit": managed_hit,
-                "hit_evidence": "SOS bpmd was configured after CoreCLR loaded and DbgEng reported a distinct breakpoint event"
+                "kind": "hardware_execute",
+                "configured": hardware_breakpoint,
+                "continued": continued_to_hardware_breakpoint,
+                "wait": hardware_wait,
+                "event": hardware_event,
+                "hit": hardware_breakpoint_hit,
+                "hit_evidence": if hardware_breakpoint_hit {
+                    "the DbgEng hardware breakpoint event ID and current instruction pointer both match the DAC-mapped native entry for the selected MethodDef"
+                } else {
+                    "the selected MethodDef was resolved by the DAC, but DbgEng did not report a matching hardware execute breakpoint hit"
+                }
             },
             "context": context,
+            "limitations": [
+                "This vertical slice requires one unambiguous metadata method name; exact overload signature selection is not yet implemented.",
+                "The breakpoint covers the DAC representative entry address. Generic instantiations, tiered recompilation, ReadyToRun entry indirection, and re-JIT/unload transitions require additional validation."
+            ],
             "end": end
         }))
     })();
@@ -263,6 +395,19 @@ pub(super) fn run_live_managed_break(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
     }
+}
+
+fn validate_module_load_filter(value: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    ensure!(!value.is_empty(), "--wait-for-module must not be empty");
+    ensure!(
+        value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '.' | '_' | '-')),
+        "--wait-for-module must be a module basename"
+    );
+    Ok(value.to_string())
 }
 
 fn live_stop_context(
@@ -314,82 +459,94 @@ fn validate_managed_breakpoint_token(value: &str, argument: &str) -> anyhow::Res
     Ok(value.to_string())
 }
 
-fn dbgeng_command_path(path: &Path) -> anyhow::Result<String> {
-    let path = path.to_string_lossy();
-    let path = path
-        .strip_prefix(r"\\?\UNC\")
-        .map(|value| format!(r"\\{value}"))
-        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
-        .unwrap_or_else(|| path.into_owned());
-    let path = path.replace('\\', "/");
+fn validate_managed_module(value: &str) -> anyhow::Result<String> {
+    let path = validate_module_load_filter(value)?;
     ensure!(
-        !path.contains('"'),
-        "DbgEng command paths cannot contain quotes"
+        Path::new(&path)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("dll") || extension.eq_ignore_ascii_case("exe")
+            }),
+        "--managed-module must be a managed .dll or .exe basename"
     );
     Ok(path)
 }
 
-fn execute_sos_breakpoint_commands(
+fn module_image_path(module: &ModuleInfo, role: &str) -> anyhow::Result<PathBuf> {
+    [
+        module.loaded_image_name.as_deref(),
+        module.image_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .with_context(|| {
+        format!("DbgEng did not report an accessible {role} image path for the selected module")
+    })
+}
+
+fn wait_for_managed_module_in_dac(
     session: &DebuggerSession,
-    load_sos_command: &str,
-    set_managed_breakpoint_command: &str,
+    dac: &windbg_dbgeng::CoreClrDacBridge,
+    managed_module_path: &Path,
+    wait_timeout_ms: u32,
+    clr_notification_exception: u32,
 ) -> anyhow::Result<Value> {
-    const MAX_SOS_OUTPUT_BYTES: usize = 16 * 1024;
+    const MAX_CLR_NOTIFICATIONS: usize = 64;
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("reading the system clock for the SOS output log")?
-        .as_nanos();
-    let log_path = env::temp_dir().join(format!(
-        "windbg-tool-sos-{}-{timestamp}.log",
-        std::process::id()
-    ));
-    let open_log_command = format!(r#".logopen "{}""#, log_path.display());
-    session
-        .execute_command(&open_log_command)
-        .context("opening the bounded SOS command-output log")?;
-
-    let command_result = (|| {
-        session
-            .execute_command(load_sos_command)
-            .context("loading the SOS debugger extension")?;
-        session
-            .execute_command(set_managed_breakpoint_command)
-            .context("configuring the SOS managed breakpoint")
-    })();
-    let close_result = session
-        .execute_command(".logclose")
-        .context("closing the SOS command-output log");
-    let output_result = fs::read(&log_path)
-        .with_context(|| format!("reading SOS command output {}", log_path.display()));
-    let remove_result = fs::remove_file(&log_path)
-        .with_context(|| format!("removing SOS command output {}", log_path.display()));
-
-    if let Err(command_error) = command_result {
-        let cleanup_failures = [close_result.err(), output_result.err(), remove_result.err()]
-            .into_iter()
-            .flatten()
-            .map(|error| error.to_string())
-            .collect::<Vec<_>>();
-        if cleanup_failures.is_empty() {
-            return Err(command_error);
+    let deadline = Instant::now() + Duration::from_millis(u64::from(wait_timeout_ms));
+    let mut notifications = Vec::new();
+    let mut continue_as_handled = false;
+    for attempt in 1..=MAX_CLR_NOTIFICATIONS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "timed out waiting for the CLR to register the selected managed module"
+        );
+        let remaining_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        let continued = if continue_as_handled {
+            session.continue_execution_handled()?
+        } else {
+            session.continue_execution()?
+        };
+        let wait = session
+            .wait_for_event(remaining_ms)
+            .context("waiting for the next CLR managed-module notification")?;
+        let event = session
+            .last_event()
+            .context("reading the CLR managed-module notification")?;
+        let is_clr_notification = event.event_name == "exception"
+            && event
+                .exception
+                .as_ref()
+                .is_some_and(|exception| exception.code == clr_notification_exception);
+        ensure!(
+            wait.name.as_deref() == Some("break") && is_clr_notification,
+            "DbgEng stopped before the CLR registered the selected managed module"
+        );
+        let module_available = dac.is_module_loaded(managed_module_path)?;
+        notifications.push(json!({
+            "attempt": attempt,
+            "continued": continued,
+            "wait": wait,
+            "event": event,
+            "module_available": module_available
+        }));
+        if module_available {
+            return Ok(json!({
+                "notification_exception_code": format!("0x{clr_notification_exception:08X}"),
+                "notifications": notifications,
+                "module_available": true
+            }));
         }
-        return Err(command_error).context(format!(
-            "SOS command cleanup also failed: {}",
-            cleanup_failures.join("; ")
-        ));
+        continue_as_handled = true;
     }
-    close_result?;
-    let output = output_result?;
-    remove_result?;
-    let truncated = output.len() > MAX_SOS_OUTPUT_BYTES;
-    let output =
-        String::from_utf8_lossy(&output[..output.len().min(MAX_SOS_OUTPUT_BYTES)]).into_owned();
-    Ok(json!({
-        "text": output,
-        "byte_limit": MAX_SOS_OUTPUT_BYTES,
-        "truncated": truncated
-    }))
+
+    bail!(
+        "the CLR emitted {MAX_CLR_NOTIFICATIONS} notifications without registering the selected managed module"
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1286,6 +1443,11 @@ pub(super) fn live_capabilities() -> Value {
                 "notes": "Launches at the initial break, sets an absolute, module-RVA, or deferred symbol-expression code breakpoint, then reports bounded hit evidence, thread/IP/module/register/stack context."
             },
             {
+                "feature": "managed method breakpoint workflow",
+                "status": "x64_coreclr_dac_vertical_slice",
+                "notes": "Uses a matching CoreCLR DAC through the active DbgEng client, resolves one unambiguous metadata method, requests CLR code generation, and then sets a DbgEng hardware execute breakpoint. CLR notification writes require --allow-runtime-write and an approved test VM."
+            },
+            {
                 "feature": "dump creation",
                 "status": "dbghelp_minidump_writer",
                 "notes": "Creates mini or full process dumps through DbgHelp from the Microsoft Debugging Platform runtime, either one-shot from a process id or from a daemon-owned live target."
@@ -1765,6 +1927,7 @@ mod tests {
             module: Some("target.exe".to_string()),
             module_offset: Some("0x1000".to_string()),
             symbol: None,
+            wait_for_module: None,
             initial_break_timeout_ms: 5000,
             wait_timeout_ms: 10000,
             max_frames: 16,
@@ -1817,14 +1980,12 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_verbatim_paths_for_dbgeng_commands() {
+    fn validates_managed_module_basename() {
         assert_eq!(
-            dbgeng_command_path(Path::new(r"\\?\C:\tools\sos.dll")).unwrap(),
-            "C:/tools/sos.dll"
+            validate_managed_module("RemoteDesktopManager.dll").unwrap(),
+            "RemoteDesktopManager.dll"
         );
-        assert_eq!(
-            dbgeng_command_path(Path::new(r"\\?\UNC\server\share\sos.dll")).unwrap(),
-            "//server/share/sos.dll"
-        );
+        assert!(validate_managed_module("RemoteDesktopManager").is_err());
+        assert!(validate_managed_module(r#"RemoteDesktopManager.dll;qd"#).is_err());
     }
 }

@@ -7,9 +7,9 @@ use windbg_dbgeng::{
     attach_live_session, launch_live_session, open_dump_session, BreakpointInfo, CoreRegisterState,
     DebuggerEventInfo, DebuggerExecutionStatus, DebuggerSession, DebuggerSessionKind,
     DebuggerSessionSummary, DisassemblyResult, DumpKind, DumpOpenOptions, DumpWriteOptions,
-    DumpWriteResult, EvaluationResult, LiveAttachOptions, LiveLaunchSessionOptions,
-    MemoryReadResult, ModuleInfo, SourceLocation, StackFrameInfo, SymbolInfo, ThreadContext,
-    ThreadInfo,
+    DumpWriteResult, EvaluationResult, LiveAttachOptions, LiveInitialStop,
+    LiveLaunchSessionOptions, MemoryReadResult, ModuleInfo, SourceLocation, StackFrameInfo,
+    SymbolInfo, ThreadContext, ThreadInfo,
 };
 
 pub type TargetId = u64;
@@ -292,6 +292,7 @@ impl TargetRegistry {
         let session = launch_live_session(LiveLaunchSessionOptions {
             command_line: request.command_line,
             initial_break_timeout_ms: request.initial_break_timeout_ms,
+            initial_stop: LiveInitialStop::SoftwareBreakpoint,
         })?;
         Ok(self.insert_target(session))
     }

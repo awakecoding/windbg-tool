@@ -111,22 +111,24 @@ Use `--initial-break` when no reliable code breakpoint is available or the host 
 
 `--end terminate` is the default for disposable startup probes. Use `--end detach` only when the debuggee should continue after the captured event.
 
-## Managed SOS breakpoints
+## Managed CoreCLR DAC breakpoints
 
-`live managed-break` uses DbgEng and the supported SOS `bpmd` command to stop on a managed method. It first stops at the native `coreclr!coreclr_execute_assembly` export so CoreCLR is loaded, loads the explicit x64 SOS extension, configures `!bpmd`, then requires a distinct DbgEng breakpoint event before reporting `managed_breakpoint.hit: true`. The response keeps the initial event, the native CoreCLR setup breakpoint, and the managed event separate.
+`live managed-break` does not load SOS or execute `!bpmd`. It starts with a DbgEng create-process event, stops on CoreCLR and the requested managed module load, dynamically loads the exact x64 `mscordaccore.dll` that is a sibling of the target's loaded `coreclr.dll`, resolves the selected `MethodDef` through the DAC, requests CLR code-generation notification, then creates a DbgEng **hardware execute** breakpoint at the DAC-mapped native entry. `managed_breakpoint.hit` is true only when both the DbgEng breakpoint ID and current instruction pointer match that DAC-mapped address.
 
-Install the current Microsoft debugger extension with `dotnet tool install --global dotnet-debugger-extensions`, then `dotnet-debugger-extensions install --architecture X64`, or provide an equivalent compatible x64 `sos.dll`:
+Build and stage `windbg_coreclr_dac_bridge.dll` with `cargo xtask native-build`; `cargo xtask package` places it beside `windbg-tool.exe`. A development build can set `WINDBG_CORECLR_DAC_BRIDGE_DLL` to the bridge DLL. The target DAC is never bundled: it must exactly match the target CoreCLR architecture and file version.
+
+CLR's notification mechanism writes debugger-notification state into the target. Therefore `--allow-runtime-write` is explicit and should be used only in an approved test VM. Without it the command fails clearly before any target write; it does not disable endpoint protection or silently fall back to SOS.
 
 ```powershell
 target\debug\windbg-tool.exe --compact live managed-break `
   --command-line '"C:\apps\RemoteDesktopManager_x64.exe" /AutoCloseAfter:10' `
-  --sos "$env:USERPROFILE\.dotnet\sos\sos.dll" `
-  --managed-module RemoteDesktopManager `
+  --managed-module RemoteDesktopManager.dll `
   --method Devolutions.RemoteDesktopManager.Program.Main `
+  --allow-runtime-write `
   --end terminate
 ```
 
-The managed assembly and method inputs are intentionally limited to managed metadata-name characters; this prevents a generated SOS command from accepting additional debugger commands.
+The vertical slice resolves regular private methods as normal metadata. It requires a unique fully-qualified metadata name and currently rejects ambiguous overloads; C# signatures, generic instantiations, ReadyToRun indirection, tiered recompilation, re-JIT, and unload transitions remain explicit limits. The structured response keeps CoreCLR/module-load events, DAC runtime/token/entry resolution, CLR notification, hardware breakpoint, and final method-hit context distinct.
 
 ## AI-oriented DbgEng target inspection
 
