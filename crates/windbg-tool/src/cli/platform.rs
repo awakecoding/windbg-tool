@@ -1,7 +1,7 @@
 use anyhow::{bail, ensure, Context};
 use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsString;
 use std::fs;
@@ -238,6 +238,7 @@ struct StartupProfileEvent {
     loaded_module_count: Option<usize>,
     live_thread_count: Option<usize>,
     context: Value,
+    thread_accounting: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -303,6 +304,7 @@ struct StartupProfileRun {
     lifecycle_summary: Value,
     debuggee_output: Value,
     module_provenance: Value,
+    dbgeng_module_parameters: Value,
     largest_observed_gaps: Vec<StartupProfileGap>,
     gaps_excluded_from_ranking: Vec<StartupProfileExcludedGap>,
     counts: Value,
@@ -414,11 +416,13 @@ pub(super) fn run_live_startup_profile(
             "event_timestamps": "Observed when DbgEng returns control to windbg-tool, not target-side instruction timestamps.",
             "completion_module": "A requested module load is an observable image-load boundary only. It does not establish UI readiness, managed assembly registration, first managed method execution, or successful application initialization.",
             "quiet_interval": "A requested settle interval establishes only that no configured DbgEng lifecycle stop was observed while the target was resumed for that duration. It does not establish CPU, I/O, UI, or application quiescence.",
-            "not_cpu_time": true,
+            "lifecycle_phase_cpu_time": "not_available; lifecycle phases and inter-event gaps remain host wall-time measurements.",
+            "thread_accounting": "When requested, separate read-only DbgEng per-thread CPU counters can be returned at selected lifecycle stops in raw 100 ns units and fixture-validated milliseconds. They do not attribute a lifecycle gap to CPU work.",
             "regression_interpretation": "Repeated values can identify wall-clock variability or candidates for comparison with a baseline. They do not attribute CPU use or prove a regression."
         },
         "limitations": [
             "DbgEng lifecycle events do not establish managed assembly registration, managed method execution, JIT activity, or CPU attribution.",
+            "Optional per-thread accounting is a bounded, validity-gated DbgEng snapshot. It is independent from the lifecycle wall clock, returns raw 100 ns counters and fixture-validated millisecond projections, and never establishes causal attribution.",
             debuggee_output_limitation,
             "Largest observed gaps rank only adjacent retained events while the full lifecycle filter set was active. Tail-filter gaps are retained as excluded coverage diagnostics, not ranked evidence.",
             "First-chance exceptions are opt-in because managed startup can generate enough events to consume the bounded timeline."
@@ -1023,6 +1027,8 @@ fn collect_startup_profile_stops(
         counts,
         module_identities,
         captured_contexts,
+        captured_thread_accounting_snapshots,
+        ..
     } = recording;
     let module_identities = module_identities
         .into_iter()
@@ -1044,6 +1050,8 @@ fn collect_startup_profile_stops(
         };
     }
     let module_provenance = startup_profile_module_provenance(&timeline, args);
+    let dbgeng_module_parameters =
+        startup_profile_dbgeng_module_parameters(session, &timeline, args);
     let lifecycle_summary =
         startup_profile_lifecycle_summary(&timeline, phase_module, &completion, &debuggee_output);
     let (largest_observed_gaps, gaps_excluded_from_ranking) =
@@ -1076,6 +1084,7 @@ fn collect_startup_profile_stops(
         lifecycle_summary,
         debuggee_output,
         module_provenance,
+        dbgeng_module_parameters,
         largest_observed_gaps,
         gaps_excluded_from_ranking,
         timeline,
@@ -1110,7 +1119,14 @@ fn collect_startup_profile_stops(
             "first_chance_exceptions_requested": args.include_first_chance_exceptions,
             "stop_context_requested": args.capture_stop_context,
             "stop_contexts_returned": captured_contexts,
-            "module_provenance_requested": args.capture_module_provenance
+            "native_symbol_entry_range_requested": args.capture_native_symbol_entry_range,
+            "thread_accounting_requested": args.capture_thread_accounting,
+            "thread_accounting_snapshot_limit": args.max_thread_accounting_snapshots,
+            "thread_accounting_snapshots_attempted": captured_thread_accounting_snapshots,
+            "thread_accounting_thread_limit": args.max_thread_accounting_threads,
+            "module_provenance_requested": args.capture_module_provenance,
+            "dbgeng_module_parameters_requested": args.capture_dbgeng_module_parameters,
+            "dbgeng_module_parameter_limit": args.max_dbgeng_module_parameters
         }),
         cleanup: Value::Null,
     })
@@ -1135,6 +1151,8 @@ struct StartupProfileRecording {
     counts: StartupProfileCounts,
     module_identities: BTreeSet<String>,
     captured_contexts: u32,
+    captured_thread_accounting_snapshots: u32,
+    prior_thread_accounting: HashMap<(u32, u32), (usize, windbg_dbgeng::ThreadAccountingEntry)>,
 }
 
 fn configure_startup_profile_event_filters(
@@ -1272,6 +1290,7 @@ fn record_startup_profile_event(
         }
     }
     let context = startup_profile_stop_context(session, recording, args, &kind);
+    let thread_accounting = startup_profile_thread_accounting(session, recording, args, &kind);
     recording.timeline.push(StartupProfileEvent {
         index: recording.timeline.len(),
         kind,
@@ -1282,7 +1301,99 @@ fn record_startup_profile_event(
         loaded_module_count,
         live_thread_count,
         context,
+        thread_accounting,
     });
+}
+
+fn startup_profile_thread_accounting(
+    session: &DebuggerSession,
+    recording: &mut StartupProfileRecording,
+    args: &LiveStartupProfileArgs,
+    event_kind: &str,
+) -> Value {
+    if !args.capture_thread_accounting {
+        return json!({
+            "status": "not_requested",
+            "detail": "Read-only per-thread DbgEng accounting capture is disabled."
+        });
+    }
+    if !startup_profile_thread_accounting_event_selected(args, event_kind) {
+        return json!({
+            "status": "not_selected",
+            "detail": "This lifecycle event kind is outside --thread-accounting-on."
+        });
+    }
+    if recording.captured_thread_accounting_snapshots >= args.max_thread_accounting_snapshots {
+        return json!({
+            "status": "limit_reached",
+            "detail": "The bounded read-only thread-accounting snapshot limit was reached."
+        });
+    }
+
+    recording.captured_thread_accounting_snapshots += 1;
+    let event_index = recording.timeline.len();
+    match session.thread_accounting_snapshot(args.max_thread_accounting_threads) {
+        Ok(snapshot) => {
+            let mut same_thread_deltas = Vec::new();
+            for entry in &snapshot.threads {
+                let key = (entry.thread.engine_id, entry.thread.system_id);
+                if let Some((prior_event_index, previous)) =
+                    recording.prior_thread_accounting.get(&key)
+                {
+                    let current_times = entry.kernel_time_raw.zip(entry.user_time_raw);
+                    let previous_times = previous.kernel_time_raw.zip(previous.user_time_raw);
+                    let delta = match (current_times, previous_times) {
+                        (Some((kernel, user)), Some((previous_kernel, previous_user)))
+                            if kernel >= previous_kernel && user >= previous_user =>
+                        {
+                            json!({
+                                "status": "captured",
+                                "kernel_time_delta_raw": kernel - previous_kernel,
+                                "user_time_delta_raw": user - previous_user,
+                                "total_time_delta_raw": kernel - previous_kernel + user - previous_user,
+                                "kernel_time_delta_ms": (kernel - previous_kernel) as f64 / 10_000.0,
+                                "user_time_delta_ms": (user - previous_user) as f64 / 10_000.0,
+                                "total_time_delta_ms": (kernel - previous_kernel + user - previous_user) as f64 / 10_000.0,
+                                "detail": "The same DbgEng engine/system thread identifier pair had validity-gated, nondecreasing 100 ns counters. Millisecond projections were fixture-validated, but do not attribute a lifecycle gap to CPU work."
+                            })
+                        }
+                        (Some(_), Some(_)) => json!({
+                            "status": "unavailable_counter_decreased",
+                            "detail": "At least one raw counter decreased between selected stops, so no delta was emitted."
+                        }),
+                        _ => json!({
+                            "status": "unavailable_missing_valid_timing_counters",
+                            "detail": "One or both snapshots did not expose validity-gated kernel and user timing counters."
+                        }),
+                    };
+                    same_thread_deltas.push(json!({
+                        "engine_thread_id": entry.thread.engine_id,
+                        "system_thread_id": entry.thread.system_id,
+                        "prior_event_index": prior_event_index,
+                        "current_event_index": event_index,
+                        "delta": delta
+                    }));
+                }
+                recording
+                    .prior_thread_accounting
+                    .insert(key, (event_index, entry.clone()));
+            }
+            json!({
+                "status": snapshot.status,
+                "source": snapshot.source,
+                "counter_units": snapshot.counter_units,
+                "snapshot": snapshot,
+                "same_thread_deltas": same_thread_deltas,
+                "detail": "The snapshot uses read-only IDebugAdvanced2::GetSystemObjectInformation. Deltas compare only entries with the same DbgEng engine/system thread identifier pair; they do not establish CPU causality for a lifecycle gap or a stable identity if the operating system later reuses a thread ID."
+            })
+        }
+        Err(error) => json!({
+            "status": "unavailable",
+            "source": "dbgeng_iddebugadvanced2_getsystemobjectinformation",
+            "detail": "DbgEng rejected the read-only thread-accounting query.",
+            "error": error.to_string()
+        }),
+    }
 }
 
 fn startup_profile_stop_context(
@@ -1312,18 +1423,51 @@ fn startup_profile_stop_context(
 
     recording.captured_contexts += 1;
     match session.core_registers() {
-        Ok(registers) => match live_stop_context(session, registers, args.max_frames) {
-            Ok(context) => json!({
-                "status": "captured",
-                "source": "dbgeng_read_only_stop_snapshot",
-                "value": context
-            }),
-            Err(error) => json!({
-                "status": "unavailable",
-                "source": "dbgeng_read_only_stop_snapshot",
-                "error": error.to_string()
-            }),
-        },
+        Ok(registers) => {
+            let instruction_offset = registers.instruction_offset;
+            match live_stop_context(session, registers, args.max_frames) {
+                Ok(context) => {
+                    let native_symbol_entry_range = if args.capture_native_symbol_entry_range {
+                        match instruction_offset {
+                            Some(address) => match session.symbol_entry_range_by_offset(address) {
+                                Ok(range) => json!({
+                                    "status": range.status,
+                                    "source": range.source,
+                                    "value": range,
+                                    "detail": "The bounded DbgEng symbol-entry query can cause host-side symbol-resolution I/O through the configured symbol path. It is not target timing or proof of managed execution."
+                                }),
+                                Err(error) => json!({
+                                    "status": "unavailable",
+                                    "source": "dbgeng_idebugsymbols5_symbol_entry",
+                                    "error": error.to_string()
+                                }),
+                            },
+                            None => json!({
+                                "status": "unavailable",
+                                "source": "dbgeng_idebugsymbols5_symbol_entry",
+                                "detail": "The read-only stop context had no instruction offset."
+                            }),
+                        }
+                    } else {
+                        json!({
+                            "status": "not_requested",
+                            "detail": "Native symbol-entry range capture is disabled."
+                        })
+                    };
+                    json!({
+                        "status": "captured",
+                        "source": "dbgeng_read_only_stop_snapshot",
+                        "value": context,
+                        "native_symbol_entry_range": native_symbol_entry_range
+                    })
+                }
+                Err(error) => json!({
+                    "status": "unavailable",
+                    "source": "dbgeng_read_only_stop_snapshot",
+                    "error": error.to_string()
+                }),
+            }
+        }
         Err(error) => json!({
             "status": "unavailable",
             "source": "dbgeng_read_only_stop_snapshot",
@@ -1342,6 +1486,34 @@ fn startup_profile_context_event_selected(args: &LiveStartupProfileArgs, event_k
         ][..]
     } else {
         args.context_on.as_slice()
+    };
+    selected.iter().any(|selected| {
+        matches!(
+            (selected, event_kind),
+            (StartupProfileContextEvent::CreateProcess, "create_process")
+                | (StartupProfileContextEvent::ExitProcess, "exit_process")
+                | (StartupProfileContextEvent::CreateThread, "create_thread")
+                | (StartupProfileContextEvent::ExitThread, "exit_thread")
+                | (StartupProfileContextEvent::LoadModule, "load_module")
+                | (StartupProfileContextEvent::UnloadModule, "unload_module")
+                | (StartupProfileContextEvent::Exception, "exception")
+        )
+    })
+}
+
+fn startup_profile_thread_accounting_event_selected(
+    args: &LiveStartupProfileArgs,
+    event_kind: &str,
+) -> bool {
+    let selected = if args.thread_accounting_on.is_empty() {
+        &[
+            StartupProfileContextEvent::CreateProcess,
+            StartupProfileContextEvent::LoadModule,
+            StartupProfileContextEvent::CreateThread,
+            StartupProfileContextEvent::ExitProcess,
+        ][..]
+    } else {
+        args.thread_accounting_on.as_slice()
     };
     selected.iter().any(|selected| {
         matches!(
@@ -1587,6 +1759,78 @@ fn startup_profile_debuggee_output(
         "max_total_chars": capture.max_total_chars,
         "detail": capture.detail
     })
+}
+
+fn startup_profile_dbgeng_module_parameters(
+    session: &DebuggerSession,
+    timeline: &[StartupProfileEvent],
+    args: &LiveStartupProfileArgs,
+) -> Value {
+    if !args.capture_dbgeng_module_parameters {
+        return json!({
+            "status": "not_requested",
+            "source": "dbgeng_idebugsymbols5_getmoduleparameters",
+            "records": [],
+            "detail": "DbgEng module-parameter capture is disabled by default because configured symbol paths can cause host-side resolution I/O."
+        });
+    }
+    let mut modules = BTreeMap::new();
+    for event in timeline {
+        if let (Some(base_address), Some(module)) = (event.event.module_base, event.module.as_ref())
+        {
+            modules
+                .entry(base_address)
+                .or_insert_with(|| module.clone());
+        }
+    }
+    let observed_module_count = modules.len();
+    let selected = modules
+        .into_iter()
+        .take(args.max_dbgeng_module_parameters as usize)
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        return json!({
+            "status": "not_observed",
+            "source": "dbgeng_idebugsymbols5_getmoduleparameters",
+            "records": [],
+            "detail": "No retained lifecycle event had a DbgEng module base address to query."
+        });
+    }
+    let base_addresses = selected
+        .iter()
+        .map(|(base_address, _)| *base_address)
+        .collect::<Vec<_>>();
+    match session.module_parameters(&base_addresses) {
+        Ok(parameters) => {
+            let records = selected
+                .into_iter()
+                .zip(parameters)
+                .map(|((base_address, module), parameters)| {
+                    json!({
+                        "module": module,
+                        "base_address": format!("0x{base_address:X}"),
+                        "parameters": parameters
+                    })
+                })
+                .collect::<Vec<_>>();
+            json!({
+                "status": "captured",
+                "source": "dbgeng_idebugsymbols5_getmoduleparameters",
+                "records": records,
+                "records_returned": base_addresses.len(),
+                "observed_module_base_count": observed_module_count,
+                "truncated": observed_module_count > base_addresses.len(),
+                "detail": "These are bounded DbgEng module/symbol-readiness parameters for lifecycle-observed bases. They are not target timing or target-memory evidence. The configured symbol path can cause host-side symbol-resolution I/O."
+            })
+        }
+        Err(error) => json!({
+            "status": "unavailable",
+            "source": "dbgeng_idebugsymbols5_getmoduleparameters",
+            "records": [],
+            "detail": "DbgEng rejected the bounded module-parameter query; lifecycle collection continued.",
+            "error": error.to_string()
+        }),
+    }
 }
 
 fn startup_profile_module_provenance(
@@ -4370,6 +4614,10 @@ mod tests {
                 "status": "not_requested",
                 "detail": "test"
             }),
+            thread_accounting: json!({
+                "status": "not_requested",
+                "detail": "test"
+            }),
         }
     }
 
@@ -4456,6 +4704,12 @@ mod tests {
             module_provenance: json!({
                 "status": "not_requested",
                 "source": "host_file_metadata",
+                "records": [],
+                "detail": "test"
+            }),
+            dbgeng_module_parameters: json!({
+                "status": "not_requested",
+                "source": "dbgeng_idebugsymbols5_getmoduleparameters",
                 "records": [],
                 "detail": "test"
             }),

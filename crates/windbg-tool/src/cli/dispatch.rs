@@ -319,6 +319,12 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             TargetCommand::MemoryMap(args) => {
                 call_and_print(pipe, target_memory_map_call(args), &output).await
             }
+            TargetCommand::ThreadAccounting(args) => {
+                call_and_print(pipe, target_thread_accounting_call(args), &output).await
+            }
+            TargetCommand::ModuleParameters(args) => {
+                call_and_print(pipe, target_module_parameters_call(args)?, &output).await
+            }
             TargetCommand::Stack(args) => {
                 call_and_print(pipe, target_stack_call(args), &output).await
             }
@@ -332,6 +338,14 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
                 call_and_print(
                     pipe,
                     target_address_call("target_symbol_by_offset", args)?,
+                    &output,
+                )
+                .await
+            }
+            TargetCommand::SymbolEntryRange(args) => {
+                call_and_print(
+                    pipe,
+                    target_address_call("target_symbol_entry_range", args)?,
                     &output,
                 )
                 .await

@@ -1,6 +1,7 @@
 using System.Runtime.CompilerServices;
 using System.Globalization;
 using System.Runtime.InteropServices;
+using System.Diagnostics;
 
 namespace ManagedBreakpointFixture;
 
@@ -12,6 +13,7 @@ public static class Program
         Console.WriteLine(ManagedTargets.InvokePrivateEntry());
         Console.WriteLine(ManagedTargets.Overload("selected"));
         EmitRequestedDebugOutput(args);
+        BurnRequestedCpu(args);
         SleepForStartupObservation(args);
         return 0;
     }
@@ -58,6 +60,37 @@ public static class Program
         }
 
         Thread.Sleep(delayMilliseconds);
+    }
+
+    private static void BurnRequestedCpu(string[] args)
+    {
+        const string durationArgument = "--cpu-burn-ms";
+        var index = Array.IndexOf(args, durationArgument);
+        if (index < 0 || index + 1 >= args.Length)
+        {
+            return;
+        }
+
+        if (!int.TryParse(
+                args[index + 1],
+                NumberStyles.None,
+                CultureInfo.InvariantCulture,
+                out var durationMilliseconds)
+            || durationMilliseconds is < 1 or > 10000)
+        {
+            throw new ArgumentOutOfRangeException(
+                durationArgument,
+                "Expected an integer duration from 1 through 10000 milliseconds.");
+        }
+
+        var stopwatch = Stopwatch.StartNew();
+        ulong accumulator = 0;
+        while (stopwatch.ElapsedMilliseconds < durationMilliseconds)
+        {
+            accumulator = unchecked((accumulator * 6364136223846793005UL) + (ulong)Stopwatch.GetTimestamp());
+        }
+
+        GC.KeepAlive(accumulator);
     }
 
     [DllImport("kernel32.dll", EntryPoint = "OutputDebugStringW", CharSet = CharSet.Unicode)]

@@ -27,6 +27,9 @@ pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
 pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
 pub const DBGENG_RUNTIME_DIR_ENV: &str = "WINDBG_DBGENG_RUNTIME_DIR";
 pub const MAX_VIRTUAL_MEMORY_MAP_REGIONS: u32 = 4096;
+pub const MAX_THREAD_ACCOUNTING_THREADS: u32 = 128;
+pub const MAX_MODULE_PARAMETER_QUERIES: usize = 128;
+pub const MAX_SYMBOL_ENTRY_OFFSET_REGIONS: usize = 16;
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
 const DBGENG_DLL_NAME: &str = "dbgeng.dll";
 #[cfg(windows)]
@@ -495,12 +498,88 @@ pub struct ThreadInfo {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct ThreadAccountingEntry {
+    pub thread: ThreadInfo,
+    pub basic_information_status: String,
+    pub basic_information_size_bytes: Option<u32>,
+    pub name_status: String,
+    pub name: Option<String>,
+    pub name_size_bytes: Option<u32>,
+    pub valid_mask: Option<u32>,
+    pub exit_status: Option<u32>,
+    pub priority_class: Option<u32>,
+    pub priority: Option<u32>,
+    pub create_time_raw: Option<u64>,
+    pub exit_time_raw: Option<u64>,
+    pub kernel_time_raw: Option<u64>,
+    pub user_time_raw: Option<u64>,
+    pub kernel_time_ms: Option<f64>,
+    pub user_time_ms: Option<f64>,
+    pub start_offset: Option<u64>,
+    pub affinity: Option<u64>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadAccountingSnapshot {
+    pub source: String,
+    pub status: String,
+    pub counter_units: String,
+    pub total_threads: Option<usize>,
+    pub threads: Vec<ThreadAccountingEntry>,
+    pub returned: usize,
+    pub limit: u32,
+    pub truncated: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ModuleInfo {
     pub base_address: u64,
     pub module_name: Option<String>,
     pub image_name: Option<String>,
     pub loaded_image_name: Option<String>,
     pub symbol_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleDebugParameters {
+    pub base_address: u64,
+    pub image_size: u32,
+    pub time_date_stamp: u32,
+    pub checksum: u32,
+    pub flags: u32,
+    pub symbol_type: u32,
+    pub symbol_type_name: String,
+    pub image_name_size: u32,
+    pub module_name_size: u32,
+    pub loaded_image_name_size: u32,
+    pub symbol_file_name_size: u32,
+    pub mapped_image_name_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolEntryOffsetRegion {
+    pub base_address: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolEntryRange {
+    pub source: String,
+    pub status: String,
+    pub address: u64,
+    pub symbol_module_base: Option<u64>,
+    pub symbol_offset: Option<u64>,
+    pub symbol_size: Option<u32>,
+    pub displacement: Option<u64>,
+    pub symbol_tag: Option<u32>,
+    pub symbol_flags: Option<u32>,
+    pub symbol_token: Option<u32>,
+    pub regions: Vec<SymbolEntryOffsetRegion>,
+    pub regions_available: Option<u32>,
+    pub regions_truncated: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1235,6 +1314,167 @@ impl DebuggerSession {
             .collect())
     }
 
+    pub fn thread_accounting_snapshot(
+        &self,
+        max_threads: u32,
+    ) -> anyhow::Result<ThreadAccountingSnapshot> {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            IDebugAdvanced2, DEBUG_SYSOBJINFO_THREAD_BASIC_INFORMATION,
+            DEBUG_SYSOBJINFO_THREAD_NAME_WIDE, DEBUG_TBINFO_AFFINITY, DEBUG_TBINFO_EXIT_STATUS,
+            DEBUG_TBINFO_PRIORITY, DEBUG_TBINFO_PRIORITY_CLASS, DEBUG_TBINFO_START_OFFSET,
+            DEBUG_TBINFO_TIMES, DEBUG_THREAD_BASIC_INFORMATION,
+        };
+
+        ensure!(
+            (1..=MAX_THREAD_ACCOUNTING_THREADS).contains(&max_threads),
+            "DbgEng thread-accounting limit must be from 1 through {MAX_THREAD_ACCOUNTING_THREADS}"
+        );
+        let threads = self.threads()?;
+        let total_threads = threads.len();
+        let truncated = total_threads > max_threads as usize;
+        let advanced: IDebugAdvanced2 = match self.client.cast() {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                return Ok(ThreadAccountingSnapshot {
+                    source: "dbgeng_iddebugadvanced2_getsystemobjectinformation".to_string(),
+                    status: "unavailable".to_string(),
+                    counter_units: "100ns".to_string(),
+                    total_threads: Some(total_threads),
+                    threads: Vec::new(),
+                    returned: 0,
+                    limit: max_threads,
+                    truncated,
+                    detail: format!(
+                        "DbgEng did not expose IDebugAdvanced2 for thread accounting: {error}"
+                    ),
+                });
+            }
+        };
+
+        const MAX_THREAD_NAME_CHARS: usize = 128;
+        let mut entries = Vec::with_capacity(total_threads.min(max_threads as usize));
+        for thread in threads.into_iter().take(max_threads as usize) {
+            let mut basic = DEBUG_THREAD_BASIC_INFORMATION::default();
+            let mut basic_information_size_bytes = 0u32;
+            let basic_result = unsafe {
+                advanced.GetSystemObjectInformation(
+                    DEBUG_SYSOBJINFO_THREAD_BASIC_INFORMATION,
+                    0,
+                    thread.engine_id,
+                    Some((&mut basic as *mut DEBUG_THREAD_BASIC_INFORMATION).cast()),
+                    std::mem::size_of::<DEBUG_THREAD_BASIC_INFORMATION>() as u32,
+                    Some(&mut basic_information_size_bytes),
+                )
+            };
+
+            let mut name_buffer = vec![0u16; MAX_THREAD_NAME_CHARS];
+            let mut name_size_bytes = 0u32;
+            let name_result = unsafe {
+                advanced.GetSystemObjectInformation(
+                    DEBUG_SYSOBJINFO_THREAD_NAME_WIDE,
+                    0,
+                    thread.engine_id,
+                    Some(name_buffer.as_mut_ptr().cast()),
+                    (name_buffer.len() * std::mem::size_of::<u16>()) as u32,
+                    Some(&mut name_size_bytes),
+                )
+            };
+            let basic_captured = basic_result.is_ok();
+            let name_captured = name_result.is_ok();
+
+            let mut errors = Vec::new();
+            let basic_information_status = match &basic_result {
+                Ok(()) => "captured".to_string(),
+                Err(error) => {
+                    errors.push(format!("basic_information: {error}"));
+                    "unavailable".to_string()
+                }
+            };
+            let (name_status, name) = match &name_result {
+                Ok(()) => {
+                    let capacity_bytes = (name_buffer.len() * std::mem::size_of::<u16>()) as u32;
+                    let used_chars = if name_size_bytes == 0 {
+                        name_buffer
+                            .iter()
+                            .position(|character| *character == 0)
+                            .unwrap_or(name_buffer.len())
+                    } else {
+                        (name_size_bytes as usize / std::mem::size_of::<u16>())
+                            .min(name_buffer.len())
+                    };
+                    let name_slice = &name_buffer[..used_chars];
+                    let name_len = name_slice
+                        .iter()
+                        .position(|character| *character == 0)
+                        .unwrap_or(name_slice.len());
+                    let name = String::from_utf16_lossy(&name_slice[..name_len]);
+                    (
+                        if name_size_bytes > capacity_bytes {
+                            "truncated".to_string()
+                        } else if name.is_empty() {
+                            "not_provided".to_string()
+                        } else {
+                            "captured".to_string()
+                        },
+                        (!name.is_empty()).then_some(name),
+                    )
+                }
+                Err(error) => {
+                    errors.push(format!("thread_name: {error}"));
+                    ("unavailable".to_string(), None)
+                }
+            };
+            let valid = basic.Valid;
+            let has = |flag| basic_captured && valid & flag != 0;
+            entries.push(ThreadAccountingEntry {
+                thread,
+                basic_information_status,
+                basic_information_size_bytes: basic_captured
+                    .then_some(basic_information_size_bytes),
+                name_status,
+                name,
+                name_size_bytes: name_captured.then_some(name_size_bytes),
+                valid_mask: basic_captured.then_some(valid),
+                exit_status: has(DEBUG_TBINFO_EXIT_STATUS).then_some(basic.ExitStatus),
+                priority_class: has(DEBUG_TBINFO_PRIORITY_CLASS).then_some(basic.PriorityClass),
+                priority: has(DEBUG_TBINFO_PRIORITY).then_some(basic.Priority),
+                create_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.CreateTime),
+                exit_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.ExitTime),
+                kernel_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.KernelTime),
+                user_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.UserTime),
+                kernel_time_ms: has(DEBUG_TBINFO_TIMES)
+                    .then_some(basic.KernelTime as f64 / 10_000.0),
+                user_time_ms: has(DEBUG_TBINFO_TIMES).then_some(basic.UserTime as f64 / 10_000.0),
+                start_offset: has(DEBUG_TBINFO_START_OFFSET).then_some(basic.StartOffset),
+                affinity: has(DEBUG_TBINFO_AFFINITY).then_some(basic.Affinity),
+                errors,
+            });
+        }
+        let unavailable_entries = entries
+            .iter()
+            .filter(|entry| entry.basic_information_status != "captured")
+            .count();
+        let status = if entries.is_empty() || unavailable_entries == entries.len() {
+            "unavailable"
+        } else if unavailable_entries > 0 || truncated {
+            "partial"
+        } else {
+            "captured"
+        };
+        Ok(ThreadAccountingSnapshot {
+            source: "dbgeng_iddebugadvanced2_getsystemobjectinformation".to_string(),
+            status: status.to_string(),
+            counter_units: "100ns".to_string(),
+            total_threads: Some(total_threads),
+            returned: entries.len(),
+            threads: entries,
+            limit: max_threads,
+            truncated,
+            detail: "Per-thread fields are returned only when their DEBUG_THREAD_BASIC_INFORMATION valid-mask bit is set. KernelTime and UserTime use 100 ns DbgEng counters; their millisecond projections were fixture-validated against a bounded CPU-burn run. They remain per-thread accounting samples, not lifecycle-gap causality.".to_string(),
+        })
+    }
+
     pub fn modules(&self) -> anyhow::Result<Vec<ModuleInfo>> {
         let mut loaded = 0u32;
         let mut unloaded = 0u32;
@@ -1269,6 +1509,125 @@ impl DebuggerSession {
             });
         }
         Ok(modules)
+    }
+
+    pub fn module_parameters(
+        &self,
+        base_addresses: &[u64],
+    ) -> anyhow::Result<Vec<ModuleDebugParameters>> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODULE_PARAMETERS;
+
+        ensure!(
+            !base_addresses.is_empty(),
+            "DbgEng module-parameter query requires at least one observed module base address"
+        );
+        ensure!(
+            base_addresses.len() <= MAX_MODULE_PARAMETER_QUERIES,
+            "DbgEng module-parameter query supports at most {MAX_MODULE_PARAMETER_QUERIES} module base addresses"
+        );
+        let mut parameters = vec![DEBUG_MODULE_PARAMETERS::default(); base_addresses.len()];
+        unsafe {
+            self.symbols.GetModuleParameters(
+                base_addresses.len() as u32,
+                Some(base_addresses.as_ptr()),
+                0,
+                parameters.as_mut_ptr(),
+            )?;
+        }
+        Ok(parameters
+            .into_iter()
+            .map(|parameters| ModuleDebugParameters {
+                base_address: parameters.Base,
+                image_size: parameters.Size,
+                time_date_stamp: parameters.TimeDateStamp,
+                checksum: parameters.Checksum,
+                flags: parameters.Flags,
+                symbol_type: parameters.SymbolType,
+                symbol_type_name: dbgeng_symbol_type_name(parameters.SymbolType).to_string(),
+                image_name_size: parameters.ImageNameSize,
+                module_name_size: parameters.ModuleNameSize,
+                loaded_image_name_size: parameters.LoadedImageNameSize,
+                symbol_file_name_size: parameters.SymbolFileNameSize,
+                mapped_image_name_size: parameters.MappedImageNameSize,
+            })
+            .collect())
+    }
+
+    pub fn symbol_entry_range_by_offset(&self, address: u64) -> anyhow::Result<SymbolEntryRange> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_MODULE_AND_ID, DEBUG_OFFSET_REGION, DEBUG_SYMBOL_ENTRY,
+        };
+
+        let mut id = DEBUG_MODULE_AND_ID::default();
+        let mut displacement = 0u64;
+        let mut entries = 0u32;
+        unsafe {
+            self.symbols.GetSymbolEntriesByOffset(
+                address,
+                0,
+                Some(&mut id),
+                Some(&mut displacement),
+                1,
+                Some(&mut entries),
+            )?;
+        }
+        if entries == 0 {
+            return Ok(SymbolEntryRange {
+                source: "dbgeng_idebugsymbols5_symbol_entry".to_string(),
+                status: "not_found".to_string(),
+                address,
+                symbol_module_base: None,
+                symbol_offset: None,
+                symbol_size: None,
+                displacement: None,
+                symbol_tag: None,
+                symbol_flags: None,
+                symbol_token: None,
+                regions: Vec::new(),
+                regions_available: Some(0),
+                regions_truncated: false,
+                detail: "DbgEng returned no symbol entry for the requested address.".to_string(),
+            });
+        }
+
+        let mut entry = DEBUG_SYMBOL_ENTRY::default();
+        unsafe {
+            self.symbols.GetSymbolEntryInformation(&id, &mut entry)?;
+        }
+        let mut regions = vec![DEBUG_OFFSET_REGION::default(); MAX_SYMBOL_ENTRY_OFFSET_REGIONS];
+        let mut regions_available = 0u32;
+        unsafe {
+            self.symbols.GetSymbolEntryOffsetRegions(
+                &id,
+                0,
+                Some(regions.as_mut_slice()),
+                Some(&mut regions_available),
+            )?;
+        }
+        let returned = regions_available.min(MAX_SYMBOL_ENTRY_OFFSET_REGIONS as u32) as usize;
+        regions.truncate(returned);
+        Ok(SymbolEntryRange {
+            source: "dbgeng_idebugsymbols5_symbol_entry".to_string(),
+            status: "captured".to_string(),
+            address,
+            symbol_module_base: Some(entry.ModuleBase),
+            symbol_offset: Some(entry.Offset),
+            symbol_size: Some(entry.Size),
+            displacement: Some(displacement),
+            symbol_tag: Some(entry.Tag),
+            symbol_flags: Some(entry.Flags),
+            symbol_token: Some(entry.Token),
+            regions: regions
+                .into_iter()
+                .map(|region| SymbolEntryOffsetRegion {
+                    base_address: region.Base,
+                    size: region.Size,
+                })
+                .collect(),
+            regions_available: Some(regions_available),
+            regions_truncated: regions_available > MAX_SYMBOL_ENTRY_OFFSET_REGIONS as u32,
+            detail: "This is a bounded DbgEng symbol-entry offset-region query. It identifies debugger symbol coverage at an observed native address, but does not establish managed method execution. Symbol queries can trigger host-side symbol resolution I/O according to the configured symbol path.".to_string(),
+        })
     }
 
     pub fn module_by_offset(&self, address: u64) -> anyhow::Result<Option<ModuleInfo>> {
@@ -1943,6 +2302,26 @@ fn status_name(status: u32) -> String {
     {
         let _ = status;
         "unknown".to_string()
+    }
+}
+
+#[cfg(windows)]
+fn dbgeng_symbol_type_name(symbol_type: u32) -> &'static str {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
+        DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
+    };
+
+    match symbol_type {
+        DEBUG_SYMTYPE_NONE => "none",
+        DEBUG_SYMTYPE_COFF => "coff",
+        DEBUG_SYMTYPE_CODEVIEW => "codeview",
+        DEBUG_SYMTYPE_PDB => "pdb",
+        DEBUG_SYMTYPE_EXPORT => "export",
+        DEBUG_SYMTYPE_DEFERRED => "deferred",
+        DEBUG_SYMTYPE_SYM => "sym",
+        DEBUG_SYMTYPE_DIA => "dia",
+        _ => "unknown",
     }
 }
 

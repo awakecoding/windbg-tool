@@ -249,7 +249,11 @@ target\debug\windbg-tool.exe --compact live startup-profile `
 
 `--max-events` bounds retained timeline payload rather than forcing a healthy target to terminate. For a full-lifetime profile without `--completion-module`, windbg-tool retains `max_events - 1` entries, disables high-volume thread/module filters, and waits only for `exit_process`, preserving the final exit boundary in the last slot. The result marks this as `coverage.timeline_truncated: true` and lists the DbgEng `timing.tail_filter_commands`; it makes no claim about events omitted during that exit-only tail. A completion-bound profile instead stops as incomplete at its retention limit, because disabling the lifecycle filters would make a quiet interval unknowable. A single completion-bound run defaults to `--end detach`, so the target can finish normally. Repeated runs require the explicit `--end terminate` cleanup mode to prevent overlapping detached targets. A full-lifetime successful run has `finish_reason: "exit_process"`; a module completion has `finish_reason: "completion_module"`; a quiet completion has `finish_reason: "completion_module_quiet_interval"`.
 
-The opt-in `--capture-stop-context` captures bounded read-only register/module/symbol/stack context on selected early stops; it can increase observer overhead and is disabled by default. `--context-on` selects event kinds, defaulting to `load-module`, `create-thread`, `exception`, and `exit-process`; every timeline event has an explicit context status (`not_requested`, `not_selected`, `limit_reached`, `captured`, or `unavailable`). `--capture-module-provenance` separately reads bounded host-file metadata only for absolute module image paths DbgEng already observed. Its records include canonical host path, file size/last-write time, PE architecture/image timestamp, CodeView identity, and available Win32 file/product versions. This is host-file metadata, not target-memory evidence or lifecycle timing; it never hashes, verifies signatures, or reads an unobserved path.
+The opt-in `--capture-stop-context` captures bounded read-only register/module/symbol/stack context on selected early stops; it can increase observer overhead and is disabled by default. `--context-on` selects event kinds, defaulting to `load-module`, `create-thread`, `exception`, and `exit-process`; every timeline event has an explicit context status (`not_requested`, `not_selected`, `limit_reached`, `captured`, or `unavailable`). `--capture-native-symbol-entry-range` optionally adds one bounded `IDebugSymbols5` symbol-entry offset-region lookup to each captured context's existing instruction address. The result is native symbol coverage at that address, not a managed method boundary or execution proof. Both that lookup and `--capture-dbgeng-module-parameters` can cause host-side symbol-resolution I/O through the configured symbol path; neither writes target memory.
+
+`--capture-thread-accounting` captures bounded `IDebugAdvanced2::GetSystemObjectInformation` snapshots at selected lifecycle stops. `--thread-accounting-on` defaults to `create-process`, `load-module`, `create-thread`, and `exit-process`; `--max-thread-accounting-snapshots` and `--max-thread-accounting-threads` cap work and JSON. Every returned thread preserves the source validity mask and raw `KernelTime`/`UserTime` values. The fixture's bounded `--cpu-burn-ms` run established that these two counters use 100 ns units, so the output also has millisecond projections and same-engine/system-thread deltas when both snapshots are valid and nondecreasing. Those are per-thread accounting samples only: they do not turn a lifecycle wall-time gap into CPU attribution, identify a managed method, or prove that an OS thread identity was never reused.
+
+`--capture-module-provenance` separately reads bounded host-file metadata only for absolute module image paths DbgEng already observed. Its records include canonical host path, file size/last-write time, PE architecture/image timestamp, CodeView identity, and available Win32 file/product versions. This is host-file metadata, not target-memory evidence or lifecycle timing; it never hashes, verifies signatures, or reads an unobserved path.
 
 The important JSON fields are:
 
@@ -289,6 +293,10 @@ The important JSON fields are:
       "status": "captured",
       "source": "host_file_metadata"
     },
+    "dbgeng_module_parameters": {
+      "status": "captured",
+      "source": "dbgeng_idebugsymbols5_getmoduleparameters"
+    },
     "largest_observed_gaps": [{
       "elapsed_ms": 10,
       "detail": "Target-resumed host wall time between adjacent observed lifecycle stops; not CPU time."
@@ -317,6 +325,8 @@ target\debug\windbg-tool.exe --compact live startup-compare `
 ```
 
 The comparator accepts only `live_startup_profile` JSON artifacts up to 16 MiB. It compares observed phase and one-largest-gap wall-time distributions plus bounded lifecycle event/module/exception sequence prefixes. It reports profile and comparison truncation, omits unstable thread IDs, and never labels a difference as a CPU regression or causal explanation.
+
+For a daemon-owned stopped target, `target thread-accounting --target <id> --max-threads 32` and MCP `target_thread_accounting` return the same bounded read-only per-thread accounting. `target module-parameters --target <id> --module-base <address>` / MCP `target_module_parameters` accept only 1 through 128 distinct supplied module bases. `target symbol-entry-range --target <id> --address <address>` / MCP `target_symbol_entry_range` return a bounded DbgEng symbol-entry region record for one existing native address. The module and symbol queries are not target writes, but their configured symbol path can produce host-side symbol-resolution I/O.
 
 For a future RDM observation, use the bounded no-breakpoint form only after the fixture command has completed with the expected no-write report:
 

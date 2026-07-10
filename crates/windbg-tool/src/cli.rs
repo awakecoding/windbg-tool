@@ -476,6 +476,14 @@ enum TargetCommand {
     Step(TargetIdArgs),
     #[command(about = "List threads for a daemon-owned target")]
     Threads(TargetIdArgs),
+    #[command(
+        about = "Read bounded DbgEng per-thread CPU accounting for a stopped daemon-owned target"
+    )]
+    ThreadAccounting(TargetThreadAccountingArgs),
+    #[command(
+        about = "Read bounded DbgEng symbol-readiness parameters for supplied observed module bases"
+    )]
+    ModuleParameters(TargetModuleParametersArgs),
     #[command(about = "List modules for a daemon-owned target")]
     Modules(TargetIdArgs),
     #[command(about = "Read current thread and instruction offsets for a daemon-owned target")]
@@ -498,6 +506,10 @@ enum TargetCommand {
     Disasm(TargetDisasmArgs),
     #[command(about = "Resolve the nearest symbol for a daemon-owned target address")]
     Symbol(TargetAddressArgs),
+    #[command(
+        about = "Read bounded DbgEng symbol-entry offset regions for an existing native address"
+    )]
+    SymbolEntryRange(TargetAddressArgs),
     #[command(
         about = "Resolve source file and line information for a daemon-owned target address"
     )]
@@ -814,6 +826,42 @@ struct LiveStartupProfileArgs {
     max_frames: u32,
     #[arg(
         long,
+        requires = "capture_stop_context",
+        help = "Attach one bounded DbgEng symbol-entry range query to each captured stop context; symbol paths can cause host-side resolution I/O"
+    )]
+    capture_native_symbol_entry_range: bool,
+    #[arg(
+        long,
+        help = "Capture bounded read-only DbgEng per-thread accounting snapshots with raw validity-gated counters"
+    )]
+    capture_thread_accounting: bool,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_enum,
+        requires = "capture_thread_accounting",
+        value_name = "EVENT",
+        help = "Comma-separated lifecycle event kinds eligible for thread accounting; defaults to create-process,load-module,create-thread,exit-process when enabled"
+    )]
+    thread_accounting_on: Vec<StartupProfileContextEvent>,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        requires = "capture_thread_accounting",
+        help = "Maximum selected lifecycle stops that collect a thread-accounting snapshot"
+    )]
+    max_thread_accounting_snapshots: u32,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_thread_accounting",
+        help = "Maximum threads returned in each DbgEng thread-accounting snapshot"
+    )]
+    max_thread_accounting_threads: u32,
+    #[arg(
+        long,
         help = "Capture bounded DbgEng debuggee-output callback records; disabled by default because debug strings can contain sensitive content"
     )]
     capture_debuggee_output: bool,
@@ -854,6 +902,19 @@ struct LiveStartupProfileArgs {
         help = "Maximum unique DbgEng-observed module image paths inspected for host file metadata"
     )]
     max_module_provenance: u32,
+    #[arg(
+        long,
+        help = "Read bounded DbgEng module parameters only for module bases observed in this lifecycle timeline; symbol paths can cause host-side resolution I/O"
+    )]
+    capture_dbgeng_module_parameters: bool,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_dbgeng_module_parameters",
+        help = "Maximum observed module bases queried through DbgEng IDebugSymbols5"
+    )]
+    max_dbgeng_module_parameters: u32,
     #[arg(
         long,
         value_name = "PATH",
@@ -1394,6 +1455,32 @@ struct TargetMemoryMapArgs {
         help = "Maximum DbgEng virtual-memory regions returned"
     )]
     region_limit: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetThreadAccountingArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        help = "Maximum DbgEng threads returned"
+    )]
+    max_threads: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetModuleParametersArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(
+        long = "module-base",
+        required = true,
+        value_name = "ADDRESS",
+        help = "DbgEng-observed module base address; repeat for up to 128 distinct modules"
+    )]
+    module_bases: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -5779,6 +5866,42 @@ fn target_memory_map_call(args: TargetMemoryMapArgs) -> ToolCall {
     }
 }
 
+fn target_thread_accounting_call(args: TargetThreadAccountingArgs) -> ToolCall {
+    ToolCall {
+        name: "target_thread_accounting".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "max_threads": args.max_threads,
+        }),
+    }
+}
+
+fn target_module_parameters_call(args: TargetModuleParametersArgs) -> anyhow::Result<ToolCall> {
+    ensure!(
+        (1..=128).contains(&args.module_bases.len()),
+        "target module-parameters requires from 1 through 128 --module-base values"
+    );
+    let module_base_addresses = args
+        .module_bases
+        .iter()
+        .map(|address| parse_u64_argument(address))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut unique = module_base_addresses.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    ensure!(
+        unique.len() == module_base_addresses.len(),
+        "target module-parameters requires distinct --module-base values"
+    );
+    Ok(ToolCall {
+        name: "target_module_parameters".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "module_base_addresses": module_base_addresses,
+        }),
+    })
+}
+
 fn target_dump_call(args: TargetDumpArgs) -> ToolCall {
     ToolCall {
         name: "target_write_dump".to_string(),
@@ -8106,5 +8229,32 @@ mod tests {
         assert_eq!(call.arguments["path"], r"C:\dumps\app.dmp");
         assert_eq!(call.arguments["kind"], "full");
         assert_eq!(call.arguments["overwrite"], true);
+    }
+
+    #[test]
+    fn builds_bounded_target_observability_tool_calls() -> anyhow::Result<()> {
+        let accounting = target_thread_accounting_call(TargetThreadAccountingArgs {
+            target: 7,
+            max_threads: 32,
+        });
+        assert_eq!(accounting.name, "target_thread_accounting");
+        assert_eq!(accounting.arguments["target_id"], 7);
+        assert_eq!(accounting.arguments["max_threads"], 32);
+
+        let parameters = target_module_parameters_call(TargetModuleParametersArgs {
+            target: 7,
+            module_bases: vec!["0x1000".to_string(), "0x2000".to_string()],
+        })?;
+        assert_eq!(parameters.name, "target_module_parameters");
+        assert_eq!(
+            parameters.arguments["module_base_addresses"],
+            json!([0x1000, 0x2000])
+        );
+        assert!(target_module_parameters_call(TargetModuleParametersArgs {
+            target: 7,
+            module_bases: vec!["0x1000".to_string(), "0x1000".to_string()],
+        })
+        .is_err());
+        Ok(())
     }
 }

@@ -3,8 +3,10 @@ use crate::state::ServiceState;
 use crate::targets::{
     DumpOpenRequest, LiveAttachRequest, LiveLaunchRequest, TargetAddressRequest,
     TargetBreakpointRemoveRequest, TargetBreakpointSetRequest, TargetDisassembleRequest,
-    TargetExpressionRequest, TargetMemoryMapRequest, TargetMemoryReadRequest, TargetRequest,
-    TargetStackTraceRequest, TargetThreadContextRequest, TargetWaitRequest, TargetWriteDumpRequest,
+    TargetExpressionRequest, TargetMemoryMapRequest, TargetMemoryReadRequest,
+    TargetModuleParametersRequest, TargetRequest, TargetStackTraceRequest,
+    TargetThreadAccountingRequest, TargetThreadContextRequest, TargetWaitRequest,
+    TargetWriteDumpRequest,
 };
 use crate::ttd_replay::{
     AddressInfoRequest, CursorId, IndexBuildRequest, IndexStatsRequest, IndexStatusRequest,
@@ -218,6 +220,18 @@ pub fn definitions() -> Vec<Tool> {
         tool::<TargetMemoryMapRequest>(
             "target_memory_map",
             "Return a bounded user-mode virtual-memory region map through DbgEng IDebugDataSpaces4::QueryVirtual.",
+        ),
+        tool::<TargetThreadAccountingRequest>(
+            "target_thread_accounting",
+            "Return bounded read-only DbgEng per-thread accounting from IDebugAdvanced2.",
+        ),
+        tool::<TargetModuleParametersRequest>(
+            "target_module_parameters",
+            "Return bounded DbgEng symbol-readiness parameters for supplied observed module bases.",
+        ),
+        tool::<TargetAddressRequest>(
+            "target_symbol_entry_range",
+            "Return bounded DbgEng symbol-entry offset regions for one existing native address.",
         ),
         tool::<TargetRequest>(
             "target_list_threads",
@@ -511,6 +525,24 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         "target_memory_map" => {
             let request = parse::<TargetMemoryMapRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.memory_map(request)?)?)
+        }
+        "target_thread_accounting" => {
+            let request = parse::<TargetThreadAccountingRequest>(call.arguments)?;
+            Ok(serde_json::to_value(
+                state.targets.thread_accounting(request)?,
+            )?)
+        }
+        "target_module_parameters" => {
+            let request = parse::<TargetModuleParametersRequest>(call.arguments)?;
+            Ok(serde_json::to_value(
+                state.targets.module_parameters(request)?,
+            )?)
+        }
+        "target_symbol_entry_range" => {
+            let request = parse::<TargetAddressRequest>(call.arguments)?;
+            Ok(serde_json::to_value(
+                state.targets.symbol_entry_range(request)?,
+            )?)
         }
         "target_list_threads" => {
             let request = parse::<TargetRequest>(call.arguments)?;
