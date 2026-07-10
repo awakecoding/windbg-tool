@@ -6,6 +6,7 @@
 
 - **Discovery commands** do not require the daemon: `discover`, `cli-schema`, `recipes`, `tools`, `schema`, `trace-list`, `symbols inspect`
 - **Replay commands** usually talk to the local daemon and operate on a `session_id` and `cursor_id`
+- **Recording commands** use the separately installed Microsoft `TTD.exe` recorder and do not require the daemon
 - **Canonical agent debugging commands** start with `debug`, `triage`, `symbols doctor`, and `breakpoint plan`
 - **Platform helper commands** cover DbgEng, remote debugging doctors/plans, live-launch probing, and WinDbg installation
 
@@ -35,12 +36,96 @@ Use the returned handles with analysis commands:
 target\debug\windbg-tool.exe info --session 1
 target\debug\windbg-tool.exe debug snapshot --session 1 --cursor 1
 target\debug\windbg-tool.exe position set --session 1 --cursor 1 --position 50
+target\debug\windbg-tool.exe exception focus --session 1 --cursor 1 --index 0
 target\debug\windbg-tool.exe registers --session 1 --cursor 1
 target\debug\windbg-tool.exe disasm --session 1 --cursor 1
 target\debug\windbg-tool.exe memory strings --session 1 --cursor 1 --address 0x12345678 --size 256 --encoding both
 ```
 
 `open` is the preferred starting point because it loads the trace, creates a cursor, and optionally seeks to a position in one response. `debug snapshot` is the canonical cross-backend snapshot for agents; `context snapshot` remains available as the legacy TTD-focused snapshot.
+
+## Record a trace
+
+`trace record` launches a target with the Microsoft `TTD.exe` command-line recorder, waits for it to exit, and emits the resulting `.run` path. It uses TTD's documented `-noUI -out <path> -launch <target command line>` invocation; the target command line is passed directly, not through a shell. Because TTD recording requires elevation, it runs TTD directly from an elevated terminal or automatically invokes Windows 11 `sudo` when it is configured for the synchronous **Input Closed** or **Inline** mode. Force New Window mode is rejected because it returns before the recorder completes.
+
+Install the standalone TTD recorder with `winget install --id Microsoft.TimeTravelDebugging`, then open a new elevated terminal so `ttd.exe` is on `PATH`. You can also set `TTD_EXE` or pass `--ttd-exe`. `trace record` always passes TTD's `-accepteula` option.
+
+```powershell
+target\debug\windbg-tool.exe --compact trace record `
+  --output C:\traces\rdm.run `
+  --command-line '"C:\apps\RemoteDesktopManager.exe" /AutoCloseAfter:10'
+```
+
+The output directory must already exist and the `.run` path must not already exist. TTD traces include process-memory data and should be handled as sensitive artifacts.
+
+For high-overhead startup captures, first choose a bounded capture strategy:
+
+```powershell
+# Preserve the earliest startup data, up to 1 GiB.
+target\debug\windbg-tool.exe trace record --profile startup `
+  --output C:\traces\rdm-startup.run `
+  --command-line '"C:\apps\RemoteDesktopManager.exe" /AutoCloseAfter:10'
+
+# Retain only the newest data in a 2 GiB rolling window.
+target\debug\windbg-tool.exe trace record --profile recent `
+  --output C:\traces\rdm-recent.run `
+  --command-line '"C:\apps\RemoteDesktopManager.exe" /AutoCloseAfter:10'
+```
+
+`--max-file-mb <size>` provides a custom cap; add `--ring` to retain the newest data after the cap is reached. `--profile` is a convenience preset and cannot be combined with either custom size option.
+
+Use repeatable `--module <basename>` to ask TTD to record only selected native modules, for example `--module RemoteDesktopManager_x64.exe --module coreclr.dll`. The values must be basenames, not paths. Module filtering is an experiment: managed code often executes as JIT-generated code associated with `coreclr.dll`, so filtering only the application executable can omit needed behavior.
+
+`--replay-cpu-support <default|most-aggressive|...>` forwards TTD's replay CPU compatibility setting. `--num-vcpu <count>` can reduce recorder memory pressure, but TTD warns that lowering it can severely slow recording; do not use it as a performance optimization.
+
+If TTD reports that the target has CET shadow stacks enabled, use `--disable-user-shadow-stack` to launch only that new target process with the official Windows process-creation mitigation set to **always off**, then have TTD attach by PID. This is an explicit, per-process compatibility override; it does not change system policy or the target binary. Attaching begins after process creation, so it can miss the earliest startup instructions.
+
+When using that CET-compatible attach mode, `--record-for-seconds <seconds>` asks TTD to stop recording after the requested window without terminating the target. This bounds a hung or slowed startup capture but necessarily retains the attach-mode earliest-startup limitation. After a successful recording, the result includes trace size, elapsed time, output rate, and parsed `.out` sidecar data such as allocated vCPUs, active threads, simulation duration, and finalization state.
+
+To enable synchronous sudo recording, choose **Input Closed** or **Inline** in **Settings > System > Advanced > Enable sudo**, or from an elevated terminal run:
+
+```powershell
+sudo config --enable disableInput
+```
+
+## Live startup breakpoints
+
+`live startup-break` is a one-shot native DbgEng workflow: it launches at the initial debug break, configures one code breakpoint, continues the target once, waits for a bounded event, captures JSON context, and then ends the debug session. It does not shell out to CDB or WinDbg.
+
+Use a module basename and RVA when the executable is present at the initial break:
+
+```powershell
+target\debug\windbg-tool.exe --compact live startup-break `
+  --command-line '"C:\Temp\windbg-tool-ttd\rdm\RemoteDesktopManager_x64.exe" /AutoCloseAfter:10' `
+  --module RemoteDesktopManager_x64.exe `
+  --module-offset 0x1000 `
+  --wait-timeout-ms 10000 `
+  --end terminate
+```
+
+Alternatively specify an absolute `--address`, or a deferred DbgEng `--symbol 'module!symbol'` expression. Deferred symbol breakpoints allow module and symbol loading after process creation. The response includes the initial event, configured breakpoint, an explicit `breakpoint.hit` evidence flag, PID/thread/IP, current module and symbol, core registers, and a bounded stack. A stopped event that does not match the configured breakpoint remains reported as `hit: false`; it is not misrepresented as a breakpoint hit.
+
+Use `--initial-break` when no reliable code breakpoint is available or the host policy rejects breakpoint creation. It captures the initial DbgEng process break without continuing the target and labels that evidence explicitly; it does not claim a code-breakpoint hit.
+
+`--end terminate` is the default for disposable startup probes. Use `--end detach` only when the debuggee should continue after the captured event.
+
+## AI-oriented DbgEng target inspection
+
+Daemon-owned live and dump targets expose bounded, read-only inspection commands for agent workflows. After `target wait` reports a stop on a live target, use `target event` to identify the DbgEng event that caused it. The response includes the process/thread IDs, event type, and, where DbgEng provides it, a breakpoint ID, exception code/address/first-chance state, module base, or exit code. It does not return unbounded debugger output. Event inspection is unavailable for dump targets because a dump has no live event stream.
+
+```powershell
+target\debug\windbg-tool.exe --compact target event --target 1
+```
+
+`target threads` returns DbgEng engine thread IDs. Use one of those IDs with `target thread` to capture that thread's core registers, nearest module/symbol, bounded stack, and bounded disassembly. The command restores the previously selected DbgEng thread before returning, so it is safe for agents to inspect worker threads without changing subsequent target commands.
+
+```powershell
+target\debug\windbg-tool.exe --compact target threads --target 1
+target\debug\windbg-tool.exe --compact target thread --target 1 `
+  --engine-thread-id 3 --max-frames 16 --disassembly-count 8
+```
+
+`debug snapshot --target <id>` now includes a best-effort `event` section by default for live targets. Use `--exclude event` when an event query is not relevant, or `--include event` to request it alone.
 
 ## Canonical agent debugging commands
 
@@ -100,6 +185,8 @@ target\debug\windbg-tool.exe --compact debug log summarize --path D:\logs\windbg
 - `cursor_id` identifies a replay cursor inside that trace
 - Many commands accept `-s` for `--session` and `-c` for `--cursor`
 - `position set` accepts either a structured position, a WinDbg-style `HEX:HEX` string, or a percentage from `0` to `100`
+- `exception focus` accepts a zero-based exception index, seeks with the recorded JSON position and owning TTD thread, and reports a pasteable `requested_position_hex`; use it instead of manually transcribing decimal positions from `exceptions`.
+- `timeline events` reports `event_counts` before applying its event limit, and limits source payloads. Its `sources` entries report source status and counts; run `modules`, `events modules`, `events threads`, `exceptions`, or `keyframes` for the full metadata list.
 
 ## Output shaping
 
@@ -119,6 +206,12 @@ target\debug\windbg-tool.exe --compact --envelope sessions
 ```
 
 In envelope mode, successful commands return `{ "schema_version": 1, "ok": true, "data": ... }`. `--field` selects from `data`, so `--envelope --field session_id --raw open ...` still prints the raw session id. Failures return `{ "schema_version": 1, "ok": false, "error": ... }` and ignore `--field`/`--raw` so agents always receive the full error reason.
+
+## Symbol path environment
+
+TTD replay and every DbgEng live-launch, live-attach, and dump session honor the standard Windows symbol environment. Explicit TTD `--symbol-path` values take precedence; otherwise `_NT_SYMBOL_PATH` is searched first, then `_NT_ALT_SYMBOL_PATH`. TTD `--symcache-dir` takes precedence over `_NT_SYMCACHE_PATH`.
+
+If no selected path includes the Microsoft public symbol server, windbg-tool appends `srv*<cache>*https://msdl.microsoft.com/download/symbols`. The default cache directories are `.ttd-symbol-cache` for TTD and `.windbg-symbol-cache` for DbgEng. DbgEng target summaries and `live launch` results expose the final `symbol_path`.
 
 Structured error codes use stable exit codes:
 
@@ -153,12 +246,13 @@ The schema includes curated metadata where available and inferred metadata for o
 | Discover capabilities | `discover`, `cli-schema [command...]`, `recipes`, `tools`, `schema <tool>` |
 | Canonical agent context | `debug capabilities`, `debug snapshot`, `triage <kind>`, `symbols doctor`, `breakpoint plan`, `debug log summarize` |
 | Manage daemon/session state | `daemon ensure`, `daemon status`, `sessions`, `open`, `load`, `close`, `info` |
+| Capture a new trace | `trace record --output <trace.run> --command-line <target-command-line>` |
 | Move through a trace | `cursor create`, `position get`, `position set`, `step`, `replay to`, `replay watch-memory`, `sweep watch-memory` |
 | Inspect trace metadata | `threads`, `modules`, `exceptions`, `keyframes`, `timeline events`, `module info`, `module audit` |
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
 | Symbol and source triage | `symbols doctor`, `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `dump create`, `dump open`, `dump inspect`, `target dump`, `windbg status` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `dump create`, `dump open`, `dump inspect`, `target event`, `target thread`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 

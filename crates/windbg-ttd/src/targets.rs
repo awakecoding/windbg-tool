@@ -5,10 +5,11 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use windbg_dbgeng::{
     attach_live_session, launch_live_session, open_dump_session, BreakpointInfo, CoreRegisterState,
-    DebuggerExecutionStatus, DebuggerSession, DebuggerSessionKind, DebuggerSessionSummary,
-    DisassemblyResult, DumpKind, DumpOpenOptions, DumpWriteOptions, DumpWriteResult,
-    EvaluationResult, LiveAttachOptions, LiveLaunchSessionOptions, MemoryReadResult, ModuleInfo,
-    SourceLocation, StackFrameInfo, SymbolInfo, ThreadInfo,
+    DebuggerEventInfo, DebuggerExecutionStatus, DebuggerSession, DebuggerSessionKind,
+    DebuggerSessionSummary, DisassemblyResult, DumpKind, DumpOpenOptions, DumpWriteOptions,
+    DumpWriteResult, EvaluationResult, LiveAttachOptions, LiveLaunchSessionOptions,
+    MemoryReadResult, ModuleInfo, SourceLocation, StackFrameInfo, SymbolInfo, ThreadContext,
+    ThreadInfo,
 };
 
 pub type TargetId = u64;
@@ -72,6 +73,17 @@ pub struct TargetStackTraceRequest {
     pub target_id: TargetId,
     #[serde(default = "default_target_stack_frames")]
     pub max_frames: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetThreadContextRequest {
+    pub target_id: TargetId,
+    #[schemars(description = "DbgEng engine thread id returned by target_list_threads")]
+    pub engine_thread_id: u32,
+    #[serde(default = "default_target_stack_frames")]
+    pub max_frames: u32,
+    #[serde(default = "default_target_disasm_count")]
+    pub disassembly_count: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -166,6 +178,18 @@ pub struct TargetThreadList {
 pub struct TargetRegisterState {
     pub target_id: TargetId,
     pub registers: CoreRegisterState,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetEventResponse {
+    pub target_id: TargetId,
+    pub event: DebuggerEventInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetThreadContextResponse {
+    pub target_id: TargetId,
+    pub context: ThreadContext,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -365,6 +389,15 @@ impl TargetRegistry {
         })
     }
 
+    pub fn last_event(&self, request: TargetRequest) -> anyhow::Result<TargetEventResponse> {
+        let target = self.target(request.target_id)?;
+        ensure_live_target(request.target_id, &target.session)?;
+        Ok(TargetEventResponse {
+            target_id: request.target_id,
+            event: target.session.last_event()?,
+        })
+    }
+
     pub fn read_memory(
         &self,
         request: TargetMemoryReadRequest,
@@ -422,6 +455,21 @@ impl TargetRegistry {
         Ok(TargetStackTraceResponse {
             target_id: request.target_id,
             frames: target.session.stack_trace(request.max_frames)?,
+        })
+    }
+
+    pub fn thread_context(
+        &self,
+        request: TargetThreadContextRequest,
+    ) -> anyhow::Result<TargetThreadContextResponse> {
+        let target = self.target(request.target_id)?;
+        Ok(TargetThreadContextResponse {
+            target_id: request.target_id,
+            context: target.session.thread_context(
+                request.engine_thread_id,
+                request.max_frames,
+                request.disassembly_count,
+            )?,
         })
     }
 

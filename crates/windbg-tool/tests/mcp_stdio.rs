@@ -990,6 +990,7 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         | "target_continue"
         | "target_step_into"
         | "target_core_registers"
+        | "target_last_event"
         | "target_list_threads"
         | "target_list_modules"
         | "target_list_breakpoints" => Ok(&["target_id"]),
@@ -998,6 +999,7 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         "target_write_dump" => Ok(&["target_id", "path"]),
         "target_symbol_by_offset" | "target_source_by_offset" => Ok(&["target_id", "address"]),
         "target_stack_trace" => Ok(&["target_id"]),
+        "target_thread_context" => Ok(&["target_id", "engine_thread_id"]),
         "target_disassemble" => Ok(&["target_id"]),
         "target_set_breakpoint" => Ok(&["target_id", "address"]),
         "target_remove_breakpoint" => Ok(&["target_id", "breakpoint_id"]),

@@ -32,6 +32,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         Some(Commands::CliSchema(args)) => print_value(cli_schema(args)?, &output),
         Some(Commands::Trace { command }) => match command {
             TraceCommand::List(args) => call_and_print(pipe, trace_list_call(args), &output).await,
+            TraceCommand::Record(args) => platform::run_trace_record(args, &output),
         },
         Some(Commands::TraceList(args)) => {
             call_and_print(pipe, trace_list_call(args), &output).await
@@ -44,6 +45,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         },
         Some(Commands::Live { command }) => match command {
             LiveCommand::Launch(args) => platform::run_live_launch(args, &output),
+            LiveCommand::StartupBreak(args) => platform::run_live_startup_break(args, &output),
             LiveCommand::Start(args) => live_start_and_print(pipe, args, &output).await,
             LiveCommand::Attach(args) => live_attach_and_print(pipe, args, &output).await,
             LiveCommand::Capabilities => print_value(platform::live_capabilities(), &output),
@@ -146,6 +148,9 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         Some(Commands::Exceptions(args)) => {
             call_and_print(pipe, session_call("ttd_list_exceptions", args), &output).await
         }
+        Some(Commands::Exception { command }) => match command {
+            ExceptionCommand::Focus(args) => exception_focus_and_print(pipe, args, &output).await,
+        },
         Some(Commands::Events { command }) => match command {
             EventsCommand::Modules(args) => {
                 call_and_print(pipe, session_call("ttd_module_events", args), &output).await
@@ -302,11 +307,17 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
                 )
                 .await
             }
+            TargetCommand::Event(args) => {
+                call_and_print(pipe, target_call("target_last_event", args.target), &output).await
+            }
             TargetCommand::Memory(args) => {
                 call_and_print(pipe, target_memory_call(args)?, &output).await
             }
             TargetCommand::Stack(args) => {
                 call_and_print(pipe, target_stack_call(args), &output).await
+            }
+            TargetCommand::Thread(args) => {
+                call_and_print(pipe, target_thread_context_call(args), &output).await
             }
             TargetCommand::Disasm(args) => {
                 call_and_print(pipe, target_disasm_call(args)?, &output).await

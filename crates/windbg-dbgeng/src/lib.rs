@@ -1,6 +1,92 @@
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
+
+pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
+pub const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
+pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
+pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
+const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandardSymbolEnvironment {
+    pub symbol_path: Option<String>,
+    pub symcache_dir: Option<PathBuf>,
+}
+
+impl StandardSymbolEnvironment {
+    pub fn from_process() -> Self {
+        Self::from_values(
+            env_path(NT_SYMBOL_PATH_ENV),
+            env_path(NT_ALT_SYMBOL_PATH_ENV),
+            env::var_os(NT_SYMCACHE_PATH_ENV).map(PathBuf::from),
+        )
+    }
+
+    pub fn from_values(
+        symbol_path: Option<String>,
+        alternate_symbol_path: Option<String>,
+        symcache_dir: Option<PathBuf>,
+    ) -> Self {
+        let symbol_path = [symbol_path, alternate_symbol_path]
+            .into_iter()
+            .flatten()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(";");
+        Self {
+            symbol_path: (!symbol_path.is_empty()).then_some(symbol_path),
+            symcache_dir: symcache_dir.filter(|path| !path.as_os_str().is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDbgEngSymbolPath {
+    pub symbol_path: String,
+    pub symbol_cache_dir: PathBuf,
+}
+
+pub fn resolve_dbgeng_symbol_path() -> ResolvedDbgEngSymbolPath {
+    resolve_dbgeng_symbol_path_with_environment(
+        StandardSymbolEnvironment::from_process(),
+        Path::new(DEFAULT_DBGENG_SYMBOL_CACHE),
+    )
+}
+
+pub fn resolve_dbgeng_symbol_path_with_environment(
+    environment: StandardSymbolEnvironment,
+    default_cache_dir: &Path,
+) -> ResolvedDbgEngSymbolPath {
+    let symbol_cache_dir = environment
+        .symcache_dir
+        .unwrap_or_else(|| default_cache_dir.to_path_buf());
+    let mut paths = environment.symbol_path.into_iter().collect::<Vec<_>>();
+    if !paths
+        .iter()
+        .any(|path| path.contains(MICROSOFT_SYMBOL_SERVER))
+    {
+        paths.push(format!(
+            "srv*{}*{}",
+            symbol_cache_dir.to_string_lossy(),
+            MICROSOFT_SYMBOL_SERVER
+        ));
+    }
+    ResolvedDbgEngSymbolPath {
+        symbol_path: paths.join(";"),
+        symbol_cache_dir,
+    }
+}
+
+fn env_path(name: &str) -> Option<String> {
+    env::var_os(name).and_then(|value| {
+        let value = value.to_string_lossy().trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ProcessServerOptions {
@@ -79,6 +165,7 @@ pub struct LiveLaunchResult {
     pub wait_succeeded: bool,
     pub execution_status: Option<u32>,
     pub execution_status_name: Option<String>,
+    pub symbol_path: String,
     pub end: LiveLaunchEnd,
 }
 
@@ -109,6 +196,7 @@ pub struct DebuggerSessionSummary {
     pub processor_type: Option<u32>,
     pub processor_name: Option<String>,
     pub execution_status: DebuggerExecutionStatus,
+    pub symbol_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +297,40 @@ pub struct EvaluationResult {
     pub float64_value: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerExceptionInfo {
+    pub code: u32,
+    pub flags: u32,
+    pub address: u64,
+    pub first_chance: bool,
+    pub parameters: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerEventInfo {
+    pub event_type: u32,
+    pub event_name: String,
+    pub process_system_id: u32,
+    pub thread_system_id: u32,
+    pub description: Option<String>,
+    pub extra_information_size: u32,
+    pub breakpoint_id: Option<u32>,
+    pub exception: Option<DebuggerExceptionInfo>,
+    pub module_base: Option<u64>,
+    pub exit_code: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadContext {
+    pub thread: ThreadInfo,
+    pub registers: CoreRegisterState,
+    pub current_module: Option<ModuleInfo>,
+    pub current_symbol: Option<SymbolInfo>,
+    pub stack: Vec<StackFrameInfo>,
+    pub disassembly: Option<DisassemblyResult>,
+    pub current_thread_preserved: bool,
+}
+
 pub fn start_process_server(options: ProcessServerOptions) -> anyhow::Result<ProcessServerResult> {
     start_process_server_impl(options)
 }
@@ -245,6 +367,7 @@ pub struct DebuggerSession {
     registers: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugRegisters,
     symbols: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
     system_objects: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
+    symbol_path: String,
 }
 
 #[cfg(windows)]
@@ -264,6 +387,7 @@ impl DebuggerSession {
             processor_type: self.processor_type().ok(),
             processor_name: self.processor_name().ok(),
             execution_status: self.execution_status(),
+            symbol_path: self.symbol_path.clone(),
         }
     }
 
@@ -280,10 +404,17 @@ impl DebuggerSession {
     }
 
     pub fn wait_for_event(&self, timeout_ms: u32) -> anyhow::Result<DebuggerExecutionStatus> {
-        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_STATUS_TIMEOUT, DEBUG_WAIT_DEFAULT,
+        };
 
-        unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms)? };
-        Ok(self.execution_status())
+        let wait = unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) };
+        let status = self.execution_status();
+        match wait {
+            Ok(()) => Ok(status),
+            Err(_) if status.raw == Some(DEBUG_STATUS_TIMEOUT) => Ok(status),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn continue_execution(&self) -> anyhow::Result<DebuggerExecutionStatus> {
@@ -302,6 +433,111 @@ impl DebuggerSession {
             self.control.SetExecutionStatus(DEBUG_STATUS_STEP_INTO)?;
         }
         Ok(self.execution_status())
+    }
+
+    pub fn last_event(&self) -> anyhow::Result<DebuggerEventInfo> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_EVENT_BREAKPOINT, DEBUG_EVENT_EXCEPTION, DEBUG_EVENT_EXIT_PROCESS,
+            DEBUG_EVENT_EXIT_THREAD, DEBUG_EVENT_LOAD_MODULE, DEBUG_EVENT_UNLOAD_MODULE,
+            DEBUG_LAST_EVENT_INFO_BREAKPOINT, DEBUG_LAST_EVENT_INFO_EXCEPTION,
+            DEBUG_LAST_EVENT_INFO_EXIT_PROCESS, DEBUG_LAST_EVENT_INFO_EXIT_THREAD,
+            DEBUG_LAST_EVENT_INFO_LOAD_MODULE, DEBUG_LAST_EVENT_INFO_UNLOAD_MODULE,
+        };
+
+        const MAX_EVENT_DESCRIPTION_CHARS: usize = 512;
+        const MAX_EVENT_EXTRA_BYTES: usize = 512;
+
+        let mut event_type = 0u32;
+        let mut process_system_id = 0u32;
+        let mut thread_system_id = 0u32;
+        let mut extra_information = vec![0u8; MAX_EVENT_EXTRA_BYTES];
+        let mut extra_information_used = 0u32;
+        let mut description = vec![0u16; MAX_EVENT_DESCRIPTION_CHARS];
+        let mut description_used = 0u32;
+        unsafe {
+            self.control.GetLastEventInformationWide(
+                &mut event_type,
+                &mut process_system_id,
+                &mut thread_system_id,
+                Some(extra_information.as_mut_ptr().cast()),
+                extra_information.len() as u32,
+                Some(&mut extra_information_used),
+                Some(&mut description),
+                Some(&mut description_used),
+            )?;
+        }
+        ensure!(
+            extra_information_used as usize <= extra_information.len(),
+            "DbgEng last-event payload exceeds the bounded {MAX_EVENT_EXTRA_BYTES}-byte limit"
+        );
+        ensure!(
+            description_used as usize <= description.len(),
+            "DbgEng last-event description exceeds the bounded {MAX_EVENT_DESCRIPTION_CHARS}-character limit"
+        );
+
+        let description_len = description_used as usize;
+        let description = &description[..description_len];
+        let description_len = if description.last().is_some_and(|character| *character == 0) {
+            description_len - 1
+        } else {
+            description_len
+        };
+        let description = String::from_utf16_lossy(&description[..description_len]);
+        let description = (!description.is_empty()).then_some(description);
+        let extra_information = &extra_information[..extra_information_used as usize];
+        let breakpoint_id = (event_type == DEBUG_EVENT_BREAKPOINT)
+            .then(|| read_event_info::<DEBUG_LAST_EVENT_INFO_BREAKPOINT>(extra_information))
+            .flatten()
+            .map(|info| info.Id);
+        let exception = (event_type == DEBUG_EVENT_EXCEPTION)
+            .then(|| read_event_info::<DEBUG_LAST_EVENT_INFO_EXCEPTION>(extra_information))
+            .flatten()
+            .map(|info| {
+                let count = (info.ExceptionRecord.NumberParameters as usize)
+                    .min(info.ExceptionRecord.ExceptionInformation.len());
+                DebuggerExceptionInfo {
+                    code: info.ExceptionRecord.ExceptionCode.0 as u32,
+                    flags: info.ExceptionRecord.ExceptionFlags,
+                    address: info.ExceptionRecord.ExceptionAddress,
+                    first_chance: info.FirstChance != 0,
+                    parameters: info.ExceptionRecord.ExceptionInformation[..count].to_vec(),
+                }
+            });
+        let module_base = match event_type {
+            DEBUG_EVENT_LOAD_MODULE => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_LOAD_MODULE>(extra_information)
+                    .map(|info| info.Base)
+            }
+            DEBUG_EVENT_UNLOAD_MODULE => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_UNLOAD_MODULE>(extra_information)
+                    .map(|info| info.Base)
+            }
+            _ => None,
+        };
+        let exit_code = match event_type {
+            DEBUG_EVENT_EXIT_PROCESS => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_EXIT_PROCESS>(extra_information)
+                    .map(|info| info.ExitCode)
+            }
+            DEBUG_EVENT_EXIT_THREAD => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_EXIT_THREAD>(extra_information)
+                    .map(|info| info.ExitCode)
+            }
+            _ => None,
+        };
+
+        Ok(DebuggerEventInfo {
+            event_type,
+            event_name: event_type_name(event_type).to_string(),
+            process_system_id,
+            thread_system_id,
+            description,
+            extra_information_size: extra_information_used,
+            breakpoint_id,
+            exception,
+            module_base,
+            exit_code,
+        })
     }
 
     pub fn detach(&self) -> anyhow::Result<()> {
@@ -422,6 +658,26 @@ impl DebuggerSession {
         Ok(modules)
     }
 
+    pub fn module_by_offset(&self, address: u64) -> anyhow::Result<Option<ModuleInfo>> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_GETMOD_NO_UNLOADED_MODULES;
+
+        let mut index = 0u32;
+        let mut base_address = 0u64;
+        let result = unsafe {
+            self.symbols.GetModuleByOffset2(
+                address,
+                0,
+                DEBUG_GETMOD_NO_UNLOADED_MODULES,
+                Some(&mut index),
+                Some(&mut base_address),
+            )
+        };
+        if result.is_err() {
+            return Ok(None);
+        }
+        Ok(Some(self.module_info(index, base_address)))
+    }
+
     pub fn symbol_by_offset(&self, address: u64) -> anyhow::Result<Option<SymbolInfo>> {
         self.try_symbol_by_offset(address)
     }
@@ -491,6 +747,72 @@ impl DebuggerSession {
             .collect())
     }
 
+    pub fn thread_context(
+        &self,
+        engine_thread_id: u32,
+        max_frames: u32,
+        disassembly_count: u32,
+    ) -> anyhow::Result<ThreadContext> {
+        ensure!(max_frames > 0, "max_frames must be greater than zero");
+        ensure!(
+            disassembly_count > 0,
+            "disassembly_count must be greater than zero"
+        );
+        ensure!(
+            engine_thread_id != u32::MAX,
+            "engine_thread_id cannot be DEBUG_ANY_ID"
+        );
+
+        let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
+        let changed_thread = previous_thread_id != engine_thread_id;
+        if changed_thread {
+            unsafe {
+                self.system_objects.SetCurrentThreadId(engine_thread_id)?;
+            }
+        }
+
+        let context = (|| {
+            let registers = self.core_registers()?;
+            let instruction_offset = registers.instruction_offset;
+            let current_module = instruction_offset
+                .map(|address| self.module_by_offset(address))
+                .transpose()?
+                .flatten();
+            let current_symbol = instruction_offset
+                .map(|address| self.symbol_by_offset(address))
+                .transpose()?
+                .flatten();
+            let stack = self.stack_trace(max_frames)?;
+            let disassembly = instruction_offset
+                .map(|address| self.disassemble(Some(address), disassembly_count))
+                .transpose()?;
+            let system_id = self.current_thread_system_id()?;
+            Ok(ThreadContext {
+                thread: ThreadInfo {
+                    engine_id: engine_thread_id,
+                    system_id,
+                },
+                registers,
+                current_module,
+                current_symbol,
+                stack,
+                disassembly,
+                current_thread_preserved: true,
+            })
+        })();
+
+        let restore = changed_thread
+            .then(|| unsafe { self.system_objects.SetCurrentThreadId(previous_thread_id) });
+        match (context, restore) {
+            (Ok(context), Some(Ok(()))) | (Ok(context), None) => Ok(context),
+            (Ok(_), Some(Err(error))) => Err(error).context("failed to restore the current thread"),
+            (Err(error), Some(Err(restore_error))) => Err(error).context(format!(
+                "failed to inspect the requested thread and failed to restore the current thread: {restore_error}"
+            )),
+            (Err(error), _) => Err(error),
+        }
+    }
+
     pub fn disassemble(
         &self,
         address: Option<u64>,
@@ -540,16 +862,42 @@ impl DebuggerSession {
 
     pub fn add_code_breakpoint(&self, address: u64) -> anyhow::Result<BreakpointInfo> {
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
-            DEBUG_ANY_ID, DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
+            DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
         };
 
-        let breakpoint = unsafe {
-            self.control
-                .AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)?
-        };
+        let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_CODE)?;
         unsafe {
-            breakpoint.SetOffset(address)?;
-            breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+            breakpoint.SetOffset(address).with_context(|| {
+                format!("DbgEng could not set code breakpoint offset 0x{address:X}")
+            })?;
+            breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .context("DbgEng could not enable code breakpoint")?;
+        }
+        self.breakpoint_info(&breakpoint)
+    }
+
+    pub fn add_code_breakpoint_expression(
+        &self,
+        expression: &str,
+    ) -> anyhow::Result<BreakpointInfo> {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
+        };
+
+        let mut expression_wide = expression.encode_utf16().collect::<Vec<_>>();
+        expression_wide.push(0);
+        let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_CODE)?;
+        unsafe {
+            breakpoint
+                .SetOffsetExpressionWide(PCWSTR(expression_wide.as_ptr()))
+                .with_context(|| {
+                    format!("DbgEng could not set code breakpoint expression '{expression}'")
+                })?;
+            breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .context("DbgEng could not enable code breakpoint")?;
         }
         self.breakpoint_info(&breakpoint)
     }
@@ -561,13 +909,10 @@ impl DebuggerSession {
         access_type: u32,
     ) -> anyhow::Result<BreakpointInfo> {
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
-            DEBUG_ANY_ID, DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_ENABLED,
+            DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_ENABLED,
         };
 
-        let breakpoint = unsafe {
-            self.control
-                .AddBreakpoint2(DEBUG_BREAKPOINT_DATA, DEBUG_ANY_ID)?
-        };
+        let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_DATA)?;
         unsafe {
             breakpoint.SetOffset(address)?;
             breakpoint.SetDataParameters(size, access_type)?;
@@ -650,6 +995,55 @@ impl DebuggerSession {
         .ok()
     }
 
+    fn add_compatible_breakpoint(
+        &self,
+        break_type: u32,
+    ) -> anyhow::Result<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugBreakpoint2>
+    {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_ANY_ID;
+
+        match unsafe { self.control.AddBreakpoint2(break_type, DEBUG_ANY_ID) } {
+            Ok(breakpoint) => Ok(breakpoint),
+            Err(modern_error) => unsafe {
+                self.control
+                    .AddBreakpoint(break_type, DEBUG_ANY_ID)
+                    .and_then(|breakpoint| breakpoint.cast())
+            }
+            .with_context(|| {
+                format!(
+                    "DbgEng could not add breakpoint type {break_type}; AddBreakpoint2 failed first: {modern_error}"
+                )
+            }),
+        }
+    }
+
+    fn module_info(&self, index: u32, base_address: u64) -> ModuleInfo {
+        ModuleInfo {
+            base_address,
+            module_name: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_MODULE,
+                index,
+                base_address,
+            ),
+            image_name: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_IMAGE,
+                index,
+                base_address,
+            ),
+            loaded_image_name: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_LOADED_IMAGE,
+                index,
+                base_address,
+            ),
+            symbol_file: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_SYMBOL_FILE,
+                index,
+                base_address,
+            ),
+        }
+    }
+
     fn try_symbol_by_offset(&self, address: u64) -> anyhow::Result<Option<SymbolInfo>> {
         let mut displacement = 0u64;
         let name = match read_wide_string(|buffer, size| unsafe {
@@ -700,6 +1094,32 @@ impl DebuggerSession {
     }
 }
 
+#[cfg(windows)]
+fn read_event_info<T: Copy>(bytes: &[u8]) -> Option<T> {
+    (bytes.len() >= std::mem::size_of::<T>())
+        .then(|| unsafe { bytes.as_ptr().cast::<T>().read_unaligned() })
+}
+
+fn event_type_name(event_type: u32) -> &'static str {
+    match event_type {
+        1 => "breakpoint",
+        2 => "exception",
+        4 => "create_thread",
+        8 => "exit_thread",
+        16 => "create_process",
+        32 => "exit_process",
+        64 => "load_module",
+        128 => "unload_module",
+        256 => "system_error",
+        512 => "session_status",
+        1024 => "change_debuggee_state",
+        2048 => "change_engine_state",
+        4096 => "change_symbol_state",
+        8192 => "service_exception",
+        _ => "unknown",
+    }
+}
+
 #[cfg(not(windows))]
 impl DebuggerSession {
     pub fn summary(&self) -> DebuggerSessionSummary {
@@ -714,6 +1134,7 @@ impl DebuggerSession {
                 raw: None,
                 name: None,
             },
+            symbol_path: resolve_dbgeng_symbol_path().symbol_path,
         }
     }
 
@@ -737,6 +1158,10 @@ impl DebuggerSession {
     }
 
     pub fn step_into(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn last_event(&self) -> anyhow::Result<DebuggerEventInfo> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -768,6 +1193,10 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn module_by_offset(&self, _address: u64) -> anyhow::Result<Option<ModuleInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn symbol_by_offset(&self, _address: u64) -> anyhow::Result<Option<SymbolInfo>> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
@@ -777,6 +1206,15 @@ impl DebuggerSession {
     }
 
     pub fn stack_trace(&self, _max_frames: u32) -> anyhow::Result<Vec<StackFrameInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn thread_context(
+        &self,
+        _engine_thread_id: u32,
+        _max_frames: u32,
+        _disassembly_count: u32,
+    ) -> anyhow::Result<ThreadContext> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -793,6 +1231,13 @@ impl DebuggerSession {
     }
 
     pub fn add_code_breakpoint(&self, _address: u64) -> anyhow::Result<BreakpointInfo> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn add_code_breakpoint_expression(
+        &self,
+        _expression: &str,
+    ) -> anyhow::Result<BreakpointInfo> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -877,6 +1322,7 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
         initial_break_timeout_ms: options.initial_break_timeout_ms,
     })?;
     let execution_status = session.execution_status();
+    let symbol_path = session.symbol_path.clone();
     match options.end {
         LiveLaunchEnd::Detach => session.detach()?,
         LiveLaunchEnd::Terminate => session.terminate()?,
@@ -888,6 +1334,7 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
         wait_succeeded: true,
         execution_status: execution_status.raw,
         execution_status_name: execution_status.name,
+        symbol_path,
         end: options.end,
     })
 }
@@ -909,12 +1356,16 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
     let registers: IDebugRegisters = client.cast()?;
     let symbols: IDebugSymbols5 = client.cast()?;
     let system_objects: IDebugSystemObjects = client.cast()?;
+    let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
-        client.CreateProcessWide(
-            0,
-            PCWSTR(command_line.as_ptr()),
-            DEBUG_PROCESS_ONLY_THIS_PROCESS,
-        )?;
+        // DbgEng can mutate the command buffer; command_line is owned and remains live for the call.
+        client
+            .CreateProcessWide(
+                0,
+                PCWSTR(command_line.as_ptr()),
+                DEBUG_PROCESS_ONLY_THIS_PROCESS,
+            )
+            .context("DbgEng CreateProcessWide failed")?;
         control.WaitForEvent(
             windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT,
             options.initial_break_timeout_ms,
@@ -932,6 +1383,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
         registers,
         symbols,
         system_objects,
+        symbol_path,
     })
 }
 
@@ -949,6 +1401,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
     let registers: IDebugRegisters = client.cast()?;
     let symbols: IDebugSymbols5 = client.cast()?;
     let system_objects: IDebugSystemObjects = client.cast()?;
+    let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.AttachProcess(0, options.process_id, DEBUG_ATTACH_DEFAULT)?;
         control.WaitForEvent(DEBUG_WAIT_DEFAULT, options.initial_break_timeout_ms)?;
@@ -965,6 +1418,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
         registers,
         symbols,
         system_objects,
+        symbol_path,
     })
 }
 
@@ -986,6 +1440,7 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
     let registers: IDebugRegisters = client.cast()?;
     let symbols: IDebugSymbols5 = client.cast()?;
     let system_objects: IDebugSystemObjects = client.cast()?;
+    let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
         control.WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)?;
@@ -1002,7 +1457,25 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
         registers,
         symbols,
         system_objects,
+        symbol_path,
     })
+}
+
+#[cfg(windows)]
+fn configure_dbgeng_symbol_path(
+    symbols: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
+) -> anyhow::Result<String> {
+    use windows::core::PCWSTR;
+
+    let symbol_config = resolve_dbgeng_symbol_path();
+    let mut symbol_path = symbol_config.symbol_path.encode_utf16().collect::<Vec<_>>();
+    symbol_path.push(0);
+    unsafe {
+        symbols
+            .SetSymbolPathWide(PCWSTR(symbol_path.as_ptr()))
+            .context("setting the DbgEng symbol path")?;
+    }
+    Ok(symbol_config.symbol_path)
 }
 
 #[cfg(windows)]
@@ -1228,5 +1701,69 @@ mod tests {
     fn uses_no_overwrite_by_default() {
         assert_eq!(dump_format_flags(false), 0x8000_0000);
         assert_eq!(dump_format_flags(true), 0);
+    }
+
+    #[test]
+    fn standard_symbol_environment_preserves_windows_search_order() {
+        let environment = StandardSymbolEnvironment::from_values(
+            Some("srv*C:\\primary*https://symbols.example.test".to_string()),
+            Some("C:\\alternate-symbols".to_string()),
+            Some(PathBuf::from("C:\\symbol-cache")),
+        );
+
+        assert_eq!(
+            environment.symbol_path.as_deref(),
+            Some("srv*C:\\primary*https://symbols.example.test;C:\\alternate-symbols")
+        );
+        assert_eq!(
+            environment.symcache_dir,
+            Some(PathBuf::from("C:\\symbol-cache"))
+        );
+    }
+
+    #[test]
+    fn dbgeng_symbol_path_appends_public_server_using_environment_cache() {
+        let resolved = resolve_dbgeng_symbol_path_with_environment(
+            StandardSymbolEnvironment::from_values(
+                Some("C:\\private-symbols".to_string()),
+                Some("C:\\alternate-symbols".to_string()),
+                Some(PathBuf::from("C:\\symbol-cache")),
+            ),
+            Path::new("unused-cache"),
+        );
+
+        assert_eq!(
+            resolved.symbol_path,
+            "C:\\private-symbols;C:\\alternate-symbols;srv*C:\\symbol-cache*https://msdl.microsoft.com/download/symbols"
+        );
+        assert_eq!(resolved.symbol_cache_dir, PathBuf::from("C:\\symbol-cache"));
+    }
+
+    #[test]
+    fn dbgeng_symbol_path_does_not_duplicate_public_server() {
+        let resolved = resolve_dbgeng_symbol_path_with_environment(
+            StandardSymbolEnvironment::from_values(
+                Some(format!("srv*C:\\cache*{MICROSOFT_SYMBOL_SERVER}")),
+                None,
+                Some(PathBuf::from("C:\\unused-cache")),
+            ),
+            Path::new("unused-cache"),
+        );
+
+        assert_eq!(
+            resolved
+                .symbol_path
+                .matches(MICROSOFT_SYMBOL_SERVER)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn names_documented_dbgeng_event_types() {
+        assert_eq!(event_type_name(1), "breakpoint");
+        assert_eq!(event_type_name(2), "exception");
+        assert_eq!(event_type_name(64), "load_module");
+        assert_eq!(event_type_name(0xFFFF), "unknown");
     }
 }
