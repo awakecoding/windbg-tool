@@ -54,7 +54,7 @@ rustup target add x86_64-pc-windows-msvc
 cargo xtask deps --arch amd64
 cargo xtask native-build --arch amd64 --static-crt
 cargo build -p windbg-tool --release --target x86_64-pc-windows-msvc
-cargo xtask package --arch amd64 --target x86_64-pc-windows-msvc --profile release --out target\package\windbg-tool-windows-x64
+cargo xtask package --arch amd64 --target x86_64-pc-windows-msvc --profile release --out target\package\windbg-tool-x64
 ```
 
 Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64 package. Architecture-specific dependency staging uses `target\runtime\<arch>\...`, while the legacy no-argument `cargo xtask deps`, `cargo xtask native-build`, and `cargo xtask package` commands keep using the existing host-architecture directories.
@@ -62,6 +62,15 @@ Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64
 Release packages statically link the MSVC C runtime into Rust code with `RUSTFLAGS=-C target-feature=+crt-static` and into the native bridge with `cargo xtask native-build --static-crt`. WinDbg, DbgEng, symbol, and TTD replay runtime DLLs remain dynamic dependencies and are copied into the package directory.
 
 Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
+
+### Publishing a GitHub Release
+
+Run the **Windows packages** workflow with **Run workflow** and enter an unprefixed semantic version such as `0.1.0`. After both package matrix jobs complete, the workflow creates the `v0.1.0` tag at the commit selected for the dispatch and publishes a GitHub Release containing:
+
+- `windbg-tool-x64.zip`
+- `windbg-tool-arm64.zip`
+
+Select **dry_run** to build both ZIPs, validate their contents, validate the version, and confirm that the tag is available without creating a tag or GitHub Release. The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
 
 To smoke-test the packaged MCP server:
 

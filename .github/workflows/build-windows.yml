@@ -4,6 +4,19 @@ on:
   push:
   pull_request:
   workflow_dispatch:
+    inputs:
+      version:
+        description: Release version without the v prefix (for example, 0.1.0)
+        required: true
+        type: string
+      dry_run:
+        description: Build and validate release packages without creating a tag or release
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
 
 jobs:
   package:
@@ -19,13 +32,13 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             nuget_arch: amd64
             vcvars_arch: x64
-            artifact: windbg-tool-windows-x64
+            artifact: windbg-tool-x64
             can_run: true
           - label: windows-arm64
             rust_target: aarch64-pc-windows-msvc
             nuget_arch: arm64
             vcvars_arch: x64_arm64
-            artifact: windbg-tool-windows-arm64
+            artifact: windbg-tool-arm64
             can_run: false
 
     env:
@@ -170,3 +183,77 @@ jobs:
           name: ${{ matrix.artifact }}
           path: target\package\${{ matrix.artifact }}.zip
           if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: package
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ inputs.version }}
+
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@v6
+        with:
+          path: release-assets
+          pattern: windbg-tool-*
+          merge-multiple: true
+
+      - name: Validate release inputs and assets
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          if ($env:VERSION -notmatch '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z][0-9A-Za-z.-]*)?$') {
+            throw "Version must be a semantic version without the v prefix: $env:VERSION"
+          }
+
+          $tag = "v$env:VERSION"
+          $assets = @(
+            'windbg-tool-x64.zip',
+            'windbg-tool-arm64.zip'
+          )
+          foreach ($asset in $assets) {
+            $path = Join-Path $PWD "release-assets\$asset"
+            if (-not (Test-Path -Path $path -PathType Leaf)) {
+              throw "Release asset was not downloaded: $asset"
+            }
+          }
+
+          $response = & gh api --include "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>&1
+          $exitCode = $LASTEXITCODE
+          if ($exitCode -eq 0) {
+            throw "Refusing to publish because tag $tag already exists."
+          }
+
+          $responseText = $response -join [Environment]::NewLine
+          if ($responseText -notmatch '(?m)^HTTP/\S+ 404') {
+            throw "Could not determine whether tag $tag exists: $responseText"
+          }
+
+      - name: Create release and upload packages
+        if: inputs.dry_run == false
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+
+          $tag = "v$env:VERSION"
+          $assets = @(
+            (Join-Path $PWD 'release-assets\windbg-tool-x64.zip'),
+            (Join-Path $PWD 'release-assets\windbg-tool-arm64.zip')
+          )
+          & gh release create $tag $assets `
+            --repo $env:GITHUB_REPOSITORY `
+            --target $env:GITHUB_SHA `
+            --title "windbg-tool $tag" `
+            --generate-notes
+
+      - name: Report dry run
+        if: inputs.dry_run
+        shell: pwsh
+        run: Write-Host "Dry run completed. Would create v$env:VERSION with the validated package ZIPs."
