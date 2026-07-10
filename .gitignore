@@ -13,6 +13,8 @@ target/
 traces/*/
 !traces/*.7z
 traces/**/*.out
+crates/windbg-tool/tests/fixtures/**/bin/
+crates/windbg-tool/tests/fixtures/**/obj/
 native/**/packages/
 native/**/x64/
 native/**/x86/
