@@ -212,6 +212,106 @@ The .NET 10.0.9 x64 fixture was validated with the direct DAC bridge:
 | private `ManagedTargets.PrivateEntry()` | `100663300` | `00000E` | `hit: true`; breakpoint ID `0` and IP matched its native entry |
 | `ManagedTargets.Overload(string)` | `100663302` | `00010E0E` | `hit: true`; breakpoint ID `0`, IP matched native entry, and the selected candidates were `0x06000005:00000E` and `0x06000006:00010E0E` |
 
+## Non-invasive live startup profiling
+
+`live startup-profile` is a one-shot DbgEng lifecycle collector for agent-oriented startup evidence. It launches at a DbgEng `create_process` event, enables only create/exit-process, create/exit-thread, load/unload-module event filters, then resumes the target and records bounded stopped events. It does **not** configure a software or hardware breakpoint, open the DAC, request CLR notifications, allocate or write target memory, inject code, or use a profiler.
+
+The default exception policy does not request first-chance exceptions because managed startup can produce enough expected exceptions to consume the bounded timeline. Use `--include-first-chance-exceptions` only when that additional event volume is justified. Debuggee output is not captured into the structured result because the command does not install a DbgEng output callback, although a target can still inherit the invoking console.
+
+The command reports two host-monotonic measures:
+
+- `command_to_create_observed_ms` is the wall time from before DbgEng session creation until windbg-tool observes the create-process event.
+- Timeline `resumed_wall_elapsed_ms` and derived `phase_durations` accumulate only while the target is resumed between observed DbgEng stops. This excludes the collector's intentionally stopped filter/configuration/context work, but includes DbgEng scheduling and event-delivery latency.
+
+Neither measure is target CPU time. A module-load timestamp does not identify managed registration, JIT work, or method execution. Repeated runs report min/median/max wall time only for phases whose two event boundaries were observed in runs that reached `exit_process`; no baseline means the output deliberately does not call a value a regression.
+
+Build and profile the source-only fixture without any DAC or breakpoint workflow:
+
+```powershell
+$fixture = Resolve-Path crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture
+dotnet build "$fixture\ManagedBreakpointFixture.csproj" -c Release
+$report = Join-Path $env:TEMP "windbg-tool-fixture-startup-profile.json"
+
+target\debug\windbg-tool.exe --compact live startup-profile `
+  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
+  --runs 3 `
+  --phase-module ManagedBreakpointFixture.dll `
+  --initial-break-timeout-ms 30000 `
+  --timeout-ms 30000 `
+  --max-events 256 `
+  --output $report `
+  --end terminate
+```
+
+`--max-events` bounds retained timeline payload rather than forcing a healthy target to terminate. After retaining `max_events - 1` entries, windbg-tool disables the high-volume thread/module filters and waits only for `exit_process`, preserving the final exit boundary in the last slot. The result marks this as `coverage.timeline_truncated: true` and lists the DbgEng `timing.tail_filter_commands`; it makes no claim about events omitted during that exit-only tail. `--end` is used only if the time bound is reached before process exit. A successful run has `status: "completed"`, `finish_reason: "exit_process"`, and `cleanup.status: "not_needed"`. An incomplete run records `timeout` and then applies `--end`; it is excluded from aggregate samples, and a repeated collection stops after that incomplete run. The optional `--capture-stop-context` captures bounded read-only register/module/symbol/stack context on early stops; it can increase observer overhead and is disabled by default.
+
+The important JSON fields are:
+
+```json
+{
+  "workflow": "live_startup_profile",
+  "target_memory_writes": {
+    "requested": false,
+    "software_breakpoints": false,
+    "hardware_breakpoints": false,
+    "dac_bridge": false
+  },
+  "runs": [{
+    "finish_reason": "exit_process",
+    "timeline": [{
+      "kind": "load_module",
+      "observed_elapsed_ms": 41,
+      "resumed_wall_elapsed_ms": 10,
+      "module": { "basename": "coreclr.dll" }
+    }],
+    "phase_durations": [{
+      "name": "create_process_to_coreclr_load",
+      "status": "observed",
+      "elapsed_ms": 10
+    }]
+  }],
+  "aggregate": {
+    "phase_wall_time_ms": [{
+      "name": "create_process_to_coreclr_load",
+      "sample_count": 3,
+      "min_ms": 8,
+      "median_ms": 10,
+      "max_ms": 13,
+      "regression_assessment": { "status": "no_baseline" }
+    }]
+  }
+}
+```
+
+For a future RDM observation, use the bounded no-breakpoint form only after the fixture command has completed with the expected no-write report:
+
+```powershell
+$rdm = 'D:\dev\.copilot\copilot-worktrees\RDM\bookish-winner\Windows\RemoteDesktopManager\Program\bin\Release\net10.0-windows10.0.19041\RemoteDesktopManager_x64.exe'
+target\debug\windbg-tool.exe --compact live startup-profile `
+  --command-line "`"$rdm`" /AutoCloseAfter:30" `
+  --phase-module RemoteDesktopManager.dll `
+  --initial-break-timeout-ms 30000 `
+  --timeout-ms 90000 `
+  --max-events 512 `
+  --end terminate
+```
+
+Do not add `live startup-break`, `live managed-break`, DAC options, or an endpoint-security workaround to that RDM command. If the initial safe-mode RDM run is blocked or fails, retain its DbgEng error/event evidence and stop rather than retrying or changing protection policy.
+
+### Observed local RDM lifecycle evidence
+
+The local Release x64 RDM build above completed an event-only profile with `exit_process` code `0` and `target_memory_writes.requested: false`. After that initial run established the safe lifecycle path, three bounded repetitions used `--runs 3 --max-events 128`; each retained 128 events, switched to exit-only tail collection, and reached `exit_process` code `0`.
+
+| Observable host-wall phase | Min ms | Median ms | Max ms |
+| --- | ---: | ---: | ---: |
+| command start to create-process observation | 24 | 25 | 165 |
+| create-process to `coreclr.dll` load | 409 | 444 | 606 |
+| `coreclr.dll` load to `RemoteDesktopManager.dll` load | 36 | 41 | 45 |
+| `RemoteDesktopManager.dll` load to exit-process | 49,183 | 53,327 | 65,624 |
+| create-process to exit-process | 49,633 | 53,807 | 66,275 |
+
+The first observed run found `coreclr.dll` at event index 22 and `RemoteDesktopManager.dll` at index 34. These are observer wall-clock lifecycle intervals, not CPU samples or proof that a specific RDM phase consumed CPU. The longest observable interval is therefore a follow-up wall-time investigation candidate only. One target-console `HttpListenerException (87)` was printed during the repeated collection, while the structured DbgEng records contained zero exception stops and all three runs exited with code `0`; the profile does not diagnose or attribute that application output.
+
 ### Verified RDM x64 test-VM run
 
 The approved .NET 10.0.9 x64 test VM used this direct, no-SOS invocation:
@@ -234,7 +334,7 @@ The same command with `--method Devolutions.RemoteDesktopManager.Program.ApplyDp
 
 ### RDM approval requirement
 
-The prior RDM evidence above was collected in an approved test VM. RDM continuation is currently blocked: do not launch, resume, or attach RDM under either software or hardware breakpoints, and do not seek an exclusion or workaround. Any future RDM proof requires a new explicit direction plus written approval from the application owner and endpoint-security owner for the designated test VM and RDM build. That approval must state the allowed debugger operations; it does not authorize disabling, weakening, bypassing, or otherwise altering Sophos, HitmanPro.Alert, or RDM protections.
+The prior RDM evidence above was collected in an approved test VM. RDM remains blocked for breakpoint and DAC workflows: do not launch, resume, or attach it under software or hardware breakpoints, CLR notifications, or target-memory writes, and do not seek an exclusion or workaround. The separate `live startup-profile` flow above is limited to lifecycle-event filters and has no target-memory operation; it may be attempted once under the current profiling policy after fixture validation. If that safe mode is blocked, stop rather than retrying. Any future breakpoint/DAC RDM proof requires a new explicit direction plus written approval from the application owner and endpoint-security owner for the designated test VM and RDM build. That approval must state the allowed debugger operations; it does not authorize disabling, weakening, bypassing, or otherwise altering Sophos, HitmanPro.Alert, or RDM protections.
 
 ## AI-oriented DbgEng target inspection
 
@@ -379,7 +479,7 @@ The schema includes curated metadata where available and inferred metadata for o
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
 | Symbol and source triage | `symbols doctor`, `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `dump create`, `dump open`, `dump inspect`, `target event`, `target thread`, `target dump`, `windbg status` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `live startup-profile`, `dump create`, `dump open`, `dump inspect`, `target event`, `target thread`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 

@@ -278,6 +278,10 @@ enum LiveCommand {
     )]
     StartupBreak(LiveStartupBreakArgs),
     #[command(
+        about = "Profile bounded DbgEng lifecycle events with host-monotonic wall-clock timing and no breakpoints"
+    )]
+    StartupProfile(LiveStartupProfileArgs),
+    #[command(
         about = "Launch .NET under DbgEng, bind the matching CoreCLR DAC, and emit a managed method hit"
     )]
     ManagedBreak(LiveManagedBreakArgs),
@@ -716,6 +720,81 @@ struct LiveStartupBreakArgs {
     #[arg(long, default_value_t = 16)]
     max_frames: u32,
     #[arg(long, default_value = "terminate", value_parser = ["detach", "terminate"])]
+    end: String,
+}
+
+#[derive(Debug, Args)]
+struct LiveStartupProfileArgs {
+    #[arg(long, help = "Full command line to launch under DbgEng")]
+    command_line: String,
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=10),
+        help = "Independent bounded launches to collect; stops after the first launch failure"
+    )]
+    runs: u32,
+    #[arg(
+        long,
+        default_value_t = 30000,
+        help = "Maximum time to observe the initial DbgEng create-process event"
+    )]
+    initial_break_timeout_ms: u32,
+    #[arg(
+        long,
+        default_value_t = 90000,
+        help = "Maximum target-resumed wall time for each run after the create-process event"
+    )]
+    timeout_ms: u32,
+    #[arg(
+        long,
+        default_value_t = 256,
+        value_parser = clap::value_parser!(u32).range(2..=1024),
+        help = "Maximum DbgEng lifecycle events retained per run"
+    )]
+    max_events: u32,
+    #[arg(
+        long,
+        value_name = "MODULE",
+        help = "Optional application module basename used for observable module-to-exit phases"
+    )]
+    phase_module: Option<String>,
+    #[arg(
+        long,
+        help = "Request first-chance exception stops in addition to lifecycle events; can substantially increase event volume"
+    )]
+    include_first_chance_exceptions: bool,
+    #[arg(
+        long,
+        help = "Attach bounded read-only register/module/symbol/stack context to early observed stops"
+    )]
+    capture_stop_context: bool,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        help = "Maximum event contexts captured when --capture-stop-context is set"
+    )]
+    max_context_events: u32,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        help = "Maximum stack frames in each optional stop context"
+    )]
+    max_frames: u32,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the complete JSON result to a new file as well as stdout"
+    )]
+    output: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value = "terminate",
+        value_parser = ["detach", "terminate"],
+        help = "Action if the target has not exited at its event or time bound"
+    )]
     end: String,
 }
 
@@ -4475,6 +4554,7 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
             | "live capabilities"
             | "live launch"
             | "live startup-break"
+            | "live startup-profile"
             | "breakpoint capabilities"
             | "datamodel capabilities"
     );
@@ -4546,6 +4626,7 @@ fn discover_manifest() -> Value {
             "live": [
                 "live capabilities",
                 "live launch --command-line <cmd> --end detach|terminate",
+                "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>]",
                 "live start --command-line <cmd>",
                 "live attach --process-id <pid>"
             ],
@@ -5212,6 +5293,15 @@ fn command_metadata() -> Value {
             "cost": "launches_process_and_waits_for_bounded_debug_event",
             "safety": "live_debugging_changes_target_execution_state",
             "bounds": ["--initial-break-timeout-ms", "--wait-timeout-ms", "--max-frames", "--end detach|terminate"]
+        },
+        {
+            "command": "live startup-profile",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "launches_process_and_collects_bounded_lifecycle_events",
+            "safety": "live_debugging_changes_target_execution_state_without_target_memory_writes",
+            "bounds": ["--runs 1..10", "--initial-break-timeout-ms", "--timeout-ms", "--max-events", "--max-context-events", "--end detach|terminate"]
         },
         {
             "command": "live start",

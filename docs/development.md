@@ -83,6 +83,14 @@ dotnet build crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture\ManagedB
 
 Run the fixture's public/private/overload `live managed-break` commands from [cli.md](cli.md) only in an approved test VM. The overload invocation uses `--signature 00010E0E`, the raw ECMA-335 `MethodDef` signature for `string Overload(string)`. The separate `--hardware-execute` mode is non-invasive: it uses a DbgEng `DEBUG_BREAKPOINT_DATA`/`DEBUG_BREAK_EXECUTE` processor breakpoint, opens the DAC read-only, and rejects `--allow-runtime-write`. It was verified for the native `coreclr!coreclr_execute_assembly` fixture hit, but a managed assembly's DbgEng image-load event precedes its read-only DAC visibility, so it cannot currently prove a private managed-method hit. Do not work around that lifecycle boundary with target writes, JIT forcing, injection, protection changes, or unapproved debugging. RDM continuation is blocked under the current policy: do not launch, attach, or resume it under any breakpoint, and do not seek exclusions or workarounds. Any future RDM work requires a new explicit direction and written approval defining the permitted debugger operations for the test VM and build; do not change Sophos, HitmanPro.Alert, or RDM protections.
 
+## Non-invasive startup-profile fixture
+
+`live startup-profile` validates the event-only DbgEng path without a breakpoint or DAC. It starts at a create-process event and configures only DbgEng lifecycle filters. It performs no target-memory allocation/write, no CLR notification registration, no injection, and no profiling. Run its fixture command from [cli.md](cli.md) before any RDM profile attempt.
+
+The command's phase values are host-monotonic resumed wall time between DbgEng stops, not CPU time or target-internal timestamps. Preserve `finish_reason`, `coverage`, and incomplete runs when evaluating output. `--capture-stop-context` is read-only but opt-in because its symbol/stack queries add observer overhead. `--include-first-chance-exceptions` is also opt-in and bounded by `--max-events`.
+
+The RDM policy remains stricter for all breakpoint/DAC workflows. The event-only profile command can make one bounded RDM launch after the fixture proves its no-write result. Only after that run reaches `exit_process` may it make a small bounded repeated collection; if the initial run is blocked, do not retry or seek an exclusion, protection change, or workaround.
+
 Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
 
 ### Publishing a GitHub Release

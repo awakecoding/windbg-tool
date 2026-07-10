@@ -1,7 +1,10 @@
 use anyhow::{bail, ensure, Context};
+use serde::Serialize;
 use serde_json::{json, Value};
+use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -29,8 +32,8 @@ use windows::Win32::System::Threading::{
 use super::output::{print_value, OutputOptions};
 use super::{
     CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
-    LiveManagedBreakArgs, LiveStartupBreakArgs, TraceRecordArgs, TraceRecordProfile,
-    TraceReplayCpuSupport, WindbgCommand,
+    LiveManagedBreakArgs, LiveStartupBreakArgs, LiveStartupProfileArgs, TraceRecordArgs,
+    TraceRecordProfile, TraceReplayCpuSupport, WindbgCommand,
 };
 
 pub(super) fn run_dbgeng_server(
@@ -205,6 +208,736 @@ pub(super) fn run_live_startup_break(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
     }
+}
+
+const STARTUP_PROFILE_CORECLR_MODULE: &str = "coreclr.dll";
+const STARTUP_PROFILE_MAX_MODULE_IDENTITIES: usize = 128;
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupProfileModule {
+    base_address: String,
+    basename: Option<String>,
+    module_name: Option<String>,
+    image_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupProfileEvent {
+    index: usize,
+    kind: String,
+    observed_elapsed_ms: u64,
+    resumed_wall_elapsed_ms: u64,
+    event: windbg_dbgeng::DebuggerEventInfo,
+    module: Option<StartupProfileModule>,
+    loaded_module_count: Option<usize>,
+    live_thread_count: Option<usize>,
+    context: Option<Value>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupProfilePhase {
+    name: String,
+    status: String,
+    elapsed_ms: Option<u64>,
+    start_event_index: Option<usize>,
+    end_event_index: Option<usize>,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupProfileRun {
+    run: u32,
+    status: String,
+    finish_reason: String,
+    target: windbg_dbgeng::DebuggerSessionSummary,
+    timing: Value,
+    event_filters: Value,
+    timeline: Vec<StartupProfileEvent>,
+    phase_durations: Vec<StartupProfilePhase>,
+    counts: Value,
+    coverage: Value,
+    cleanup: Value,
+}
+
+pub(super) fn run_live_startup_profile(
+    args: LiveStartupProfileArgs,
+    output_options: &OutputOptions,
+) -> anyhow::Result<()> {
+    let end = parse_live_launch_end(&args.end)?;
+    let phase_module = args
+        .phase_module
+        .as_deref()
+        .map(validate_module_load_filter)
+        .transpose()?;
+    ensure!(
+        args.runs == 1 || matches!(end, LiveLaunchEnd::Terminate),
+        "--runs greater than one requires --end terminate so a bounded run cannot leave a detached target behind"
+    );
+    if let Some(path) = args.output.as_deref() {
+        ensure!(
+            !path.exists(),
+            "refusing to overwrite startup-profile artifact {}",
+            path.display()
+        );
+        let parent = path
+            .parent()
+            .context("startup-profile artifact path must have a parent directory")?;
+        ensure!(
+            parent.is_dir(),
+            "startup-profile artifact directory does not exist: {}",
+            parent.display()
+        );
+    }
+
+    let mut runs = Vec::with_capacity(args.runs as usize);
+    let mut completed_runs = Vec::with_capacity(args.runs as usize);
+    for run_index in 1..=args.runs {
+        match collect_startup_profile_run(&args, run_index, phase_module.as_deref(), end) {
+            Ok(run) => {
+                if run.status == "completed" {
+                    completed_runs.push(run.clone());
+                }
+                let should_stop = run.status != "completed";
+                runs.push(serde_json::to_value(run)?);
+                if should_stop {
+                    break;
+                }
+            }
+            Err(error) => {
+                runs.push(json!({
+                    "run": run_index,
+                    "status": "failed",
+                    "error": error.to_string()
+                }));
+                break;
+            }
+        }
+    }
+
+    let mut result = json!({
+        "workflow": "live_startup_profile",
+        "command_line": args.command_line,
+        "requested_runs": args.runs,
+        "runs_completed_with_process_exit": completed_runs.len(),
+        "runs": runs,
+        "aggregate": startup_profile_aggregate(&completed_runs),
+        "target_memory_writes": {
+            "requested": false,
+            "operations": [],
+            "software_breakpoints": false,
+            "hardware_breakpoints": false,
+            "dac_bridge": false,
+            "clr_notifications": false,
+            "injection": false,
+            "profiler": false
+        },
+        "measurement_semantics": {
+            "clock": "host_monotonic_instant",
+            "launch_to_create_ms": "Host elapsed time from before DbgEng session creation until windbg-tool observes the DbgEng create-process stop.",
+            "phase_elapsed_ms": "Host wall time accumulated only while the target is resumed between observed DbgEng stops. It excludes windbg-tool's intentional stopped-state filter/context work, but includes debugger scheduling and event-delivery latency.",
+            "event_timestamps": "Observed when DbgEng returns control to windbg-tool, not target-side instruction timestamps.",
+            "not_cpu_time": true,
+            "regression_interpretation": "Repeated values can identify wall-clock variability or candidates for comparison with a baseline. They do not attribute CPU use or prove a regression."
+        },
+        "limitations": [
+            "DbgEng lifecycle events do not establish managed assembly registration, managed method execution, JIT activity, or CPU attribution.",
+            "Debuggee output is not captured into structured JSON because this command does not install an output callback; a target can still inherit the invoking console.",
+            "First-chance exceptions are opt-in because managed startup can generate enough events to consume the bounded timeline."
+        ]
+    });
+    if let Some(path) = args.output {
+        fs::write(&path, serde_json::to_vec_pretty(&result)?)
+            .with_context(|| format!("writing startup-profile artifact {}", path.display()))?;
+        result["artifact"] = json!({
+            "path": path,
+            "format": "pretty_json",
+            "written": true
+        });
+    }
+    print_value(result, output_options)
+}
+
+fn collect_startup_profile_run(
+    args: &LiveStartupProfileArgs,
+    run_index: u32,
+    phase_module: Option<&str>,
+    end: LiveLaunchEnd,
+) -> anyhow::Result<StartupProfileRun> {
+    let command_started = Instant::now();
+    let session = launch_live_session(LiveLaunchSessionOptions {
+        command_line: args.command_line.clone(),
+        initial_break_timeout_ms: args.initial_break_timeout_ms,
+        initial_stop: LiveInitialStop::CreateProcessEvent,
+    })?;
+
+    let result =
+        collect_startup_profile_stops(&session, args, run_index, phase_module, command_started);
+    let cleanup = match &result {
+        Ok(run) if run.finish_reason == "exit_process" => Ok(json!({
+            "action": "none",
+            "status": "not_needed",
+            "detail": "DbgEng reported exit_process before cleanup."
+        })),
+        _ => match end {
+            LiveLaunchEnd::Detach => session.detach().map(|()| {
+                json!({
+                    "action": "detach",
+                    "status": "ok"
+                })
+            }),
+            LiveLaunchEnd::Terminate => session.terminate().map(|()| {
+                json!({
+                    "action": "terminate",
+                    "status": "ok"
+                })
+            }),
+        },
+    };
+
+    match (result, cleanup) {
+        (Ok(mut run), Ok(cleanup)) => {
+            run.cleanup = cleanup;
+            Ok(run)
+        }
+        (Ok(mut run), Err(error)) => {
+            run.status = "cleanup_failed".to_string();
+            run.cleanup = json!({
+                "action": end,
+                "status": "error",
+                "error": error.to_string()
+            });
+            Ok(run)
+        }
+        (Err(error), Ok(_)) => Err(error),
+        (Err(error), Err(cleanup_error)) => Err(error).context(format!(
+            "also failed to end the live debug session: {cleanup_error}"
+        )),
+    }
+}
+
+fn collect_startup_profile_stops(
+    session: &DebuggerSession,
+    args: &LiveStartupProfileArgs,
+    run_index: u32,
+    phase_module: Option<&str>,
+    command_started: Instant,
+) -> anyhow::Result<StartupProfileRun> {
+    let initial_event = session
+        .last_event()
+        .context("reading the initial DbgEng create-process event")?;
+    ensure!(
+        initial_event.event_name == "create_process",
+        "DbgEng did not stop on create-process: {initial_event:?}"
+    );
+
+    let mut recording = StartupProfileRecording {
+        timeline: Vec::with_capacity(args.max_events as usize),
+        ..StartupProfileRecording::default()
+    };
+    let mut resumed_elapsed = Duration::ZERO;
+    record_startup_profile_event(
+        session,
+        &mut recording,
+        args,
+        initial_event,
+        (command_started.elapsed(), resumed_elapsed),
+    );
+
+    let event_filters =
+        configure_startup_profile_event_filters(session, args.include_first_chance_exceptions)?;
+    let deadline = Instant::now() + Duration::from_millis(u64::from(args.timeout_ms));
+    let mut timeline_truncated = false;
+    let mut tail_filter_commands = Vec::new();
+    let finish_reason = loop {
+        if !timeline_truncated && recording.timeline.len() >= args.max_events as usize - 1 {
+            tail_filter_commands = configure_startup_profile_exit_tail_filters(
+                session,
+                args.include_first_chance_exceptions,
+            )?;
+            timeline_truncated = true;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break "timeout";
+        }
+        session.continue_execution()?;
+        let resumed_at = Instant::now();
+        let wait_timeout_ms = duration_millis(remaining).clamp(1, u64::from(u32::MAX)) as u32;
+        let wait = session.wait_for_event(wait_timeout_ms)?;
+        resumed_elapsed += resumed_at.elapsed();
+        if wait.name.as_deref() == Some("timeout") {
+            break "timeout";
+        }
+        let event = session
+            .last_event()
+            .context("reading a DbgEng lifecycle event")?;
+        let exiting = event.event_name == "exit_process";
+        if !timeline_truncated || exiting {
+            record_startup_profile_event(
+                session,
+                &mut recording,
+                args,
+                event,
+                (command_started.elapsed(), resumed_elapsed),
+            );
+        }
+        if exiting {
+            break "exit_process";
+        }
+    };
+
+    let phase_durations = derive_startup_profile_phases(&recording.timeline, phase_module);
+    let StartupProfileRecording {
+        timeline,
+        counts,
+        module_identities,
+        captured_contexts,
+    } = recording;
+    let module_identities = module_identities
+        .into_iter()
+        .take(STARTUP_PROFILE_MAX_MODULE_IDENTITIES)
+        .collect::<Vec<_>>();
+    let module_identity_truncated =
+        counts.unique_module_identity_count > STARTUP_PROFILE_MAX_MODULE_IDENTITIES;
+    let timeline_len = timeline.len();
+    let status = if finish_reason == "exit_process" {
+        "completed"
+    } else {
+        "incomplete"
+    };
+    Ok(StartupProfileRun {
+        run: run_index,
+        status: status.to_string(),
+        finish_reason: finish_reason.to_string(),
+        target: session.summary(),
+        timing: json!({
+            "command_to_create_observed_ms": timeline
+                .first()
+                .map(|event| event.observed_elapsed_ms),
+            "target_resumed_wall_elapsed_ms": duration_millis(resumed_elapsed),
+            "timeout_after_create_ms": args.timeout_ms,
+            "timeout_clock": "host_monotonic_target_resumed_wall_time",
+            "timeline_retention_limit_reached": timeline_truncated,
+            "tail_filter_commands": tail_filter_commands
+        }),
+        event_filters,
+        timeline,
+        phase_durations,
+        counts: json!({
+            "module_load_events": counts.module_load_events,
+            "module_unload_events": counts.module_unload_events,
+            "create_thread_events": counts.create_thread_events,
+            "exit_thread_events": counts.exit_thread_events,
+            "exception_events": counts.exception_events,
+            "first_chance_exception_events": counts.first_chance_exception_events,
+            "peak_observed_live_thread_count": counts.peak_live_thread_count,
+            "peak_observed_loaded_module_count": counts.peak_loaded_module_count,
+            "unique_observed_module_identities": module_identities,
+            "unique_observed_module_identity_count": counts.unique_module_identity_count,
+            "unique_observed_module_identities_truncated": module_identity_truncated
+        }),
+        coverage: json!({
+            "timeline_event_limit": args.max_events,
+            "timeline_events_returned": timeline_len,
+            "timeline_truncated": timeline_truncated,
+            "truncation_behavior": if timeline_truncated {
+                "After retaining max_events - 1 lifecycle entries, windbg-tool disabled high-volume filters and waited only for exit_process so the final exit boundary remains observable."
+            } else {
+                "All observed lifecycle events were retained."
+            },
+            "finished_at_process_exit": finish_reason == "exit_process",
+            "phase_module": phase_module,
+            "first_chance_exceptions_requested": args.include_first_chance_exceptions,
+            "stop_context_requested": args.capture_stop_context,
+            "stop_contexts_returned": captured_contexts
+        }),
+        cleanup: Value::Null,
+    })
+}
+
+#[derive(Default)]
+struct StartupProfileCounts {
+    module_load_events: u32,
+    module_unload_events: u32,
+    create_thread_events: u32,
+    exit_thread_events: u32,
+    exception_events: u32,
+    first_chance_exception_events: u32,
+    peak_live_thread_count: usize,
+    peak_loaded_module_count: usize,
+    unique_module_identity_count: usize,
+}
+
+#[derive(Default)]
+struct StartupProfileRecording {
+    timeline: Vec<StartupProfileEvent>,
+    counts: StartupProfileCounts,
+    module_identities: BTreeSet<String>,
+    captured_contexts: u32,
+}
+
+fn configure_startup_profile_event_filters(
+    session: &DebuggerSession,
+    include_first_chance_exceptions: bool,
+) -> anyhow::Result<Value> {
+    let mut commands = Vec::new();
+    if include_first_chance_exceptions {
+        session
+            .execute_command("sxe *")
+            .context("configuring DbgEng to stop on first-chance exceptions")?;
+        commands.push("sxe *");
+    }
+    for (command, event) in [
+        ("sxe cpr", "create_process"),
+        ("sxe epr", "exit_process"),
+        ("sxe ct", "create_thread"),
+        ("sxe et", "exit_thread"),
+        ("sxe ld", "load_module"),
+        ("sxe ud", "unload_module"),
+    ] {
+        session
+            .execute_command(command)
+            .with_context(|| format!("configuring DbgEng {event} event filtering"))?;
+        commands.push(command);
+    }
+    Ok(json!({
+        "commands": commands,
+        "first_chance_exceptions": if include_first_chance_exceptions {
+            "all_requested_with_sxe_wildcard"
+        } else {
+            "not_requested; DbgEng's default unhandled-exception behavior remains observable if it stops the target"
+        }
+    }))
+}
+
+fn configure_startup_profile_exit_tail_filters(
+    session: &DebuggerSession,
+    include_first_chance_exceptions: bool,
+) -> anyhow::Result<Vec<String>> {
+    let mut commands = Vec::new();
+    if include_first_chance_exceptions {
+        session
+            .execute_command("sxd *")
+            .context("disabling first-chance exception stops after the startup timeline limit")?;
+        commands.push("sxd *".to_string());
+    }
+    for (command, event) in [
+        ("sxd ct", "create_thread"),
+        ("sxd et", "exit_thread"),
+        ("sxd ld", "load_module"),
+        ("sxd ud", "unload_module"),
+        ("sxe epr", "exit_process"),
+    ] {
+        session
+            .execute_command(command)
+            .with_context(|| format!("configuring DbgEng exit-tail {event} filtering"))?;
+        commands.push(command.to_string());
+    }
+    Ok(commands)
+}
+
+fn record_startup_profile_event(
+    session: &DebuggerSession,
+    recording: &mut StartupProfileRecording,
+    args: &LiveStartupProfileArgs,
+    event: windbg_dbgeng::DebuggerEventInfo,
+    timing: (Duration, Duration),
+) {
+    let (observed_elapsed, resumed_elapsed) = timing;
+    let kind = event.event_name.clone();
+    let module = event
+        .module_base
+        .and_then(|address| session.module_by_offset(address).ok().flatten())
+        .map(normalize_startup_profile_module);
+    let loaded_module_count = if matches!(kind.as_str(), "load_module" | "unload_module") {
+        session.modules().ok().map(|modules| modules.len())
+    } else {
+        None
+    };
+    let live_thread_count = if matches!(
+        kind.as_str(),
+        "create_process" | "create_thread" | "exit_thread"
+    ) {
+        session.threads().ok().map(|threads| threads.len())
+    } else {
+        None
+    };
+    match kind.as_str() {
+        "load_module" => recording.counts.module_load_events += 1,
+        "unload_module" => recording.counts.module_unload_events += 1,
+        "create_thread" => recording.counts.create_thread_events += 1,
+        "exit_thread" => recording.counts.exit_thread_events += 1,
+        "exception" => {
+            recording.counts.exception_events += 1;
+            if event
+                .exception
+                .as_ref()
+                .is_some_and(|exception| exception.first_chance)
+            {
+                recording.counts.first_chance_exception_events += 1;
+            }
+        }
+        _ => {}
+    }
+    if let Some(count) = loaded_module_count {
+        recording.counts.peak_loaded_module_count =
+            recording.counts.peak_loaded_module_count.max(count);
+    }
+    if let Some(count) = live_thread_count {
+        recording.counts.peak_live_thread_count =
+            recording.counts.peak_live_thread_count.max(count);
+    }
+    if let Some(module) = module.as_ref() {
+        if let Some(identity) = module.basename.as_deref().or(module.module_name.as_deref()) {
+            recording
+                .module_identities
+                .insert(identity.to_ascii_lowercase());
+            recording.counts.unique_module_identity_count = recording.module_identities.len();
+        }
+    }
+    let context =
+        if args.capture_stop_context && recording.captured_contexts < args.max_context_events {
+            recording.captured_contexts += 1;
+            Some(match session.core_registers() {
+                Ok(registers) => match live_stop_context(session, registers, args.max_frames) {
+                    Ok(context) => json!({
+                        "status": "ok",
+                        "value": context
+                    }),
+                    Err(error) => json!({
+                        "status": "error",
+                        "error": error.to_string()
+                    }),
+                },
+                Err(error) => json!({
+                    "status": "error",
+                    "error": error.to_string()
+                }),
+            })
+        } else {
+            None
+        };
+    recording.timeline.push(StartupProfileEvent {
+        index: recording.timeline.len(),
+        kind,
+        observed_elapsed_ms: duration_millis(observed_elapsed),
+        resumed_wall_elapsed_ms: duration_millis(resumed_elapsed),
+        event,
+        module,
+        loaded_module_count,
+        live_thread_count,
+        context,
+    });
+}
+
+fn normalize_startup_profile_module(module: ModuleInfo) -> StartupProfileModule {
+    let image_path = [
+        module.loaded_image_name.as_deref(),
+        module.image_name.as_deref(),
+        module.module_name.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|value| !value.trim().is_empty())
+    .map(normalize_startup_profile_path);
+    let basename = image_path
+        .as_deref()
+        .and_then(|path| Path::new(path).file_name())
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned);
+    StartupProfileModule {
+        base_address: format!("0x{:X}", module.base_address),
+        basename,
+        module_name: module.module_name,
+        image_path,
+    }
+}
+
+fn normalize_startup_profile_path(value: &str) -> String {
+    value.replace('\\', "/")
+}
+
+fn derive_startup_profile_phases(
+    timeline: &[StartupProfileEvent],
+    phase_module: Option<&str>,
+) -> Vec<StartupProfilePhase> {
+    let create = timeline.iter().find(|event| event.kind == "create_process");
+    let coreclr = find_startup_profile_module_event(timeline, STARTUP_PROFILE_CORECLR_MODULE);
+    let selected =
+        phase_module.and_then(|module| find_startup_profile_module_event(timeline, module));
+    let exit = timeline.iter().find(|event| event.kind == "exit_process");
+    let mut phases = Vec::with_capacity(5);
+    phases.push(match create {
+        Some(event) => StartupProfilePhase {
+            name: "launch_to_create_process".to_string(),
+            status: "observed".to_string(),
+            elapsed_ms: Some(event.observed_elapsed_ms),
+            start_event_index: None,
+            end_event_index: Some(event.index),
+            detail: "Host command-start to observed DbgEng create-process stop.".to_string(),
+        },
+        None => unavailable_startup_profile_phase(
+            "launch_to_create_process",
+            "DbgEng did not report a create-process event.",
+        ),
+    });
+    phases.push(startup_profile_phase_between(
+        "create_process_to_coreclr_load",
+        create,
+        coreclr,
+        "Requires observed create-process and coreclr.dll load events.",
+    ));
+    if let Some(module) = phase_module {
+        phases.push(startup_profile_phase_between(
+            "coreclr_load_to_selected_module_load",
+            coreclr,
+            selected,
+            &format!("Requires observed coreclr.dll and selected module ({module}) load events."),
+        ));
+        phases.push(startup_profile_phase_between(
+            "selected_module_load_to_exit_process",
+            selected,
+            exit,
+            &format!("Requires observed selected module ({module}) load and exit-process events."),
+        ));
+    } else {
+        phases.push(unavailable_startup_profile_phase(
+            "coreclr_load_to_selected_module_load",
+            "No --phase-module was requested.",
+        ));
+        phases.push(unavailable_startup_profile_phase(
+            "selected_module_load_to_exit_process",
+            "No --phase-module was requested.",
+        ));
+    }
+    phases.push(startup_profile_phase_between(
+        "create_process_to_exit_process",
+        create,
+        exit,
+        "Requires observed create-process and exit-process events.",
+    ));
+    phases
+}
+
+fn find_startup_profile_module_event<'a>(
+    timeline: &'a [StartupProfileEvent],
+    requested_module: &str,
+) -> Option<&'a StartupProfileEvent> {
+    timeline.iter().find(|event| {
+        event.kind == "load_module"
+            && event.module.as_ref().is_some_and(|module| {
+                [
+                    module.basename.as_deref(),
+                    module.module_name.as_deref(),
+                    module.image_path.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|candidate| startup_profile_module_name_matches(candidate, requested_module))
+            })
+    })
+}
+
+fn startup_profile_module_name_matches(candidate: &str, requested: &str) -> bool {
+    module_name_matches(candidate, requested)
+        || Path::new(candidate)
+            .file_stem()
+            .zip(Path::new(requested).file_stem())
+            .is_some_and(|(candidate, requested)| candidate.eq_ignore_ascii_case(requested))
+}
+
+fn startup_profile_phase_between(
+    name: &str,
+    start: Option<&StartupProfileEvent>,
+    end: Option<&StartupProfileEvent>,
+    missing_detail: &str,
+) -> StartupProfilePhase {
+    match (start, end) {
+        (Some(start), Some(end)) if end.resumed_wall_elapsed_ms >= start.resumed_wall_elapsed_ms => {
+            StartupProfilePhase {
+                name: name.to_string(),
+                status: "observed".to_string(),
+                elapsed_ms: Some(end.resumed_wall_elapsed_ms - start.resumed_wall_elapsed_ms),
+                start_event_index: Some(start.index),
+                end_event_index: Some(end.index),
+                detail: "Host monotonic wall time accumulated while the target was resumed between observed DbgEng stops.".to_string(),
+            }
+        }
+        (Some(start), Some(end)) => StartupProfilePhase {
+            name: name.to_string(),
+            status: "unavailable".to_string(),
+            elapsed_ms: None,
+            start_event_index: Some(start.index),
+            end_event_index: Some(end.index),
+            detail: "Observed event order was not monotonic; duration is intentionally omitted.".to_string(),
+        },
+        _ => unavailable_startup_profile_phase(name, missing_detail),
+    }
+}
+
+fn unavailable_startup_profile_phase(name: &str, detail: &str) -> StartupProfilePhase {
+    StartupProfilePhase {
+        name: name.to_string(),
+        status: "unavailable".to_string(),
+        elapsed_ms: None,
+        start_event_index: None,
+        end_event_index: None,
+        detail: detail.to_string(),
+    }
+}
+
+fn startup_profile_aggregate(completed_runs: &[StartupProfileRun]) -> Value {
+    let mut values_by_phase = BTreeMap::<String, Vec<u64>>::new();
+    let mut phase_occurrences = BTreeMap::<String, usize>::new();
+    for run in completed_runs {
+        for phase in &run.phase_durations {
+            *phase_occurrences.entry(phase.name.clone()).or_default() += 1;
+            if phase.status == "observed" {
+                if let Some(value) = phase.elapsed_ms {
+                    values_by_phase
+                        .entry(phase.name.clone())
+                        .or_default()
+                        .push(value);
+                }
+            }
+        }
+    }
+    let phases = phase_occurrences
+        .into_iter()
+        .map(|(name, count)| {
+            let mut values = values_by_phase.remove(&name).unwrap_or_default();
+            values.sort_unstable();
+            let sample_count = values.len();
+            let median_ms = if sample_count == 0 {
+                None
+            } else if sample_count % 2 == 1 {
+                Some(values[sample_count / 2] as f64)
+            } else {
+                Some((values[sample_count / 2 - 1] as f64 + values[sample_count / 2] as f64) / 2.0)
+            };
+            json!({
+                "name": name,
+                "sample_count": sample_count,
+                "missing_count": count - sample_count,
+                "min_ms": values.first(),
+                "median_ms": median_ms,
+                "max_ms": values.last(),
+                "regression_assessment": {
+                    "status": "no_baseline",
+                    "detail": "This aggregate has no reference baseline, so it reports wall-clock variability only and does not label a regression or CPU cause."
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "completed_run_count": completed_runs.len(),
+        "phase_wall_time_ms": phases,
+        "coverage": "Only runs that reached exit_process contribute samples. A missing boundary remains missing rather than inferred."
+    })
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
 pub(super) fn run_live_managed_break(
@@ -1941,6 +2674,7 @@ pub(super) fn live_capabilities() -> Value {
             "dbgeng server",
             "live launch --command-line <cmd> --end detach|terminate",
             "live startup-break --command-line <cmd> --initial-break|--address <addr>|--module <name> --module-offset <rva>|--symbol <expr>",
+            "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>]",
             "live start --command-line <cmd>",
             "live attach --process-id <pid>",
             "dump create --process-id <pid> --output <path>",
@@ -1961,6 +2695,11 @@ pub(super) fn live_capabilities() -> Value {
                 "notes": "Launches at the initial break, sets an absolute, module-RVA, or deferred symbol-expression code breakpoint, then reports bounded hit evidence, thread/IP/module/register/stack context."
             },
             {
+                "feature": "startup profile workflow",
+                "status": "non_invasive_bounded_lifecycle_collection",
+                "notes": "Launches at a create-process event, configures DbgEng lifecycle event filters only, and reports host-monotonic wall-time observations. It sets no software/hardware breakpoint, opens no DAC, and performs no target-memory operation."
+            },
+            {
                 "feature": "managed method breakpoint workflow",
                 "status": "x64_coreclr_dac_vertical_slice",
                 "notes": "Uses a matching CoreCLR DAC through the active DbgEng client, resolves a metadata method by name and optional exact signature, requests CLR code generation, and then sets a DbgEng software code breakpoint. CLR notification writes require --allow-runtime-write and an approved test VM."
@@ -1979,7 +2718,7 @@ pub(super) fn live_capabilities() -> Value {
         "gaps": [
             "step-over/step-out controls",
             "module/symbol reload management",
-            "exception filtering and event callbacks",
+            "event callbacks",
             "richer debugger output capture"
         ],
         "safety": [
@@ -2533,5 +3272,153 @@ mod tests {
         );
         assert!(validate_managed_module("RemoteDesktopManager").is_err());
         assert!(validate_managed_module(r#"RemoteDesktopManager.dll;qd"#).is_err());
+    }
+
+    fn startup_profile_event_for_test(
+        index: usize,
+        kind: &str,
+        observed_elapsed_ms: u64,
+        resumed_wall_elapsed_ms: u64,
+        module: Option<&str>,
+    ) -> StartupProfileEvent {
+        StartupProfileEvent {
+            index,
+            kind: kind.to_string(),
+            observed_elapsed_ms,
+            resumed_wall_elapsed_ms,
+            event: windbg_dbgeng::DebuggerEventInfo {
+                event_type: 0,
+                event_name: kind.to_string(),
+                process_system_id: 1,
+                thread_system_id: 2,
+                description: None,
+                extra_information_size: 0,
+                breakpoint_id: None,
+                exception: None,
+                module_base: module.map(|_| 0x1000),
+                exit_code: None,
+            },
+            module: module.map(|basename| StartupProfileModule {
+                base_address: "0x1000".to_string(),
+                basename: Some(basename.to_string()),
+                module_name: Some(basename.to_string()),
+                image_path: Some(format!("C:/fixture/{basename}")),
+            }),
+            loaded_module_count: None,
+            live_thread_count: None,
+            context: None,
+        }
+    }
+
+    #[test]
+    fn startup_profile_derives_only_observed_lifecycle_phases() {
+        let timeline = vec![
+            startup_profile_event_for_test(0, "create_process", 12, 0, None),
+            startup_profile_event_for_test(1, "load_module", 20, 5, Some("coreclr.dll")),
+            startup_profile_event_for_test(
+                2,
+                "load_module",
+                30,
+                15,
+                Some("RemoteDesktopManager.dll"),
+            ),
+            startup_profile_event_for_test(3, "exit_process", 40, 35, None),
+        ];
+
+        let phases = derive_startup_profile_phases(&timeline, Some("RemoteDesktopManager.dll"));
+
+        assert_eq!(phases[0].elapsed_ms, Some(12));
+        assert_eq!(phases[1].elapsed_ms, Some(5));
+        assert_eq!(phases[2].elapsed_ms, Some(10));
+        assert_eq!(phases[3].elapsed_ms, Some(20));
+        assert_eq!(phases[4].elapsed_ms, Some(35));
+
+        let missing = derive_startup_profile_phases(&timeline[..2], Some("app.dll"));
+        assert_eq!(missing[2].status, "unavailable");
+        assert_eq!(missing[2].elapsed_ms, None);
+        assert_eq!(missing[3].elapsed_ms, None);
+        assert_eq!(missing[4].elapsed_ms, None);
+    }
+
+    fn startup_profile_run_for_test(run: u32, phase_values: &[u64]) -> StartupProfileRun {
+        StartupProfileRun {
+            run,
+            status: "completed".to_string(),
+            finish_reason: "exit_process".to_string(),
+            target: windbg_dbgeng::DebuggerSessionSummary {
+                kind: windbg_dbgeng::DebuggerSessionKind::Live,
+                target: "fixture.exe".to_string(),
+                process_id: Some(run),
+                dump_path: None,
+                processor_type: Some(0x8664),
+                processor_name: Some("AMD64".to_string()),
+                execution_status: windbg_dbgeng::DebuggerExecutionStatus {
+                    raw: Some(0),
+                    name: Some("break".to_string()),
+                },
+                symbol_path: "srv*cache*https://msdl.microsoft.com/download/symbols".to_string(),
+            },
+            timing: json!({}),
+            event_filters: json!({}),
+            timeline: Vec::new(),
+            phase_durations: phase_values
+                .iter()
+                .map(|elapsed_ms| StartupProfilePhase {
+                    name: "create_process_to_exit_process".to_string(),
+                    status: "observed".to_string(),
+                    elapsed_ms: Some(*elapsed_ms),
+                    start_event_index: Some(0),
+                    end_event_index: Some(1),
+                    detail: "test".to_string(),
+                })
+                .collect(),
+            counts: json!({}),
+            coverage: json!({}),
+            cleanup: json!({}),
+        }
+    }
+
+    #[test]
+    fn startup_profile_aggregate_reports_wall_time_median_without_regression_claim() {
+        let runs = [
+            startup_profile_run_for_test(1, &[10]),
+            startup_profile_run_for_test(2, &[30]),
+            startup_profile_run_for_test(3, &[20]),
+        ];
+
+        let aggregate = startup_profile_aggregate(&runs);
+        let phase = &aggregate["phase_wall_time_ms"][0];
+
+        assert_eq!(aggregate["completed_run_count"], 3);
+        assert_eq!(phase["sample_count"], 3);
+        assert_eq!(phase["min_ms"], 10);
+        assert_eq!(phase["median_ms"], 20.0);
+        assert_eq!(phase["max_ms"], 30);
+        assert_eq!(phase["regression_assessment"]["status"], "no_baseline");
+    }
+
+    #[test]
+    fn startup_profile_module_paths_are_normalized_for_output() {
+        let module = normalize_startup_profile_module(ModuleInfo {
+            base_address: 0x140000000,
+            module_name: Some("fixture".to_string()),
+            image_name: None,
+            loaded_image_name: Some(r"C:\fixture\bin\fixture.dll".to_string()),
+            symbol_file: None,
+        });
+
+        assert_eq!(module.basename.as_deref(), Some("fixture.dll"));
+        assert_eq!(
+            module.image_path.as_deref(),
+            Some("C:/fixture/bin/fixture.dll")
+        );
+        assert!(startup_profile_module_name_matches(
+            "coreclr",
+            "coreclr.dll"
+        ));
+        assert!(startup_profile_module_name_matches(
+            "ManagedBreakpointFixture",
+            "ManagedBreakpointFixture.dll"
+        ));
     }
 }
