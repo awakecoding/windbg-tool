@@ -216,7 +216,9 @@ The .NET 10.0.9 x64 fixture was validated with the direct DAC bridge:
 
 `live startup-profile` is a one-shot DbgEng lifecycle collector for agent-oriented startup evidence. It launches at a DbgEng `create_process` event, enables only create/exit-process, create/exit-thread, load/unload-module event filters, then resumes the target and records bounded stopped events. It does **not** configure a software or hardware breakpoint, open the DAC, request CLR notifications, allocate or write target memory, inject code, or use a profiler.
 
-The default exception policy does not request first-chance exceptions because managed startup can produce enough expected exceptions to consume the bounded timeline. Use `--include-first-chance-exceptions` only when that additional event volume is justified. Debuggee output is not captured into the structured result because the command does not install a DbgEng output callback, although a target can still inherit the invoking console.
+The default exception policy does not request first-chance exceptions because managed startup can produce enough expected exceptions to consume the bounded timeline. Use `--include-first-chance-exceptions` only when that additional event volume is justified.
+
+`--capture-debuggee-output` is an opt-in, host-side DbgEng `IDebugOutputCallbacksWide` capture for only the debuggee and debuggee-prompt categories. It is disabled by default because debug strings can contain sensitive content. `--max-output-records`, `--max-output-chars`, and `--max-total-output-chars` independently bound retained records and text; `debuggee_output` reports truncation/drop counts and restores the prior callback and output mask before the run ends. A record's `preceding_event_index` is the latest retained lifecycle event when DbgEng invoked the callback, not a causal association.
 
 The command reports two host-monotonic measures:
 
@@ -245,7 +247,9 @@ target\debug\windbg-tool.exe --compact live startup-profile `
 
 `--completion-module <basename>` ends an observation at the matching DbgEng image-load event. It is an image-load boundary only: it is not UI-ready, managed registration, JIT completion, or application initialization. Add `--settle-ms 1..60000` to require a target-resumed interval without a further configured lifecycle stop after that load. Any observed lifecycle stop restarts the interval. A `quiet_interval_observed` result establishes only that bounded DbgEng condition; it does not prove target quiescence, CPU idleness, I/O completion, or UI readiness. If process exit, timeout, or the event limit occurs first, the result stays incomplete and never infers quietness.
 
-`--max-events` bounds retained timeline payload rather than forcing a healthy target to terminate. For a full-lifetime profile without `--completion-module`, windbg-tool retains `max_events - 1` entries, disables high-volume thread/module filters, and waits only for `exit_process`, preserving the final exit boundary in the last slot. The result marks this as `coverage.timeline_truncated: true` and lists the DbgEng `timing.tail_filter_commands`; it makes no claim about events omitted during that exit-only tail. A completion-bound profile instead stops as incomplete at its retention limit, because disabling the lifecycle filters would make a quiet interval unknowable. A single completion-bound run defaults to `--end detach`, so the target can finish normally. Repeated runs require the explicit `--end terminate` cleanup mode to prevent overlapping detached targets. A full-lifetime successful run has `finish_reason: "exit_process"`; a module completion has `finish_reason: "completion_module"`; a quiet completion has `finish_reason: "completion_module_quiet_interval"`. The optional `--capture-stop-context` captures bounded read-only register/module/symbol/stack context on early stops; it can increase observer overhead and is disabled by default.
+`--max-events` bounds retained timeline payload rather than forcing a healthy target to terminate. For a full-lifetime profile without `--completion-module`, windbg-tool retains `max_events - 1` entries, disables high-volume thread/module filters, and waits only for `exit_process`, preserving the final exit boundary in the last slot. The result marks this as `coverage.timeline_truncated: true` and lists the DbgEng `timing.tail_filter_commands`; it makes no claim about events omitted during that exit-only tail. A completion-bound profile instead stops as incomplete at its retention limit, because disabling the lifecycle filters would make a quiet interval unknowable. A single completion-bound run defaults to `--end detach`, so the target can finish normally. Repeated runs require the explicit `--end terminate` cleanup mode to prevent overlapping detached targets. A full-lifetime successful run has `finish_reason: "exit_process"`; a module completion has `finish_reason: "completion_module"`; a quiet completion has `finish_reason: "completion_module_quiet_interval"`.
+
+The opt-in `--capture-stop-context` captures bounded read-only register/module/symbol/stack context on selected early stops; it can increase observer overhead and is disabled by default. `--context-on` selects event kinds, defaulting to `load-module`, `create-thread`, `exception`, and `exit-process`; every timeline event has an explicit context status (`not_requested`, `not_selected`, `limit_reached`, `captured`, or `unavailable`). `--capture-module-provenance` separately reads bounded host-file metadata only for absolute module image paths DbgEng already observed. Its records include canonical host path, file size/last-write time, PE architecture/image timestamp, CodeView identity, and available Win32 file/product versions. This is host-file metadata, not target-memory evidence or lifecycle timing; it never hashes, verifies signatures, or reads an unobserved path.
 
 The important JSON fields are:
 
@@ -276,8 +280,14 @@ The important JSON fields are:
       "status": "observed",
       "elapsed_ms": 10
     }],
-    "lifecycle_summary": {
-      "debuggee_output": { "status": "not_captured_no_output_callback" }
+    "debuggee_output": {
+      "status": "captured",
+      "records_returned": 1,
+      "dropped_record_count": 0
+    },
+    "module_provenance": {
+      "status": "captured",
+      "source": "host_file_metadata"
     },
     "largest_observed_gaps": [{
       "elapsed_ms": 10,
@@ -296,6 +306,17 @@ The important JSON fields are:
   }
 }
 ```
+
+Compare independent artifacts with no debugger launch or target interaction:
+
+```powershell
+target\debug\windbg-tool.exe --compact live startup-compare `
+  --baseline $baselineReport `
+  --candidate $candidateReport `
+  --max-sequence-events 64
+```
+
+The comparator accepts only `live_startup_profile` JSON artifacts up to 16 MiB. It compares observed phase and one-largest-gap wall-time distributions plus bounded lifecycle event/module/exception sequence prefixes. It reports profile and comparison truncation, omits unstable thread IDs, and never labels a difference as a CPU regression or causal explanation.
 
 For a future RDM observation, use the bounded no-breakpoint form only after the fixture command has completed with the expected no-write report:
 
@@ -385,6 +406,8 @@ target\debug\windbg-tool.exe --compact target thread --target 1 `
 ```
 
 `debug snapshot --target <id>` now includes a best-effort `event` section by default for live targets. Use `--exclude event` when an event query is not relevant, or `--include event` to request it alone.
+
+`target memory-map --target <id> --region-limit <1..4096>` and MCP `target_memory_map` query the stopped live user-mode target through `IDebugDataSpaces4::QueryVirtual`; both enforce the same `1..4096` region bound. They do not parse extension output or call `VirtualQueryEx`. The result uses numeric `MEMORY_BASIC_INFORMATION64` fields with `source: "dbgeng_idata_spaces4_query_virtual"`. `status: "bounded"` and `truncated: true` mean the region cap was reached, while `unavailable` or `partial_query_error` explicitly mean that full address-space coverage is not claimed. It is unavailable for dump targets.
 
 ## Canonical agent debugging commands
 

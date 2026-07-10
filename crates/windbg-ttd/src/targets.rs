@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -9,7 +9,7 @@ use windbg_dbgeng::{
     DebuggerSessionSummary, DisassemblyResult, DumpKind, DumpOpenOptions, DumpWriteOptions,
     DumpWriteResult, EvaluationResult, LiveAttachOptions, LiveInitialStop,
     LiveLaunchSessionOptions, MemoryReadResult, ModuleInfo, SourceLocation, StackFrameInfo,
-    SymbolInfo, ThreadContext, ThreadInfo,
+    SymbolInfo, ThreadContext, ThreadInfo, VirtualMemoryMap, MAX_VIRTUAL_MEMORY_MAP_REGIONS,
 };
 
 pub type TargetId = u64;
@@ -29,6 +29,8 @@ pub struct LiveLaunchRequest {
     pub command_line: String,
     #[serde(default = "default_live_wait_timeout_ms")]
     pub initial_break_timeout_ms: u32,
+    #[serde(default)]
+    pub create_process_stop: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -60,6 +62,17 @@ pub struct TargetMemoryReadRequest {
     pub target_id: TargetId,
     pub address: u64,
     pub size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetMemoryMapRequest {
+    pub target_id: TargetId,
+    #[serde(default = "default_target_memory_map_regions")]
+    #[schemars(
+        range(min = 1, max = 4096),
+        description = "Maximum DbgEng virtual-memory regions returned; must be from 1 through 4096."
+    )]
+    pub region_limit: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -199,6 +212,12 @@ pub struct TargetMemoryReadResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TargetMemoryMapResponse {
+    pub target_id: TargetId,
+    pub memory_map: VirtualMemoryMap,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TargetModuleList {
     pub target_id: TargetId,
     pub modules: Vec<ModuleInfo>,
@@ -292,7 +311,11 @@ impl TargetRegistry {
         let session = launch_live_session(LiveLaunchSessionOptions {
             command_line: request.command_line,
             initial_break_timeout_ms: request.initial_break_timeout_ms,
-            initial_stop: LiveInitialStop::SoftwareBreakpoint,
+            initial_stop: if request.create_process_stop {
+                LiveInitialStop::CreateProcessEvent
+            } else {
+                LiveInitialStop::SoftwareBreakpoint
+            },
         })?;
         Ok(self.insert_target(session))
     }
@@ -407,6 +430,19 @@ impl TargetRegistry {
         Ok(TargetMemoryReadResponse {
             target_id: request.target_id,
             memory: target.session.read_memory(request.address, request.size)?,
+        })
+    }
+
+    pub fn memory_map(
+        &self,
+        request: TargetMemoryMapRequest,
+    ) -> anyhow::Result<TargetMemoryMapResponse> {
+        validate_target_memory_map_region_limit(request.region_limit)?;
+        let target = self.target(request.target_id)?;
+        ensure_live_target(request.target_id, &target.session)?;
+        Ok(TargetMemoryMapResponse {
+            target_id: request.target_id,
+            memory_map: target.session.virtual_memory_map(request.region_limit)?,
         })
     }
 
@@ -603,6 +639,18 @@ fn default_target_stack_frames() -> u32 {
     32
 }
 
+fn default_target_memory_map_regions() -> u32 {
+    256
+}
+
+fn validate_target_memory_map_region_limit(region_limit: u32) -> anyhow::Result<()> {
+    ensure!(
+        (1..=MAX_VIRTUAL_MEMORY_MAP_REGIONS).contains(&region_limit),
+        "target memory-map region_limit must be from 1 through {MAX_VIRTUAL_MEMORY_MAP_REGIONS}"
+    );
+    Ok(())
+}
+
 fn default_target_disasm_count() -> u32 {
     16
 }
@@ -620,5 +668,20 @@ impl From<TargetDumpKind> for DumpKind {
             TargetDumpKind::Mini => DumpKind::Mini,
             TargetDumpKind::Full => DumpKind::Full,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_memory_map_region_limit_before_accessing_a_target() {
+        assert!(validate_target_memory_map_region_limit(1).is_ok());
+        assert!(validate_target_memory_map_region_limit(MAX_VIRTUAL_MEMORY_MAP_REGIONS).is_ok());
+        assert!(validate_target_memory_map_region_limit(0).is_err());
+        assert!(
+            validate_target_memory_map_region_limit(MAX_VIRTUAL_MEMORY_MAP_REGIONS + 1).is_err()
+        );
     }
 }

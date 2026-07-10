@@ -2,10 +2,16 @@ use anyhow::{bail, ensure, Context};
 use serde::Serialize;
 #[cfg(windows)]
 use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::{
     env,
     path::{Path, PathBuf},
     sync::OnceLock,
+    time::Instant,
 };
 
 #[cfg(windows)]
@@ -20,6 +26,7 @@ pub const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
 pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
 pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
 pub const DBGENG_RUNTIME_DIR_ENV: &str = "WINDBG_DBGENG_RUNTIME_DIR";
+pub const MAX_VIRTUAL_MEMORY_MAP_REGIONS: u32 = 4096;
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
 const DBGENG_DLL_NAME: &str = "dbgeng.dll";
 #[cfg(windows)]
@@ -427,6 +434,61 @@ pub struct MemoryReadResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct VirtualMemoryRegion {
+    pub base_address: u64,
+    pub allocation_base: u64,
+    pub allocation_protection: u32,
+    pub region_size: u64,
+    pub state: u32,
+    pub protection: u32,
+    pub kind: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VirtualMemoryMap {
+    pub source: String,
+    pub status: String,
+    pub region_limit: u32,
+    pub regions: Vec<VirtualMemoryRegion>,
+    pub truncated: bool,
+    pub next_query_address: Option<u64>,
+    pub query_error: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebuggerOutputCaptureOptions {
+    pub started_at: Instant,
+    pub max_records: u32,
+    pub max_chars_per_record: u32,
+    pub max_total_chars: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerOutputRecord {
+    pub elapsed_ms: u64,
+    pub preceding_event_index: Option<usize>,
+    pub mask: u32,
+    pub categories: Vec<String>,
+    pub text: String,
+    pub text_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerOutputCaptureResult {
+    pub status: String,
+    pub source: String,
+    pub records: Vec<DebuggerOutputRecord>,
+    pub records_returned: usize,
+    pub dropped_record_count: u32,
+    pub dropped_text_char_count: u32,
+    pub max_records: u32,
+    pub max_chars_per_record: u32,
+    pub max_total_chars: u32,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadInfo {
     pub engine_id: u32,
     pub system_id: u32,
@@ -581,6 +643,180 @@ pub struct DebuggerSession {
 }
 
 #[cfg(windows)]
+const OUTPUT_CAPTURE_NO_EVENT_INDEX: usize = usize::MAX;
+#[cfg(windows)]
+const DEBUG_OUTPUT_DEBUGGEE_MASK: u32 = 0x0000_0080;
+#[cfg(windows)]
+const DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK: u32 = 0x0000_0100;
+
+#[cfg(windows)]
+struct DebuggerOutputCaptureShared {
+    started_at: Instant,
+    max_records: usize,
+    max_chars_per_record: usize,
+    max_total_chars: usize,
+    preceding_event_index: AtomicUsize,
+    state: Mutex<DebuggerOutputCaptureState>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct DebuggerOutputCaptureState {
+    records: Vec<DebuggerOutputRecord>,
+    total_text_chars: usize,
+    dropped_record_count: u32,
+    dropped_text_char_count: u32,
+}
+
+#[cfg(windows)]
+#[windows::core::implement(
+    windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide
+)]
+struct DebuggerOutputCallback {
+    shared: Arc<DebuggerOutputCaptureShared>,
+}
+
+#[cfg(windows)]
+impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide_Impl
+    for DebuggerOutputCallback_Impl
+{
+    fn Output(&self, mask: u32, text: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        if mask & (DEBUG_OUTPUT_DEBUGGEE_MASK | DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK) == 0 {
+            return Ok(());
+        }
+        let text = unsafe { text.to_string() }
+            .unwrap_or_else(|_| "<invalid UTF-16 DbgEng output>".to_string());
+        self.shared.record(mask, text);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl DebuggerOutputCaptureShared {
+    fn record(&self, mask: u32, text: String) {
+        let original_chars = text.chars().count();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.records.len() >= self.max_records {
+            state.dropped_record_count = state.dropped_record_count.saturating_add(1);
+            state.dropped_text_char_count = state
+                .dropped_text_char_count
+                .saturating_add(saturating_u32(original_chars));
+            return;
+        }
+
+        let remaining_total = self.max_total_chars.saturating_sub(state.total_text_chars);
+        let retained_chars = original_chars
+            .min(self.max_chars_per_record)
+            .min(remaining_total);
+        let text_truncated = retained_chars < original_chars;
+        let retained_text = text.chars().take(retained_chars).collect::<String>();
+        if text_truncated {
+            state.dropped_text_char_count = state
+                .dropped_text_char_count
+                .saturating_add(saturating_u32(original_chars - retained_chars));
+        }
+        state.total_text_chars += retained_chars;
+        let preceding_event_index = self.preceding_event_index.load(Ordering::Relaxed);
+        state.records.push(DebuggerOutputRecord {
+            elapsed_ms: duration_millis(self.started_at.elapsed()),
+            preceding_event_index: (preceding_event_index != OUTPUT_CAPTURE_NO_EVENT_INDEX)
+                .then_some(preceding_event_index),
+            mask,
+            categories: debug_output_categories(mask),
+            text: retained_text,
+            text_truncated,
+        });
+    }
+
+    fn snapshot(&self, options: &DebuggerOutputCaptureOptions) -> DebuggerOutputCaptureResult {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return DebuggerOutputCaptureResult {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_output_callback".to_string(),
+                    records: Vec::new(),
+                    records_returned: 0,
+                    dropped_record_count: 0,
+                    dropped_text_char_count: 0,
+                    max_records: options.max_records,
+                    max_chars_per_record: options.max_chars_per_record,
+                    max_total_chars: options.max_total_chars,
+                    detail:
+                        "The host-side output capture lock was poisoned; no output is returned."
+                            .to_string(),
+                }
+            }
+        };
+        DebuggerOutputCaptureResult {
+            status: "captured".to_string(),
+            source: "dbgeng_output_callback".to_string(),
+            records: state.records.clone(),
+            records_returned: state.records.len(),
+            dropped_record_count: state.dropped_record_count,
+            dropped_text_char_count: state.dropped_text_char_count,
+            max_records: options.max_records,
+            max_chars_per_record: options.max_chars_per_record,
+            max_total_chars: options.max_total_chars,
+            detail: "Only DbgEng debuggee output categories are enabled. Records are bounded host-side and preceding_event_index identifies the latest retained lifecycle event when the callback entered; it is not a causal association.".to_string(),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub struct DebuggerOutputCapture {
+    client: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5,
+    previous_callback:
+        Option<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide>,
+    previous_output_mask: u32,
+    _callback: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide,
+    shared: Arc<DebuggerOutputCaptureShared>,
+    options: DebuggerOutputCaptureOptions,
+    restored: bool,
+}
+
+#[cfg(windows)]
+impl DebuggerOutputCapture {
+    pub fn set_preceding_event_index(&self, index: Option<usize>) {
+        self.shared.preceding_event_index.store(
+            index.unwrap_or(OUTPUT_CAPTURE_NO_EVENT_INDEX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<DebuggerOutputCaptureResult> {
+        self.restore()?;
+        Ok(self.shared.snapshot(&self.options))
+    }
+
+    fn restore(&mut self) -> anyhow::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        unsafe {
+            self.client
+                .SetOutputCallbacksWide(self.previous_callback.as_ref())
+                .context("restoring the previous DbgEng output callback")?;
+            self.client
+                .SetOutputMask(self.previous_output_mask)
+                .context("restoring the previous DbgEng output mask")?;
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DebuggerOutputCapture {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(windows)]
 unsafe impl Send for DebuggerSession {}
 
 #[cfg(not(windows))]
@@ -611,6 +847,68 @@ impl DebuggerSession {
             raw,
             name: raw.map(status_name),
         }
+    }
+
+    pub fn begin_debuggee_output_capture(
+        &self,
+        options: DebuggerOutputCaptureOptions,
+    ) -> anyhow::Result<DebuggerOutputCapture> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide;
+
+        ensure!(
+            options.max_records > 0,
+            "DbgEng output capture requires a positive record limit"
+        );
+        ensure!(
+            options.max_chars_per_record > 0,
+            "DbgEng output capture requires a positive per-record character limit"
+        );
+        ensure!(
+            options.max_total_chars > 0,
+            "DbgEng output capture requires a positive total character limit"
+        );
+        let previous_callback = unsafe { self.client.GetOutputCallbacksWide().ok() };
+        let previous_output_mask = unsafe {
+            self.client
+                .GetOutputMask()
+                .context("reading the current DbgEng output mask")?
+        };
+        let shared = Arc::new(DebuggerOutputCaptureShared {
+            started_at: options.started_at,
+            max_records: options.max_records as usize,
+            max_chars_per_record: options.max_chars_per_record as usize,
+            max_total_chars: options.max_total_chars as usize,
+            preceding_event_index: AtomicUsize::new(OUTPUT_CAPTURE_NO_EVENT_INDEX),
+            state: Mutex::new(DebuggerOutputCaptureState::default()),
+        });
+        let callback: IDebugOutputCallbacksWide = DebuggerOutputCallback {
+            shared: Arc::clone(&shared),
+        }
+        .into();
+        unsafe {
+            self.client
+                .SetOutputCallbacksWide(&callback)
+                .context("installing the bounded DbgEng output callback")?;
+            if let Err(error) = self.client.SetOutputMask(
+                previous_output_mask
+                    | DEBUG_OUTPUT_DEBUGGEE_MASK
+                    | DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK,
+            ) {
+                let _ = self
+                    .client
+                    .SetOutputCallbacksWide(previous_callback.as_ref());
+                return Err(error).context("enabling DbgEng debuggee output categories");
+            }
+        }
+        Ok(DebuggerOutputCapture {
+            client: self.client.clone(),
+            previous_callback,
+            previous_output_mask,
+            _callback: callback,
+            shared,
+            options,
+            restored: false,
+        })
     }
 
     pub fn open_coreclr_dac_bridge(
@@ -830,6 +1128,89 @@ impl DebuggerSession {
             complete: bytes_read == size,
             data: encode_hex(&buffer),
         })
+    }
+
+    pub fn virtual_memory_map(&self, region_limit: u32) -> anyhow::Result<VirtualMemoryMap> {
+        use windows::Win32::System::Memory::MEMORY_BASIC_INFORMATION64;
+
+        ensure!(
+            self.kind == DebuggerSessionKind::Live,
+            "DbgEng QueryVirtual is only supported for live user-mode targets"
+        );
+        ensure!(
+            region_limit > 0,
+            "DbgEng virtual-memory map requires a positive region limit"
+        );
+        ensure!(
+            region_limit <= MAX_VIRTUAL_MEMORY_MAP_REGIONS,
+            "DbgEng virtual-memory map region limit must not exceed {MAX_VIRTUAL_MEMORY_MAP_REGIONS}"
+        );
+
+        let mut regions = Vec::with_capacity((region_limit as usize).min(256));
+        let mut query_address = 0u64;
+        loop {
+            if regions.len() >= region_limit as usize {
+                return Ok(VirtualMemoryMap {
+                    source: "dbgeng_idata_spaces4_query_virtual".to_string(),
+                    status: "bounded".to_string(),
+                    region_limit,
+                    regions,
+                    truncated: true,
+                    next_query_address: Some(query_address),
+                    query_error: None,
+                    detail: "The requested region limit was reached before the DbgEng virtual-address query completed.".to_string(),
+                });
+            }
+
+            let mut info = MEMORY_BASIC_INFORMATION64::default();
+            let query = unsafe { self.data_spaces.QueryVirtual(query_address, &mut info) };
+            if let Err(error) = query {
+                return Ok(VirtualMemoryMap {
+                    source: "dbgeng_idata_spaces4_query_virtual".to_string(),
+                    status: if regions.is_empty() {
+                        "unavailable".to_string()
+                    } else {
+                        "partial_query_error".to_string()
+                    },
+                    region_limit,
+                    regions,
+                    truncated: true,
+                    next_query_address: Some(query_address),
+                    query_error: Some(error.to_string()),
+                    detail: "DbgEng QueryVirtual did not return another region. The returned list is not claimed to cover the full address space.".to_string(),
+                });
+            }
+            ensure!(
+                info.RegionSize > 0,
+                "DbgEng QueryVirtual returned a zero-sized region at 0x{query_address:X}"
+            );
+            regions.push(VirtualMemoryRegion {
+                base_address: info.BaseAddress,
+                allocation_base: info.AllocationBase,
+                allocation_protection: info.AllocationProtect.0,
+                region_size: info.RegionSize,
+                state: info.State.0,
+                protection: info.Protect.0,
+                kind: info.Type.0,
+            });
+            let next_query_address = info
+                .BaseAddress
+                .checked_add(info.RegionSize)
+                .filter(|next| *next > query_address);
+            let Some(next_query_address) = next_query_address else {
+                return Ok(VirtualMemoryMap {
+                    source: "dbgeng_idata_spaces4_query_virtual".to_string(),
+                    status: "address_space_exhausted".to_string(),
+                    region_limit,
+                    regions,
+                    truncated: false,
+                    next_query_address: None,
+                    query_error: None,
+                    detail: "DbgEng QueryVirtual reached the end of the representable virtual address range.".to_string(),
+                });
+            };
+            query_address = next_query_address;
+        }
     }
 
     pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {
@@ -1852,6 +2233,41 @@ fn encode_hex(bytes: &[u8]) -> String {
         let _ = write!(&mut result, "{byte:02x}");
     }
     result
+}
+
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(windows)]
+fn saturating_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
+#[cfg(windows)]
+fn debug_output_categories(mask: u32) -> Vec<String> {
+    const OUTPUT_CATEGORIES: &[(u32, &str)] = &[
+        (0x0000_0001, "normal"),
+        (0x0000_0002, "error"),
+        (0x0000_0004, "warning"),
+        (0x0000_0008, "verbose"),
+        (0x0000_0010, "prompt"),
+        (0x0000_0020, "prompt_registers"),
+        (0x0000_0040, "extension_warning"),
+        (DEBUG_OUTPUT_DEBUGGEE_MASK, "debuggee"),
+        (DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK, "debuggee_prompt"),
+        (0x0000_0200, "symbols"),
+        (0x0000_0400, "status"),
+    ];
+    let mut categories = OUTPUT_CATEGORIES
+        .iter()
+        .filter(|(flag, _)| mask & *flag != 0)
+        .map(|(_, name)| (*name).to_string())
+        .collect::<Vec<_>>();
+    if categories.is_empty() {
+        categories.push("unknown".to_string());
+    }
+    categories
 }
 
 #[cfg(windows)]

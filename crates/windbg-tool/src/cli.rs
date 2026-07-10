@@ -282,6 +282,10 @@ enum LiveCommand {
     )]
     StartupProfile(LiveStartupProfileArgs),
     #[command(
+        about = "Compare two bounded live startup-profile JSON artifacts without CPU or causal attribution"
+    )]
+    StartupCompare(LiveStartupProfileCompareArgs),
+    #[command(
         about = "Launch .NET under DbgEng, bind the matching CoreCLR DAC, and emit a managed method hit"
     )]
     ManagedBreak(LiveManagedBreakArgs),
@@ -482,6 +486,8 @@ enum TargetCommand {
     Event(TargetIdArgs),
     #[command(about = "Read memory from a daemon-owned target")]
     Memory(TargetMemoryReadArgs),
+    #[command(about = "Return a bounded live user-mode virtual-memory map through DbgEng")]
+    MemoryMap(TargetMemoryMapArgs),
     #[command(about = "Walk the current stack for a daemon-owned target")]
     Stack(TargetStackTraceArgs),
     #[command(
@@ -785,6 +791,15 @@ struct LiveStartupProfileArgs {
     capture_stop_context: bool,
     #[arg(
         long,
+        value_delimiter = ',',
+        value_enum,
+        requires = "capture_stop_context",
+        value_name = "EVENT",
+        help = "Comma-separated lifecycle event kinds eligible for read-only context; defaults to load-module,create-thread,exception,exit-process when context capture is enabled"
+    )]
+    context_on: Vec<StartupProfileContextEvent>,
+    #[arg(
+        long,
         default_value_t = 8,
         value_parser = clap::value_parser!(u32).range(1..=32),
         help = "Maximum event contexts captured when --capture-stop-context is set"
@@ -799,6 +814,48 @@ struct LiveStartupProfileArgs {
     max_frames: u32,
     #[arg(
         long,
+        help = "Capture bounded DbgEng debuggee-output callback records; disabled by default because debug strings can contain sensitive content"
+    )]
+    capture_debuggee_output: bool,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_debuggee_output",
+        help = "Maximum debuggee-output callback records retained"
+    )]
+    max_output_records: u32,
+    #[arg(
+        long,
+        default_value_t = 512,
+        value_parser = clap::value_parser!(u32).range(1..=4096),
+        requires = "capture_debuggee_output",
+        help = "Maximum UTF-16 characters retained per debuggee-output callback record"
+    )]
+    max_output_chars: u32,
+    #[arg(
+        long,
+        default_value_t = 8192,
+        value_parser = clap::value_parser!(u32).range(1..=32768),
+        requires = "capture_debuggee_output",
+        help = "Maximum UTF-16 characters retained across all debuggee-output callback records"
+    )]
+    max_total_output_chars: u32,
+    #[arg(
+        long,
+        help = "Read bounded host-side PE/file metadata only for DbgEng-observed module image paths"
+    )]
+    capture_module_provenance: bool,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_module_provenance",
+        help = "Maximum unique DbgEng-observed module image paths inspected for host file metadata"
+    )]
+    max_module_provenance: u32,
+    #[arg(
+        long,
         value_name = "PATH",
         help = "Write the complete JSON result to a new file as well as stdout"
     )]
@@ -810,6 +867,40 @@ struct LiveStartupProfileArgs {
         help = "Action if the target has not exited at its completion or time bound; terminate is explicit"
     )]
     end: String,
+}
+
+#[derive(Debug, Args)]
+struct LiveStartupProfileCompareArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Earlier startup-profile JSON artifact"
+    )]
+    baseline: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Later startup-profile JSON artifact"
+    )]
+    candidate: PathBuf,
+    #[arg(
+        long,
+        default_value_t = 64,
+        value_parser = clap::value_parser!(u32).range(1..=256),
+        help = "Maximum retained lifecycle events compared per matched run"
+    )]
+    max_sequence_events: u32,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum StartupProfileContextEvent {
+    CreateProcess,
+    ExitProcess,
+    CreateThread,
+    ExitThread,
+    LoadModule,
+    UnloadModule,
+    Exception,
 }
 
 #[derive(Debug, Args)]
@@ -968,6 +1059,11 @@ struct LiveSessionStartArgs {
     command_line: String,
     #[arg(long, default_value_t = 5000)]
     initial_break_timeout_ms: u32,
+    #[arg(
+        long,
+        help = "Stop on DbgEng's create-process event instead of the default software initial-break engine option"
+    )]
+    create_process_stop: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1285,6 +1381,19 @@ struct TargetMemoryReadArgs {
     address: String,
     #[arg(long)]
     size: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetMemoryMapArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(
+        long,
+        default_value_t = 256,
+        value_parser = clap::value_parser!(u32).range(1..=4096),
+        help = "Maximum DbgEng virtual-memory regions returned"
+    )]
+    region_limit: u32,
 }
 
 #[derive(Debug, Args)]
@@ -3787,6 +3896,7 @@ fn backend_capability(kind: &str) -> Value {
             "can_stack": true,
             "can_query_symbols": true,
             "can_query_source": true,
+            "can_query_virtual_memory_map": "live_user_mode_only",
             "can_step": true,
             "can_continue": true,
             "can_set_breakpoint": true,
@@ -3796,7 +3906,7 @@ fn backend_capability(kind: &str) -> Value {
             "supports_jobs": false,
             "supports_timeline": false,
             "required_identifiers": ["target_id"],
-            "safe_commands": ["debug snapshot", "target status", "target event", "target thread", "target stack", "target disasm", "breakpoint plan"],
+            "safe_commands": ["debug snapshot", "target status", "target event", "target thread", "target stack", "target disasm", "target memory-map", "breakpoint plan"],
             "mutating_commands": ["target continue", "target step", "breakpoint set", "target dump"],
             "destructive_commands": ["target terminate", "target close"],
             "unsupported_operations": [
@@ -4299,6 +4409,7 @@ async fn live_start_and_print(
             arguments: json!({
                 "command_line": args.command_line,
                 "initial_break_timeout_ms": args.initial_break_timeout_ms,
+                "create_process_stop": args.create_process_stop,
             }),
         },
         output,
@@ -4641,7 +4752,8 @@ fn discover_manifest() -> Value {
                 "live capabilities",
                 "live launch --command-line <cmd> --end detach|terminate",
                 "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>] [--completion-module <basename> [--settle-ms <milliseconds>]]",
-                "live start --command-line <cmd>",
+                "live startup-compare --baseline <path> --candidate <path>",
+                "live start --command-line <cmd> [--create-process-stop]",
                 "live attach --process-id <pid>"
             ],
             "dump": ["dump open <path>", "dump inspect <path>", "dump create --process-id <pid> --output <path>"],
@@ -4679,6 +4791,7 @@ fn discover_manifest() -> Value {
                 "target event --target <id>",
                 "target thread --target <id> --engine-thread-id <id>",
                 "target memory --target <id> --address <addr> --size <n>",
+                "target memory-map --target <id> [--region-limit <n>]",
                 "target dump --target <id> --output <path>",
                 "target stack --target <id>",
                 "target disasm --target <id>",
@@ -5065,6 +5178,7 @@ fn tool_command_map() -> Value {
         { "tool": "target_core_registers", "commands": ["target registers"] },
         { "tool": "target_last_event", "commands": ["target event", "debug snapshot --include event"] },
         { "tool": "target_read_memory", "commands": ["target memory"] },
+        { "tool": "target_memory_map", "commands": ["target memory-map"] },
         { "tool": "target_list_threads", "commands": ["target threads"] },
         { "tool": "target_list_modules", "commands": ["target modules"] },
         { "tool": "target_symbol_by_offset", "commands": ["target symbol"] },
@@ -5315,7 +5429,16 @@ fn command_metadata() -> Value {
             "session_required": false,
             "cost": "launches_process_and_collects_bounded_lifecycle_events",
             "safety": "live_debugging_changes_target_execution_state_without_target_memory_writes",
-            "bounds": ["--runs 1..10", "--initial-break-timeout-ms", "--timeout-ms", "--max-events", "--completion-module <basename>", "--settle-ms 1..60000 (requires --completion-module)", "--max-context-events", "--end detach|terminate"]
+            "bounds": ["--runs 1..10", "--initial-break-timeout-ms", "--timeout-ms", "--max-events", "--completion-module <basename>", "--settle-ms 1..60000 (requires --completion-module)", "--max-context-events", "--context-on", "--max-output-records", "--max-output-chars", "--max-total-output-chars", "--max-module-provenance", "--end detach|terminate"]
+        },
+        {
+            "command": "live startup-compare",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_local_json_comparison",
+            "safety": "read_only_host_artifact",
+            "bounds": ["artifacts <= 16 MiB", "--max-sequence-events 1..256"]
         },
         {
             "command": "live start",
@@ -5324,7 +5447,7 @@ fn command_metadata() -> Value {
             "session_required": false,
             "cost": "launches_process_and_persists_target",
             "safety": "live_debugging_changes_target_execution_state",
-            "bounds": ["--initial-break-timeout-ms"]
+            "bounds": ["--initial-break-timeout-ms", "--create-process-stop"]
         },
         {
             "command": "live attach",
@@ -5392,6 +5515,16 @@ fn command_metadata() -> Value {
             "cost": "bounded_memory_read",
             "safety": "read_only_memory",
             "bounds": ["--size"]
+        },
+        {
+            "command": "target memory-map",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_dbgeng_virtual_memory_query",
+            "safety": "read_only_dbgeng_data_space",
+            "bounds": ["--region-limit 1..4096"],
+            "limitations": ["Live user-mode targets only; bounded, partial, or unavailable coverage is explicit."]
         },
         {
             "command": "target dump",
@@ -5634,6 +5767,16 @@ fn target_memory_call(args: TargetMemoryReadArgs) -> anyhow::Result<ToolCall> {
             "size": args.size,
         }),
     })
+}
+
+fn target_memory_map_call(args: TargetMemoryMapArgs) -> ToolCall {
+    ToolCall {
+        name: "target_memory_map".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "region_limit": args.region_limit,
+        }),
+    }
 }
 
 fn target_dump_call(args: TargetDumpArgs) -> ToolCall {

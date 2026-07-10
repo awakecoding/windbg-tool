@@ -3,8 +3,8 @@ use crate::state::ServiceState;
 use crate::targets::{
     DumpOpenRequest, LiveAttachRequest, LiveLaunchRequest, TargetAddressRequest,
     TargetBreakpointRemoveRequest, TargetBreakpointSetRequest, TargetDisassembleRequest,
-    TargetExpressionRequest, TargetMemoryReadRequest, TargetRequest, TargetStackTraceRequest,
-    TargetThreadContextRequest, TargetWaitRequest, TargetWriteDumpRequest,
+    TargetExpressionRequest, TargetMemoryMapRequest, TargetMemoryReadRequest, TargetRequest,
+    TargetStackTraceRequest, TargetThreadContextRequest, TargetWaitRequest, TargetWriteDumpRequest,
 };
 use crate::ttd_replay::{
     AddressInfoRequest, CursorId, IndexBuildRequest, IndexStatsRequest, IndexStatusRequest,
@@ -214,6 +214,10 @@ pub fn definitions() -> Vec<Tool> {
         tool::<TargetMemoryReadRequest>(
             "target_read_memory",
             "Read memory from a daemon-owned live or dump target session.",
+        ),
+        tool::<TargetMemoryMapRequest>(
+            "target_memory_map",
+            "Return a bounded user-mode virtual-memory region map through DbgEng IDebugDataSpaces4::QueryVirtual.",
         ),
         tool::<TargetRequest>(
             "target_list_threads",
@@ -503,6 +507,10 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         "target_read_memory" => {
             let request = parse::<TargetMemoryReadRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.read_memory(request)?)?)
+        }
+        "target_memory_map" => {
+            let request = parse::<TargetMemoryMapRequest>(call.arguments)?;
+            Ok(serde_json::to_value(state.targets.memory_map(request)?)?)
         }
         "target_list_threads" => {
             let request = parse::<TargetRequest>(call.arguments)?;

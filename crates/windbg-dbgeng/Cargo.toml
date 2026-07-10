@@ -10,6 +10,7 @@ serde.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 libloading.workspace = true
+windows-core = "0.58"
 windows = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
@@ -22,4 +23,5 @@ windows = { workspace = true, features = [
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+    "implement",
 ] }

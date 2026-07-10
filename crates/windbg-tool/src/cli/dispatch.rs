@@ -47,6 +47,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             LiveCommand::Launch(args) => platform::run_live_launch(args, &output),
             LiveCommand::StartupBreak(args) => platform::run_live_startup_break(args, &output),
             LiveCommand::StartupProfile(args) => platform::run_live_startup_profile(args, &output),
+            LiveCommand::StartupCompare(args) => platform::run_live_startup_compare(args, &output),
             LiveCommand::ManagedBreak(args) => platform::run_live_managed_break(args, &output),
             LiveCommand::Start(args) => live_start_and_print(pipe, args, &output).await,
             LiveCommand::Attach(args) => live_attach_and_print(pipe, args, &output).await,
@@ -314,6 +315,9 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             }
             TargetCommand::Memory(args) => {
                 call_and_print(pipe, target_memory_call(args)?, &output).await
+            }
+            TargetCommand::MemoryMap(args) => {
+                call_and_print(pipe, target_memory_map_call(args), &output).await
             }
             TargetCommand::Stack(args) => {
                 call_and_print(pipe, target_stack_call(args), &output).await

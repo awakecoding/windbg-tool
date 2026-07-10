@@ -14,9 +14,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 use windbg_dbgeng::{
     launch_live_session, live_launch_initial_break, open_dump_session, start_process_server,
-    write_process_dump, BreakpointInfo, DebuggerSession, DumpKind, DumpOpenOptions,
-    DumpWriteOptions, LiveInitialStop, LiveLaunchEnd, LiveLaunchOptions, LiveLaunchSessionOptions,
-    ManagedCodeAvailability, ModuleInfo, ProcessDumpOptions, ProcessServerOptions,
+    write_process_dump, BreakpointInfo, DebuggerOutputCaptureOptions, DebuggerSession, DumpKind,
+    DumpOpenOptions, DumpWriteOptions, LiveInitialStop, LiveLaunchEnd, LiveLaunchOptions,
+    LiveLaunchSessionOptions, ManagedCodeAvailability, ModuleInfo, ProcessDumpOptions,
+    ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
 use windows::core::{PCWSTR, PWSTR};
@@ -32,9 +33,11 @@ use windows::Win32::System::Threading::{
 use super::output::{print_value, OutputOptions};
 use super::{
     CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
-    LiveManagedBreakArgs, LiveStartupBreakArgs, LiveStartupProfileArgs, TraceRecordArgs,
-    TraceRecordProfile, TraceReplayCpuSupport, WindbgCommand,
+    LiveManagedBreakArgs, LiveStartupBreakArgs, LiveStartupProfileArgs,
+    LiveStartupProfileCompareArgs, StartupProfileContextEvent, TraceRecordArgs, TraceRecordProfile,
+    TraceReplayCpuSupport, WindbgCommand,
 };
+use crate::pe_symbols::bounded_pe_file_metadata;
 
 pub(super) fn run_dbgeng_server(
     args: DbgEngServerArgs,
@@ -214,6 +217,7 @@ const STARTUP_PROFILE_CORECLR_MODULE: &str = "coreclr.dll";
 const STARTUP_PROFILE_MAX_MODULE_IDENTITIES: usize = 128;
 const STARTUP_PROFILE_MAX_FIRST_SEEN_MODULES: usize = 32;
 const STARTUP_PROFILE_MAX_RANKED_GAPS: usize = 8;
+const STARTUP_PROFILE_MAX_PROVENANCE_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 struct StartupProfileModule {
@@ -233,7 +237,7 @@ struct StartupProfileEvent {
     module: Option<StartupProfileModule>,
     loaded_module_count: Option<usize>,
     live_thread_count: Option<usize>,
-    context: Option<Value>,
+    context: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -297,6 +301,8 @@ struct StartupProfileRun {
     phase_durations: Vec<StartupProfilePhase>,
     completion: StartupProfileCompletion,
     lifecycle_summary: Value,
+    debuggee_output: Value,
+    module_provenance: Value,
     largest_observed_gaps: Vec<StartupProfileGap>,
     gaps_excluded_from_ranking: Vec<StartupProfileExcludedGap>,
     counts: Value,
@@ -378,6 +384,11 @@ pub(super) fn run_live_startup_profile(
         }
     }
 
+    let debuggee_output_limitation = if args.capture_debuggee_output {
+        "Opt-in debuggee output capture retains only bounded DbgEng debuggee categories and text. It can be unavailable if DbgEng rejects callback installation, and a preceding lifecycle-event reference establishes observation order rather than causation."
+    } else {
+        "Debuggee output is not captured into structured JSON because this command does not install an output callback; a target can still inherit the invoking console."
+    };
     let mut result = json!({
         "workflow": "live_startup_profile",
         "command_line": args.command_line,
@@ -408,7 +419,7 @@ pub(super) fn run_live_startup_profile(
         },
         "limitations": [
             "DbgEng lifecycle events do not establish managed assembly registration, managed method execution, JIT activity, or CPU attribution.",
-            "Debuggee output is not captured into structured JSON because this command does not install an output callback; a target can still inherit the invoking console.",
+            debuggee_output_limitation,
             "Largest observed gaps rank only adjacent retained events while the full lifecycle filter set was active. Tail-filter gaps are retained as excluded coverage diagnostics, not ranked evidence.",
             "First-chance exceptions are opt-in because managed startup can generate enough events to consume the bounded timeline."
         ]
@@ -423,6 +434,302 @@ pub(super) fn run_live_startup_profile(
         });
     }
     print_value(result, output_options)
+}
+
+const STARTUP_PROFILE_COMPARE_MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+
+pub(super) fn run_live_startup_compare(
+    args: LiveStartupProfileCompareArgs,
+    output_options: &OutputOptions,
+) -> anyhow::Result<()> {
+    let baseline = read_startup_profile_artifact(&args.baseline, "baseline")?;
+    let candidate = read_startup_profile_artifact(&args.candidate, "candidate")?;
+    let baseline_runs = startup_profile_completed_artifact_runs(&baseline.value);
+    let candidate_runs = startup_profile_completed_artifact_runs(&candidate.value);
+    let phase_comparison =
+        startup_profile_compare_phase_distributions(&baseline_runs, &candidate_runs);
+    let gap_comparison = startup_profile_compare_largest_gaps(&baseline_runs, &candidate_runs);
+    let sequence_comparison = startup_profile_compare_sequences(
+        &baseline_runs,
+        &candidate_runs,
+        args.max_sequence_events as usize,
+    );
+
+    print_value(
+        json!({
+            "workflow": "live_startup_profile_compare",
+            "baseline": baseline.summary,
+            "candidate": candidate.summary,
+            "comparison": {
+                "phase_wall_time_ms": phase_comparison,
+                "largest_observed_inter_event_gap_wall_time_ms": gap_comparison,
+                "lifecycle_sequence": sequence_comparison
+            },
+            "coverage": {
+                "baseline_completed_runs": baseline_runs.len(),
+                "candidate_completed_runs": candidate_runs.len(),
+                "matched_run_pairs": baseline_runs.len().min(candidate_runs.len()),
+                "unmatched_baseline_runs": baseline_runs.len().saturating_sub(candidate_runs.len()),
+                "unmatched_candidate_runs": candidate_runs.len().saturating_sub(baseline_runs.len()),
+                "sequence_event_limit_per_run": args.max_sequence_events
+            },
+            "interpretation": {
+                "wall_time_only": true,
+                "cpu_attribution": "not_available",
+                "causal_attribution": "not_available",
+                "regression_assessment": "The artifact comparison reports observed wall-time and lifecycle-sequence differences only. It does not establish a CPU regression, target-internal cause, managed-method timing, I/O cause, or UI readiness."
+            }
+        }),
+        output_options,
+    )
+}
+
+struct StartupProfileArtifact {
+    value: Value,
+    summary: Value,
+}
+
+fn read_startup_profile_artifact(
+    path: &Path,
+    role: &str,
+) -> anyhow::Result<StartupProfileArtifact> {
+    let metadata = fs::metadata(path)
+        .with_context(|| format!("reading {role} startup-profile artifact {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "{role} startup-profile artifact is not a regular file: {}",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= STARTUP_PROFILE_COMPARE_MAX_ARTIFACT_BYTES,
+        "{role} startup-profile artifact is {} bytes, exceeding the {}-byte comparison limit",
+        metadata.len(),
+        STARTUP_PROFILE_COMPARE_MAX_ARTIFACT_BYTES
+    );
+    let contents = fs::read_to_string(path)
+        .with_context(|| format!("reading {role} startup-profile artifact {}", path.display()))?;
+    let value: Value = serde_json::from_str(&contents)
+        .with_context(|| format!("parsing {role} startup-profile artifact {}", path.display()))?;
+    ensure!(
+        value["workflow"].as_str() == Some("live_startup_profile"),
+        "{role} artifact is not a live startup-profile result"
+    );
+    let runs = value["runs"]
+        .as_array()
+        .with_context(|| format!("{role} startup-profile artifact has no runs array"))?;
+    Ok(StartupProfileArtifact {
+        summary: json!({
+            "role": role,
+            "path": path,
+            "artifact_bytes": metadata.len(),
+            "requested_runs": value["requested_runs"],
+            "runs_returned": runs.len(),
+            "runs_completed": value["runs_completed"],
+            "runs_completed_with_process_exit": value["runs_completed_with_process_exit"]
+        }),
+        value,
+    })
+}
+
+fn startup_profile_completed_artifact_runs(artifact: &Value) -> Vec<&Value> {
+    artifact["runs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|run| run["status"].as_str() == Some("completed"))
+        .collect()
+}
+
+fn startup_profile_compare_phase_distributions(
+    baseline_runs: &[&Value],
+    candidate_runs: &[&Value],
+) -> Vec<Value> {
+    let baseline = startup_profile_artifact_phase_samples(baseline_runs);
+    let candidate = startup_profile_artifact_phase_samples(candidate_runs);
+    let names = baseline
+        .keys()
+        .chain(candidate.keys())
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    names
+        .into_iter()
+        .map(|name| {
+            let baseline_values = baseline.get(&name).cloned().unwrap_or_default();
+            let candidate_values = candidate.get(&name).cloned().unwrap_or_default();
+            let baseline_distribution = startup_profile_wall_time_distribution(&baseline_values);
+            let candidate_distribution = startup_profile_wall_time_distribution(&candidate_values);
+            let median_delta_ms = baseline_distribution["median_ms"]
+                .as_f64()
+                .zip(candidate_distribution["median_ms"].as_f64())
+                .map(|(baseline, candidate)| candidate - baseline);
+            json!({
+                "name": name,
+                "baseline": baseline_distribution,
+                "candidate": candidate_distribution,
+                "candidate_minus_baseline_median_ms": median_delta_ms,
+                "detail": "Observed target-resumed host wall-time phase distribution. A delta is not a CPU, causal, or regression attribution."
+            })
+        })
+        .collect()
+}
+
+fn startup_profile_artifact_phase_samples(runs: &[&Value]) -> BTreeMap<String, Vec<u64>> {
+    let mut samples = BTreeMap::<String, Vec<u64>>::new();
+    for run in runs {
+        for phase in run["phase_durations"].as_array().into_iter().flatten() {
+            let (Some(name), Some(elapsed_ms)) = (
+                phase["name"].as_str(),
+                (phase["status"].as_str() == Some("observed"))
+                    .then(|| phase["elapsed_ms"].as_u64())
+                    .flatten(),
+            ) else {
+                continue;
+            };
+            samples
+                .entry(name.to_string())
+                .or_default()
+                .push(elapsed_ms);
+        }
+    }
+    samples
+}
+
+fn startup_profile_compare_largest_gaps(
+    baseline_runs: &[&Value],
+    candidate_runs: &[&Value],
+) -> Value {
+    let baseline = startup_profile_artifact_largest_gap_samples(baseline_runs);
+    let candidate = startup_profile_artifact_largest_gap_samples(candidate_runs);
+    let baseline_distribution = startup_profile_wall_time_distribution(&baseline);
+    let candidate_distribution = startup_profile_wall_time_distribution(&candidate);
+    let median_delta_ms = baseline_distribution["median_ms"]
+        .as_f64()
+        .zip(candidate_distribution["median_ms"].as_f64())
+        .map(|(baseline, candidate)| candidate - baseline);
+    json!({
+        "baseline": baseline_distribution,
+        "candidate": candidate_distribution,
+        "candidate_minus_baseline_median_ms": median_delta_ms,
+        "detail": "One retained largest fully observed lifecycle gap from each completed run. This does not attribute time to CPU, I/O, JIT, or a target-internal cause."
+    })
+}
+
+fn startup_profile_artifact_largest_gap_samples(runs: &[&Value]) -> Vec<u64> {
+    runs.iter()
+        .filter_map(|run| run["largest_observed_gaps"].as_array()?.first())
+        .filter_map(|gap| gap["elapsed_ms"].as_u64())
+        .collect()
+}
+
+fn startup_profile_wall_time_distribution(values: &[u64]) -> Value {
+    let mut values = values.to_vec();
+    values.sort_unstable();
+    let sample_count = values.len();
+    let median_ms = match sample_count {
+        0 => None,
+        count if count % 2 == 1 => Some(values[count / 2] as f64),
+        count => Some((values[count / 2 - 1] as f64 + values[count / 2] as f64) / 2.0),
+    };
+    json!({
+        "sample_count": sample_count,
+        "min_ms": values.first(),
+        "median_ms": median_ms,
+        "max_ms": values.last()
+    })
+}
+
+fn startup_profile_compare_sequences(
+    baseline_runs: &[&Value],
+    candidate_runs: &[&Value],
+    max_events: usize,
+) -> Value {
+    let pairs = baseline_runs
+        .iter()
+        .zip(candidate_runs)
+        .enumerate()
+        .map(|(pair_index, (baseline, candidate))| {
+            startup_profile_compare_run_sequence(pair_index + 1, baseline, candidate, max_events)
+        })
+        .collect::<Vec<_>>();
+    let divergent_pairs = pairs
+        .iter()
+        .filter(|pair| pair["status"].as_str() == Some("diverged"))
+        .count();
+    json!({
+        "pairs": pairs,
+        "compared_pair_count": pairs.len(),
+        "divergent_pair_count": divergent_pairs,
+        "detail": "Event kinds, module basenames, and exception codes are compared in retained DbgEng lifecycle order. Thread system IDs are intentionally omitted because they are not stable across launches."
+    })
+}
+
+fn startup_profile_compare_run_sequence(
+    pair_index: usize,
+    baseline: &Value,
+    candidate: &Value,
+    max_events: usize,
+) -> Value {
+    let baseline_events = baseline["timeline"].as_array().cloned().unwrap_or_default();
+    let candidate_events = candidate["timeline"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let baseline_tokens = baseline_events
+        .iter()
+        .take(max_events)
+        .map(startup_profile_artifact_event_token)
+        .collect::<Vec<_>>();
+    let candidate_tokens = candidate_events
+        .iter()
+        .take(max_events)
+        .map(startup_profile_artifact_event_token)
+        .collect::<Vec<_>>();
+    let shared_prefix = baseline_tokens
+        .iter()
+        .zip(&candidate_tokens)
+        .take_while(|(baseline, candidate)| baseline == candidate)
+        .count();
+    let first_divergence =
+        if shared_prefix < baseline_tokens.len() && shared_prefix < candidate_tokens.len() {
+            Some(json!({
+                "index": shared_prefix,
+                "baseline": baseline_tokens[shared_prefix],
+                "candidate": candidate_tokens[shared_prefix]
+            }))
+        } else {
+            None
+        };
+    let length_differs = baseline_tokens.len() != candidate_tokens.len();
+    let status = if first_divergence.is_some() || length_differs {
+        "diverged"
+    } else {
+        "shared_prefix_within_limit"
+    };
+    json!({
+        "pair_index": pair_index,
+        "baseline_run": baseline["run"],
+        "candidate_run": candidate["run"],
+        "status": status,
+        "shared_prefix_event_count": shared_prefix,
+        "first_divergence": first_divergence,
+        "baseline_events_returned": baseline_events.len(),
+        "candidate_events_returned": candidate_events.len(),
+        "baseline_events_compared": baseline_tokens.len(),
+        "candidate_events_compared": candidate_tokens.len(),
+        "sequence_comparison_truncated": baseline_events.len() > max_events || candidate_events.len() > max_events,
+        "baseline_profile_timeline_truncated": baseline["coverage"]["timeline_truncated"],
+        "candidate_profile_timeline_truncated": candidate["coverage"]["timeline_truncated"]
+    })
+}
+
+fn startup_profile_artifact_event_token(event: &Value) -> Value {
+    json!({
+        "kind": event["kind"],
+        "module_basename": event["module"]["basename"],
+        "exception_code": event["event"]["exception"]["code"]
+            .as_u64()
+            .map(|code| format!("0x{code:08X}"))
+    })
 }
 
 fn collect_startup_profile_run(
@@ -521,6 +828,47 @@ fn collect_startup_profile_stops(
 
     let event_filters =
         configure_startup_profile_event_filters(session, args.include_first_chance_exceptions)?;
+    let mut debuggee_output = if args.capture_debuggee_output {
+        json!({
+            "status": "unavailable",
+            "source": "dbgeng_output_callback",
+            "records": [],
+            "detail": "DbgEng output capture was requested but is not available."
+        })
+    } else {
+        json!({
+            "status": "not_requested",
+            "source": "dbgeng_output_callback",
+            "records": [],
+            "detail": "Debuggee output capture is disabled by default because debug strings can contain sensitive content."
+        })
+    };
+    let output_capture = if args.capture_debuggee_output {
+        match session.begin_debuggee_output_capture(DebuggerOutputCaptureOptions {
+            started_at: command_started,
+            max_records: args.max_output_records,
+            max_chars_per_record: args.max_output_chars,
+            max_total_chars: args.max_total_output_chars,
+        }) {
+            Ok(capture) => {
+                capture
+                    .set_preceding_event_index(recording.timeline.last().map(|event| event.index));
+                Some(capture)
+            }
+            Err(error) => {
+                debuggee_output = json!({
+                    "status": "unavailable",
+                    "source": "dbgeng_output_callback",
+                    "records": [],
+                    "detail": "The startup profile continued without output capture after DbgEng rejected callback installation.",
+                    "error": error.to_string()
+                });
+                None
+            }
+        }
+    } else {
+        None
+    };
     let mut timeline_truncated = false;
     let mut event_limit_reached = false;
     let mut tail_filter_commands = Vec::new();
@@ -610,6 +958,10 @@ fn collect_startup_profile_stops(
                 event,
                 (command_started.elapsed(), resumed_elapsed),
             );
+            if let Some(capture) = output_capture.as_ref() {
+                capture
+                    .set_preceding_event_index(recording.timeline.last().map(|event| event.index));
+            }
         }
         if exiting {
             if quiet_started_at.is_some() {
@@ -679,7 +1031,21 @@ fn collect_startup_profile_stops(
     let module_identity_truncated =
         counts.unique_module_identity_count > STARTUP_PROFILE_MAX_MODULE_IDENTITIES;
     let timeline_len = timeline.len();
-    let lifecycle_summary = startup_profile_lifecycle_summary(&timeline, phase_module, &completion);
+    if let Some(capture) = output_capture {
+        debuggee_output = match capture.finish() {
+            Ok(capture) => startup_profile_debuggee_output(capture, &timeline),
+            Err(error) => json!({
+                "status": "unavailable",
+                "source": "dbgeng_output_callback",
+                "records": [],
+                "detail": "DbgEng output callback restoration failed; no output is returned because the capture lifecycle could not be confirmed.",
+                "error": error.to_string()
+            }),
+        };
+    }
+    let module_provenance = startup_profile_module_provenance(&timeline, args);
+    let lifecycle_summary =
+        startup_profile_lifecycle_summary(&timeline, phase_module, &completion, &debuggee_output);
     let (largest_observed_gaps, gaps_excluded_from_ranking) =
         rank_startup_profile_observed_gaps(&timeline, tail_filter_started_after_event_index);
     let status = if matches!(
@@ -708,6 +1074,8 @@ fn collect_startup_profile_stops(
         }),
         event_filters,
         lifecycle_summary,
+        debuggee_output,
+        module_provenance,
         largest_observed_gaps,
         gaps_excluded_from_ranking,
         timeline,
@@ -741,7 +1109,8 @@ fn collect_startup_profile_stops(
             "completion_module": completion_module,
             "first_chance_exceptions_requested": args.include_first_chance_exceptions,
             "stop_context_requested": args.capture_stop_context,
-            "stop_contexts_returned": captured_contexts
+            "stop_contexts_returned": captured_contexts,
+            "module_provenance_requested": args.capture_module_provenance
         }),
         cleanup: Value::Null,
     })
@@ -902,28 +1271,7 @@ fn record_startup_profile_event(
             recording.counts.unique_module_identity_count = recording.module_identities.len();
         }
     }
-    let context =
-        if args.capture_stop_context && recording.captured_contexts < args.max_context_events {
-            recording.captured_contexts += 1;
-            Some(match session.core_registers() {
-                Ok(registers) => match live_stop_context(session, registers, args.max_frames) {
-                    Ok(context) => json!({
-                        "status": "ok",
-                        "value": context
-                    }),
-                    Err(error) => json!({
-                        "status": "error",
-                        "error": error.to_string()
-                    }),
-                },
-                Err(error) => json!({
-                    "status": "error",
-                    "error": error.to_string()
-                }),
-            })
-        } else {
-            None
-        };
+    let context = startup_profile_stop_context(session, recording, args, &kind);
     recording.timeline.push(StartupProfileEvent {
         index: recording.timeline.len(),
         kind,
@@ -935,6 +1283,78 @@ fn record_startup_profile_event(
         live_thread_count,
         context,
     });
+}
+
+fn startup_profile_stop_context(
+    session: &DebuggerSession,
+    recording: &mut StartupProfileRecording,
+    args: &LiveStartupProfileArgs,
+    event_kind: &str,
+) -> Value {
+    if !args.capture_stop_context {
+        return json!({
+            "status": "not_requested",
+            "detail": "Read-only stop-context capture is disabled."
+        });
+    }
+    if !startup_profile_context_event_selected(args, event_kind) {
+        return json!({
+            "status": "not_selected",
+            "detail": "This lifecycle event kind is outside --context-on."
+        });
+    }
+    if recording.captured_contexts >= args.max_context_events {
+        return json!({
+            "status": "limit_reached",
+            "detail": "The bounded read-only stop-context capture limit was reached."
+        });
+    }
+
+    recording.captured_contexts += 1;
+    match session.core_registers() {
+        Ok(registers) => match live_stop_context(session, registers, args.max_frames) {
+            Ok(context) => json!({
+                "status": "captured",
+                "source": "dbgeng_read_only_stop_snapshot",
+                "value": context
+            }),
+            Err(error) => json!({
+                "status": "unavailable",
+                "source": "dbgeng_read_only_stop_snapshot",
+                "error": error.to_string()
+            }),
+        },
+        Err(error) => json!({
+            "status": "unavailable",
+            "source": "dbgeng_read_only_stop_snapshot",
+            "error": error.to_string()
+        }),
+    }
+}
+
+fn startup_profile_context_event_selected(args: &LiveStartupProfileArgs, event_kind: &str) -> bool {
+    let selected = if args.context_on.is_empty() {
+        &[
+            StartupProfileContextEvent::LoadModule,
+            StartupProfileContextEvent::CreateThread,
+            StartupProfileContextEvent::Exception,
+            StartupProfileContextEvent::ExitProcess,
+        ][..]
+    } else {
+        args.context_on.as_slice()
+    };
+    selected.iter().any(|selected| {
+        matches!(
+            (selected, event_kind),
+            (StartupProfileContextEvent::CreateProcess, "create_process")
+                | (StartupProfileContextEvent::ExitProcess, "exit_process")
+                | (StartupProfileContextEvent::CreateThread, "create_thread")
+                | (StartupProfileContextEvent::ExitThread, "exit_thread")
+                | (StartupProfileContextEvent::LoadModule, "load_module")
+                | (StartupProfileContextEvent::UnloadModule, "unload_module")
+                | (StartupProfileContextEvent::Exception, "exception")
+        )
+    })
 }
 
 fn normalize_startup_profile_module(module: ModuleInfo) -> StartupProfileModule {
@@ -1009,6 +1429,7 @@ fn startup_profile_lifecycle_summary(
     timeline: &[StartupProfileEvent],
     phase_module: Option<&str>,
     completion: &StartupProfileCompletion,
+    debuggee_output: &Value,
 ) -> Value {
     let first = timeline.first().map(startup_profile_event_reference);
     let last = timeline.last().map(startup_profile_event_reference);
@@ -1122,10 +1543,130 @@ fn startup_profile_lifecycle_summary(
             }
         },
         "debuggee_output": {
-            "status": "not_captured_no_output_callback",
-            "detail": "DbgEng output callbacks are not installed by this event-only profiler. The target can still inherit the invoking console."
+            "status": debuggee_output["status"],
+            "records_returned": debuggee_output["records_returned"],
+            "dropped_record_count": debuggee_output["dropped_record_count"],
+            "detail": debuggee_output["detail"]
         },
         "completion_boundary": completion
+    })
+}
+
+fn startup_profile_debuggee_output(
+    capture: windbg_dbgeng::DebuggerOutputCaptureResult,
+    timeline: &[StartupProfileEvent],
+) -> Value {
+    let records = capture
+        .records
+        .into_iter()
+        .map(|record| {
+            let preceding_event = record
+                .preceding_event_index
+                .and_then(|index| timeline.get(index))
+                .map(startup_profile_event_reference);
+            json!({
+                "elapsed_ms": record.elapsed_ms,
+                "preceding_event_index": record.preceding_event_index,
+                "preceding_event": preceding_event,
+                "mask": format!("0x{:X}", record.mask),
+                "categories": record.categories,
+                "text": record.text,
+                "text_truncated": record.text_truncated
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "status": capture.status,
+        "source": capture.source,
+        "records": records,
+        "records_returned": capture.records_returned,
+        "dropped_record_count": capture.dropped_record_count,
+        "dropped_text_char_count": capture.dropped_text_char_count,
+        "max_records": capture.max_records,
+        "max_chars_per_record": capture.max_chars_per_record,
+        "max_total_chars": capture.max_total_chars,
+        "detail": capture.detail
+    })
+}
+
+fn startup_profile_module_provenance(
+    timeline: &[StartupProfileEvent],
+    args: &LiveStartupProfileArgs,
+) -> Value {
+    if !args.capture_module_provenance {
+        return json!({
+            "status": "not_requested",
+            "source": "host_file_metadata",
+            "records": [],
+            "detail": "Host-side module provenance is disabled by default. When enabled, windbg-tool reads only bounded metadata for DbgEng-observed module image paths."
+        });
+    }
+
+    let mut seen_paths = BTreeSet::new();
+    let mut candidates = Vec::new();
+    for event in timeline {
+        if event.kind != "load_module" {
+            continue;
+        }
+        let Some(image_path) = event
+            .module
+            .as_ref()
+            .and_then(|module| module.image_path.as_deref())
+        else {
+            continue;
+        };
+        if seen_paths.insert(image_path.to_ascii_lowercase()) {
+            candidates.push((
+                image_path.to_string(),
+                startup_profile_event_reference(event),
+            ));
+        }
+    }
+
+    let candidate_count = candidates.len();
+    let truncated = candidate_count > args.max_module_provenance as usize;
+    let records = candidates
+        .into_iter()
+        .take(args.max_module_provenance as usize)
+        .map(|(image_path, event)| {
+            if !Path::new(&image_path).is_absolute() {
+                return json!({
+                    "event": event,
+                    "observed_image_path": image_path,
+                    "status": "rejected_non_absolute_path",
+                    "detail": "DbgEng did not provide an absolute image path, so windbg-tool did not perform a host file read."
+                });
+            }
+            match bounded_pe_file_metadata(
+                Path::new(&image_path),
+                STARTUP_PROFILE_MAX_PROVENANCE_FILE_BYTES,
+            ) {
+                Ok(metadata) => json!({
+                    "event": event,
+                    "observed_image_path": image_path,
+                    "status": "captured",
+                    "metadata": metadata
+                }),
+                Err(error) => json!({
+                    "event": event,
+                    "observed_image_path": image_path,
+                    "status": "unavailable",
+                    "error": error.to_string(),
+                    "detail": "The debugger-observed path could not be inspected under the host metadata limits."
+                }),
+            }
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "status": "captured",
+        "source": "host_file_metadata",
+        "records": records,
+        "unique_observed_image_paths": candidate_count,
+        "returned": records.len(),
+        "limit": args.max_module_provenance,
+        "truncated": truncated,
+        "host_file_read_limit_bytes_per_module": STARTUP_PROFILE_MAX_PROVENANCE_FILE_BYTES,
+        "detail": "Metadata is read from host files only after DbgEng reported their absolute image paths. It is not target-memory evidence and its timestamps are not lifecycle timing."
     })
 }
 
@@ -3825,7 +4366,10 @@ mod tests {
             }),
             loaded_module_count: None,
             live_thread_count: None,
-            context: None,
+            context: json!({
+                "status": "not_requested",
+                "detail": "test"
+            }),
         }
     }
 
@@ -3900,6 +4444,21 @@ mod tests {
                 detail: "test".to_string(),
             },
             lifecycle_summary: json!({}),
+            debuggee_output: json!({
+                "status": "not_requested",
+                "source": "dbgeng_output_callback",
+                "records": [],
+                "records_returned": 0,
+                "dropped_record_count": 0,
+                "dropped_text_char_count": 0,
+                "detail": "test"
+            }),
+            module_provenance: json!({
+                "status": "not_requested",
+                "source": "host_file_metadata",
+                "records": [],
+                "detail": "test"
+            }),
             largest_observed_gaps: Vec::new(),
             gaps_excluded_from_ranking: Vec::new(),
             counts: json!({}),
@@ -4055,6 +4614,12 @@ mod tests {
             &timeline,
             Some("RemoteDesktopManager.dll"),
             &completion,
+            &json!({
+                "status": "not_requested",
+                "records_returned": 0,
+                "dropped_record_count": 0,
+                "detail": "test"
+            }),
         );
 
         assert_eq!(
@@ -4077,9 +4642,90 @@ mod tests {
             summary["exceptions"]["first"]["exception_code"],
             "0xC0000005"
         );
+        assert_eq!(summary["debuggee_output"]["status"], "not_requested");
+    }
+
+    #[test]
+    fn startup_profile_output_records_reference_the_latest_lifecycle_event() {
+        let timeline = vec![
+            startup_profile_event_for_test(0, "create_process", 5, 0, None),
+            startup_profile_event_for_test(1, "load_module", 12, 7, Some("coreclr.dll")),
+        ];
+        let output = startup_profile_debuggee_output(
+            windbg_dbgeng::DebuggerOutputCaptureResult {
+                status: "captured".to_string(),
+                source: "dbgeng_output_callback".to_string(),
+                records: vec![windbg_dbgeng::DebuggerOutputRecord {
+                    elapsed_ms: 13,
+                    preceding_event_index: Some(1),
+                    mask: 0x80,
+                    categories: vec!["debuggee".to_string()],
+                    text: "fixture-output".to_string(),
+                    text_truncated: false,
+                }],
+                records_returned: 1,
+                dropped_record_count: 0,
+                dropped_text_char_count: 0,
+                max_records: 4,
+                max_chars_per_record: 64,
+                max_total_chars: 128,
+                detail: "test".to_string(),
+            },
+            &timeline,
+        );
+
+        assert_eq!(output["records_returned"], 1);
+        assert_eq!(output["records"][0]["text"], "fixture-output");
         assert_eq!(
-            summary["debuggee_output"]["status"],
-            "not_captured_no_output_callback"
+            output["records"][0]["preceding_event"]["module"]["basename"],
+            "coreclr.dll"
+        );
+    }
+
+    #[test]
+    fn startup_profile_comparator_reports_wall_time_and_sequence_differences() {
+        let baseline = json!({
+            "status": "completed",
+            "run": 1,
+            "phase_durations": [{
+                "name": "create_process_to_coreclr_load",
+                "status": "observed",
+                "elapsed_ms": 10
+            }],
+            "largest_observed_gaps": [{ "elapsed_ms": 7 }],
+            "timeline": [
+                { "kind": "create_process", "module": null, "event": { "exception": null } },
+                { "kind": "load_module", "module": { "basename": "coreclr.dll" }, "event": { "exception": null } }
+            ],
+            "coverage": { "timeline_truncated": false }
+        });
+        let candidate = json!({
+            "status": "completed",
+            "run": 1,
+            "phase_durations": [{
+                "name": "create_process_to_coreclr_load",
+                "status": "observed",
+                "elapsed_ms": 15
+            }],
+            "largest_observed_gaps": [{ "elapsed_ms": 9 }],
+            "timeline": [
+                { "kind": "create_process", "module": null, "event": { "exception": null } },
+                { "kind": "load_module", "module": { "basename": "hostfxr.dll" }, "event": { "exception": null } }
+            ],
+            "coverage": { "timeline_truncated": false }
+        });
+        let baseline_runs = [&baseline];
+        let candidate_runs = [&candidate];
+
+        let phases = startup_profile_compare_phase_distributions(&baseline_runs, &candidate_runs);
+        let sequence = startup_profile_compare_sequences(&baseline_runs, &candidate_runs, 8);
+
+        assert_eq!(phases[0]["candidate_minus_baseline_median_ms"], json!(5.0));
+        assert_eq!(sequence["divergent_pair_count"], 1);
+        assert_eq!(sequence["pairs"][0]["first_divergence"]["index"], 1);
+        assert_eq!(
+            sequence["pairs"][0]["first_divergence"]["candidate"]["module_basename"],
+            "hostfxr.dll"
         );
     }
 

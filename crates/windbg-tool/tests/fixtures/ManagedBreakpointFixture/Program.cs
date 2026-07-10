@@ -1,5 +1,6 @@
 using System.Runtime.CompilerServices;
 using System.Globalization;
+using System.Runtime.InteropServices;
 
 namespace ManagedBreakpointFixture;
 
@@ -10,8 +11,29 @@ public static class Program
         Console.WriteLine(ManagedTargets.PublicEntry());
         Console.WriteLine(ManagedTargets.InvokePrivateEntry());
         Console.WriteLine(ManagedTargets.Overload("selected"));
+        EmitRequestedDebugOutput(args);
         SleepForStartupObservation(args);
         return 0;
+    }
+
+    private static void EmitRequestedDebugOutput(string[] args)
+    {
+        const string outputArgument = "--debug-output";
+        var index = Array.IndexOf(args, outputArgument);
+        if (index < 0 || index + 1 >= args.Length)
+        {
+            return;
+        }
+
+        var text = args[index + 1];
+        if (text.Length > 256)
+        {
+            throw new ArgumentOutOfRangeException(
+                outputArgument,
+                "Expected at most 256 UTF-16 characters.");
+        }
+
+        OutputDebugString(text);
     }
 
     private static void SleepForStartupObservation(string[] args)
@@ -37,6 +59,9 @@ public static class Program
 
         Thread.Sleep(delayMilliseconds);
     }
+
+    [DllImport("kernel32.dll", EntryPoint = "OutputDebugStringW", CharSet = CharSet.Unicode)]
+    private static extern void OutputDebugString(string text);
 }
 
 public static class ManagedTargets

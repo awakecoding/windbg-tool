@@ -1,12 +1,162 @@
 use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
 use std::path::Path;
+use std::time::UNIX_EPOCH;
+
+#[cfg(windows)]
+use std::ffi::OsStr;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use windows::core::PCWSTR;
+#[cfg(windows)]
+use windows::Win32::Storage::FileSystem::{
+    GetFileVersionInfoSizeW, GetFileVersionInfoW, VerQueryValueW, VS_FIXEDFILEINFO,
+};
 
 const IMAGE_DIRECTORY_ENTRY_EXPORT: usize = 0;
 const IMAGE_DIRECTORY_ENTRY_DEBUG: usize = 6;
 const IMAGE_DEBUG_TYPE_CODEVIEW: u32 = 2;
 const OPTIONAL_HEADER_PE32: u16 = 0x10b;
 const OPTIONAL_HEADER_PE32_PLUS: u16 = 0x20b;
+const MAX_VERSION_INFO_BYTES: u32 = 1024 * 1024;
+
+pub fn bounded_pe_file_metadata(path: &Path, max_file_bytes: u64) -> anyhow::Result<Value> {
+    let metadata =
+        std::fs::metadata(path).with_context(|| format!("reading {}", path.display()))?;
+    ensure!(
+        metadata.is_file(),
+        "observed module path is not a regular file: {}",
+        path.display()
+    );
+    ensure!(
+        metadata.len() <= max_file_bytes,
+        "observed module file is {} bytes, exceeding the {}-byte host metadata read limit",
+        metadata.len(),
+        max_file_bytes
+    );
+    let canonical_path = std::fs::canonicalize(path)
+        .with_context(|| format!("canonicalizing {}", path.display()))?;
+    let pe = diagnose_pe(&canonical_path)?;
+    let modified_unix_seconds = metadata
+        .modified()
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs());
+    Ok(json!({
+        "source": "host_file_metadata",
+        "canonical_path": canonical_path,
+        "file_size_bytes": metadata.len(),
+        "last_write_unix_seconds": modified_unix_seconds,
+        "pe": {
+            "machine": pe["machine"],
+            "machine_value": pe["machine_value"],
+            "timestamp": pe["timestamp"],
+            "timestamp_hex": pe["timestamp_hex"],
+            "size_of_image": pe["size_of_image"],
+            "size_of_image_hex": pe["size_of_image_hex"],
+            "image_symbol_store_key": pe["image_symbol_store_key"],
+            "codeview": pe["codeview"]
+        },
+        "version": file_version_info(&canonical_path),
+        "host_file_read_limit_bytes": max_file_bytes
+    }))
+}
+
+#[cfg(windows)]
+fn file_version_info(path: &Path) -> Value {
+    let path_wide = OsStr::new(path)
+        .encode_wide()
+        .chain(Some(0))
+        .collect::<Vec<_>>();
+    let size = unsafe { GetFileVersionInfoSizeW(PCWSTR(path_wide.as_ptr()), None) };
+    if size == 0 {
+        return json!({
+            "status": "unavailable",
+            "detail": "No Win32 version resource was available for this host file."
+        });
+    }
+    if size > MAX_VERSION_INFO_BYTES {
+        return json!({
+            "status": "unavailable",
+            "detail": format!(
+                "The Win32 version resource is {} bytes, exceeding the {}-byte host metadata limit.",
+                size,
+                MAX_VERSION_INFO_BYTES
+            )
+        });
+    }
+
+    let mut version_data = vec![0u8; size as usize];
+    if let Err(error) = unsafe {
+        GetFileVersionInfoW(
+            PCWSTR(path_wide.as_ptr()),
+            0,
+            size,
+            version_data.as_mut_ptr().cast(),
+        )
+    } {
+        return json!({
+            "status": "unavailable",
+            "detail": "Windows could not read the host file version resource.",
+            "error": error.to_string()
+        });
+    }
+
+    let root = [b'\\' as u16, 0];
+    let mut fixed_info = std::ptr::null_mut();
+    let mut fixed_info_bytes = 0u32;
+    let queried = unsafe {
+        VerQueryValueW(
+            version_data.as_ptr().cast(),
+            PCWSTR(root.as_ptr()),
+            &mut fixed_info,
+            &mut fixed_info_bytes,
+        )
+    }
+    .as_bool();
+    if !queried
+        || fixed_info.is_null()
+        || fixed_info_bytes < std::mem::size_of::<VS_FIXEDFILEINFO>() as u32
+    {
+        return json!({
+            "status": "unavailable",
+            "detail": "The host file version resource did not expose VS_FIXEDFILEINFO."
+        });
+    }
+    let fixed_info = unsafe { std::ptr::read_unaligned(fixed_info.cast::<VS_FIXEDFILEINFO>()) };
+    if fixed_info.dwSignature != 0xFEEF04BD {
+        return json!({
+            "status": "unavailable",
+            "detail": "The host file version resource has an invalid VS_FIXEDFILEINFO signature."
+        });
+    }
+    json!({
+        "status": "captured",
+        "source": "win32_version_resource",
+        "file_version": version_tuple(fixed_info.dwFileVersionMS, fixed_info.dwFileVersionLS),
+        "product_version": version_tuple(fixed_info.dwProductVersionMS, fixed_info.dwProductVersionLS),
+        "resource_size_bytes": size
+    })
+}
+
+#[cfg(not(windows))]
+fn file_version_info(_path: &Path) -> Value {
+    json!({
+        "status": "unavailable",
+        "detail": "Win32 version resources are only available on Windows."
+    })
+}
+
+fn version_tuple(high: u32, low: u32) -> String {
+    format!(
+        "{}.{}.{}.{}",
+        high >> 16,
+        high & 0xFFFF,
+        low >> 16,
+        low & 0xFFFF
+    )
+}
 
 #[derive(Debug, Clone)]
 struct Section {
@@ -385,11 +535,15 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn parses_current_exe_pe_identity() -> anyhow::Result<()> {
-        let info = diagnose_pe(&std::env::current_exe()?)?;
+    fn parses_current_exe_pe_identity_with_bounded_file_metadata() -> anyhow::Result<()> {
+        let executable = std::env::current_exe()?;
+        let info = diagnose_pe(&executable)?;
         assert!(info["timestamp"].is_u64(), "{info}");
         assert!(info["size_of_image"].is_u64(), "{info}");
         assert!(info["image_symbol_store_key"].is_string(), "{info}");
+        let metadata = bounded_pe_file_metadata(&executable, 64 * 1024 * 1024)?;
+        assert_eq!(metadata["source"], "host_file_metadata");
+        assert!(metadata["pe"]["machine"].is_string(), "{metadata}");
         Ok(())
     }
 }
