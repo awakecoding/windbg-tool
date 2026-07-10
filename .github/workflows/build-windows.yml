@@ -9,6 +9,11 @@ on:
         description: Release version without the v prefix (for example, 0.1.0)
         required: true
         type: string
+      dry_run:
+        description: Build and validate release packages without creating a tag or release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -196,7 +201,7 @@ jobs:
         uses: actions/download-artifact@v6
         with:
           path: release-assets
-          pattern: windbg-tool-windows-*
+          pattern: windbg-tool-*
           merge-multiple: true
 
       - name: Validate release inputs and assets
@@ -232,6 +237,7 @@ jobs:
           }
 
       - name: Create release and upload packages
+        if: inputs.dry_run == false
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
@@ -246,3 +252,8 @@ jobs:
             --target $env:GITHUB_SHA `
             --title "windbg-tool $tag" `
             --generate-notes
+
+      - name: Report dry run
+        if: inputs.dry_run
+        shell: pwsh
+        run: Write-Host "Dry run completed. Would create v$env:VERSION with the validated package ZIPs."

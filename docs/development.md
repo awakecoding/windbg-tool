@@ -70,7 +70,7 @@ Run the **Windows packages** workflow with **Run workflow** and enter an unprefi
 - `windbg-tool-x64.zip`
 - `windbg-tool-arm64.zip`
 
-The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP is validated before upload and contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
+Select **dry_run** to build both ZIPs, validate their contents, validate the version, and confirm that the tag is available without creating a tag or GitHub Release. The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
 
 To smoke-test the packaged MCP server:
 
