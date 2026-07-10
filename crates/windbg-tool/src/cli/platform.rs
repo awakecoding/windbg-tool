@@ -80,9 +80,19 @@ pub(super) fn run_live_startup_break(
 
     let result = (|| {
         let initial_event = session.summary();
-        let requested_breakpoint = set_startup_breakpoint(&session, &breakpoint_spec)?;
-        let continued = session.continue_execution()?;
-        let event = session.wait_for_event(args.wait_timeout_ms)?;
+        let requested_breakpoint = match breakpoint_spec {
+            StartupBreakpointSpec::InitialBreak => None,
+            _ => Some(set_startup_breakpoint(&session, &breakpoint_spec)?),
+        };
+        let continued = requested_breakpoint
+            .is_some()
+            .then(|| session.continue_execution())
+            .transpose()?;
+        let event = requested_breakpoint
+            .is_some()
+            .then(|| session.wait_for_event(args.wait_timeout_ms))
+            .transpose()?
+            .unwrap_or_else(|| session.execution_status());
         let registers = session.core_registers()?;
         let instruction_offset = registers.instruction_offset;
         let current_module = instruction_offset
@@ -93,10 +103,26 @@ pub(super) fn run_live_startup_break(
             .map(|address| session.symbol_by_offset(address))
             .transpose()?
             .flatten();
-        let configured_breakpoint = session
-            .list_breakpoints()?
-            .into_iter()
-            .find(|breakpoint| breakpoint.id == requested_breakpoint.id);
+        let stack = match session.stack_trace(args.max_frames) {
+            Ok(frames) => json!({
+                "status": "ok",
+                "frames": frames,
+                "frame_limit": args.max_frames
+            }),
+            Err(error) => json!({
+                "status": "error",
+                "error": error.to_string(),
+                "frames": [],
+                "frame_limit": args.max_frames
+            }),
+        };
+        let configured_breakpoint = match requested_breakpoint.as_ref() {
+            Some(requested) => session
+                .list_breakpoints()?
+                .into_iter()
+                .find(|breakpoint| breakpoint.id == requested.id),
+            None => None,
+        };
         let breakpoint_hit = instruction_offset
             .zip(
                 configured_breakpoint
@@ -120,6 +146,8 @@ pub(super) fn run_live_startup_break(
                 "hit": breakpoint_hit,
                 "hit_evidence": if breakpoint_hit {
                     "current instruction pointer equals the configured breakpoint offset"
+                } else if matches!(breakpoint_spec, StartupBreakpointSpec::InitialBreak) {
+                    "the initial DbgEng process break was intentionally captured without setting a code breakpoint"
                 } else {
                     "DbgEng stopped, but its current instruction pointer did not match the configured breakpoint offset"
                 }
@@ -130,8 +158,7 @@ pub(super) fn run_live_startup_break(
                 "instruction_pointer": instruction_offset,
                 "current_module": current_module,
                 "current_symbol": current_symbol,
-                "stack": session.stack_trace(args.max_frames)?,
-                "stack_frame_limit": args.max_frames
+                "stack": stack
             },
             "end": end
         }))
@@ -151,19 +178,24 @@ pub(super) fn run_live_startup_break(
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum StartupBreakpointSpec {
+    InitialBreak,
     Address { address: u64 },
     ModuleOffset { module: String, offset: u64 },
     Symbol { expression: String },
 }
 
 fn startup_breakpoint_spec(args: &LiveStartupBreakArgs) -> anyhow::Result<StartupBreakpointSpec> {
-    let selections = usize::from(args.address.is_some())
+    let selections = usize::from(args.initial_break)
+        + usize::from(args.address.is_some())
         + usize::from(args.module_offset.is_some())
         + usize::from(args.symbol.is_some());
     ensure!(
         selections == 1,
-        "specify exactly one of --address, --module with --module-offset, or --symbol"
+        "specify exactly one of --initial-break, --address, --module with --module-offset, or --symbol"
     );
+    if args.initial_break {
+        return Ok(StartupBreakpointSpec::InitialBreak);
+    }
     if let Some(address) = args.address.as_deref() {
         return Ok(StartupBreakpointSpec::Address {
             address: parse_debug_address(address)?,
@@ -194,6 +226,9 @@ fn set_startup_breakpoint(
     spec: &StartupBreakpointSpec,
 ) -> anyhow::Result<BreakpointInfo> {
     match spec {
+        StartupBreakpointSpec::InitialBreak => {
+            bail!("initial-break capture does not create a code breakpoint")
+        }
         StartupBreakpointSpec::Address { address } => session.add_code_breakpoint(*address),
         StartupBreakpointSpec::ModuleOffset { module, offset } => {
             let modules = session.modules()?;
@@ -1013,7 +1048,7 @@ pub(super) fn live_capabilities() -> Value {
         "implemented": [
             "dbgeng server",
             "live launch --command-line <cmd> --end detach|terminate",
-            "live startup-break --command-line <cmd> --address <addr>|--module <name> --module-offset <rva>|--symbol <expr>",
+            "live startup-break --command-line <cmd> --initial-break|--address <addr>|--module <name> --module-offset <rva>|--symbol <expr>",
             "live start --command-line <cmd>",
             "live attach --process-id <pid>",
             "dump create --process-id <pid> --output <path>",
@@ -1508,6 +1543,7 @@ mod tests {
     fn startup_breakpoint_requires_exactly_one_location_kind() {
         let args = LiveStartupBreakArgs {
             command_line: "target.exe".to_string(),
+            initial_break: false,
             address: Some("0x140001000".to_string()),
             module: Some("target.exe".to_string()),
             module_offset: Some("0x1000".to_string()),
@@ -1520,6 +1556,7 @@ mod tests {
         assert!(startup_breakpoint_spec(&args).is_err());
 
         let symbol_args = LiveStartupBreakArgs {
+            initial_break: false,
             address: None,
             module: None,
             module_offset: None,
@@ -1531,6 +1568,16 @@ mod tests {
             StartupBreakpointSpec::Symbol {
                 expression: "target!entry".to_string()
             }
+        );
+
+        let initial_break_args = LiveStartupBreakArgs {
+            initial_break: true,
+            symbol: None,
+            ..symbol_args
+        };
+        assert_eq!(
+            startup_breakpoint_spec(&initial_break_args).unwrap(),
+            StartupBreakpointSpec::InitialBreak
         );
     }
 }

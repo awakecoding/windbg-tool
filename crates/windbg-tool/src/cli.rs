@@ -662,6 +662,12 @@ struct LiveLaunchArgs {
 struct LiveStartupBreakArgs {
     #[arg(long, help = "Full command line to launch under DbgEng")]
     command_line: String,
+    #[arg(
+        long,
+        conflicts_with_all = ["address", "module", "module_offset", "symbol"],
+        help = "Capture the initial DbgEng break without setting a code breakpoint"
+    )]
+    initial_break: bool,
     #[arg(long, help = "Absolute code address for the breakpoint")]
     address: Option<String>,
     #[arg(

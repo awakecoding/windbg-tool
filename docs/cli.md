@@ -105,6 +105,8 @@ target\debug\windbg-tool.exe --compact live startup-break `
 
 Alternatively specify an absolute `--address`, or a deferred DbgEng `--symbol 'module!symbol'` expression. Deferred symbol breakpoints allow module and symbol loading after process creation. The response includes the initial event, configured breakpoint, an explicit `breakpoint.hit` evidence flag, PID/thread/IP, current module and symbol, core registers, and a bounded stack. A stopped event that does not match the configured breakpoint remains reported as `hit: false`; it is not misrepresented as a breakpoint hit.
 
+Use `--initial-break` when no reliable code breakpoint is available or the host policy rejects breakpoint creation. It captures the initial DbgEng process break without continuing the target and labels that evidence explicitly; it does not claim a code-breakpoint hit.
+
 `--end terminate` is the default for disposable startup probes. Use `--end detach` only when the debuggee should continue after the captured event.
 
 ## Canonical agent debugging commands

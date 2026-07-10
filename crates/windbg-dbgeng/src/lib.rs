@@ -657,16 +657,17 @@ impl DebuggerSession {
 
     pub fn add_code_breakpoint(&self, address: u64) -> anyhow::Result<BreakpointInfo> {
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
-            DEBUG_ANY_ID, DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
+            DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
         };
 
-        let breakpoint = unsafe {
-            self.control
-                .AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)?
-        };
+        let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_CODE)?;
         unsafe {
-            breakpoint.SetOffset(address)?;
-            breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+            breakpoint.SetOffset(address).with_context(|| {
+                format!("DbgEng could not set code breakpoint offset 0x{address:X}")
+            })?;
+            breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .context("DbgEng could not enable code breakpoint")?;
         }
         self.breakpoint_info(&breakpoint)
     }
@@ -677,18 +678,21 @@ impl DebuggerSession {
     ) -> anyhow::Result<BreakpointInfo> {
         use windows::core::PCWSTR;
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
-            DEBUG_ANY_ID, DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
+            DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
         };
 
         let mut expression_wide = expression.encode_utf16().collect::<Vec<_>>();
         expression_wide.push(0);
-        let breakpoint = unsafe {
-            self.control
-                .AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)?
-        };
+        let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_CODE)?;
         unsafe {
-            breakpoint.SetOffsetExpressionWide(PCWSTR(expression_wide.as_ptr()))?;
-            breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+            breakpoint
+                .SetOffsetExpressionWide(PCWSTR(expression_wide.as_ptr()))
+                .with_context(|| {
+                    format!("DbgEng could not set code breakpoint expression '{expression}'")
+                })?;
+            breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .context("DbgEng could not enable code breakpoint")?;
         }
         self.breakpoint_info(&breakpoint)
     }
@@ -700,13 +704,10 @@ impl DebuggerSession {
         access_type: u32,
     ) -> anyhow::Result<BreakpointInfo> {
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
-            DEBUG_ANY_ID, DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_ENABLED,
+            DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_ENABLED,
         };
 
-        let breakpoint = unsafe {
-            self.control
-                .AddBreakpoint2(DEBUG_BREAKPOINT_DATA, DEBUG_ANY_ID)?
-        };
+        let breakpoint = self.add_compatible_breakpoint(DEBUG_BREAKPOINT_DATA)?;
         unsafe {
             breakpoint.SetOffset(address)?;
             breakpoint.SetDataParameters(size, access_type)?;
@@ -787,6 +788,29 @@ impl DebuggerSession {
                 .GetModuleNameStringWide(which, index, base_address, Some(buffer), size)
         })
         .ok()
+    }
+
+    fn add_compatible_breakpoint(
+        &self,
+        break_type: u32,
+    ) -> anyhow::Result<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugBreakpoint2>
+    {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_ANY_ID;
+
+        match unsafe { self.control.AddBreakpoint2(break_type, DEBUG_ANY_ID) } {
+            Ok(breakpoint) => Ok(breakpoint),
+            Err(modern_error) => unsafe {
+                self.control
+                    .AddBreakpoint(break_type, DEBUG_ANY_ID)
+                    .and_then(|breakpoint| breakpoint.cast())
+            }
+            .with_context(|| {
+                format!(
+                    "DbgEng could not add breakpoint type {break_type}; AddBreakpoint2 failed first: {modern_error}"
+                )
+            }),
+        }
     }
 
     fn module_info(&self, index: u32, base_address: u64) -> ModuleInfo {
@@ -1090,11 +1114,14 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
     let system_objects: IDebugSystemObjects = client.cast()?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
-        client.CreateProcessWide(
-            0,
-            PCWSTR(command_line.as_ptr()),
-            DEBUG_PROCESS_ONLY_THIS_PROCESS,
-        )?;
+        // DbgEng can mutate the command buffer; command_line is owned and remains live for the call.
+        client
+            .CreateProcessWide(
+                0,
+                PCWSTR(command_line.as_ptr()),
+                DEBUG_PROCESS_ONLY_THIS_PROCESS,
+            )
+            .context("DbgEng CreateProcessWide failed")?;
         control.WaitForEvent(
             windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT,
             options.initial_break_timeout_ms,
