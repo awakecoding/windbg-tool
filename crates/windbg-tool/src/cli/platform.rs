@@ -212,6 +212,8 @@ pub(super) fn run_live_startup_break(
 
 const STARTUP_PROFILE_CORECLR_MODULE: &str = "coreclr.dll";
 const STARTUP_PROFILE_MAX_MODULE_IDENTITIES: usize = 128;
+const STARTUP_PROFILE_MAX_FIRST_SEEN_MODULES: usize = 32;
+const STARTUP_PROFILE_MAX_RANKED_GAPS: usize = 8;
 
 #[derive(Debug, Clone, Serialize)]
 struct StartupProfileModule {
@@ -245,6 +247,45 @@ struct StartupProfilePhase {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct StartupProfileEventReference {
+    index: usize,
+    kind: String,
+    observed_elapsed_ms: u64,
+    resumed_wall_elapsed_ms: u64,
+    thread_system_id: u32,
+    module: Option<StartupProfileModule>,
+    description: Option<String>,
+    exception_code: Option<String>,
+    exception_first_chance: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupProfileGap {
+    rank: usize,
+    elapsed_ms: u64,
+    start: StartupProfileEventReference,
+    end: StartupProfileEventReference,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupProfileExcludedGap {
+    start: StartupProfileEventReference,
+    end: StartupProfileEventReference,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct StartupProfileCompletion {
+    requested_module: Option<String>,
+    settle_ms: Option<u32>,
+    status: String,
+    module_load: Option<StartupProfileEventReference>,
+    quiet_resumed_elapsed_ms: Option<u64>,
+    detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct StartupProfileRun {
     run: u32,
     status: String,
@@ -254,6 +295,10 @@ struct StartupProfileRun {
     event_filters: Value,
     timeline: Vec<StartupProfileEvent>,
     phase_durations: Vec<StartupProfilePhase>,
+    completion: StartupProfileCompletion,
+    lifecycle_summary: Value,
+    largest_observed_gaps: Vec<StartupProfileGap>,
+    gaps_excluded_from_ranking: Vec<StartupProfileExcludedGap>,
     counts: Value,
     coverage: Value,
     cleanup: Value,
@@ -269,6 +314,15 @@ pub(super) fn run_live_startup_profile(
         .as_deref()
         .map(validate_module_load_filter)
         .transpose()?;
+    let completion_module = args
+        .completion_module
+        .as_deref()
+        .map(validate_module_load_filter)
+        .transpose()?;
+    let observed_phase_module = phase_module
+        .as_deref()
+        .or(completion_module.as_deref())
+        .map(ToOwned::to_owned);
     ensure!(
         args.runs == 1 || matches!(end, LiveLaunchEnd::Terminate),
         "--runs greater than one requires --end terminate so a bounded run cannot leave a detached target behind"
@@ -291,10 +345,20 @@ pub(super) fn run_live_startup_profile(
 
     let mut runs = Vec::with_capacity(args.runs as usize);
     let mut completed_runs = Vec::with_capacity(args.runs as usize);
+    let mut completed_runs_with_process_exit = 0usize;
     for run_index in 1..=args.runs {
-        match collect_startup_profile_run(&args, run_index, phase_module.as_deref(), end) {
+        match collect_startup_profile_run(
+            &args,
+            run_index,
+            observed_phase_module.as_deref(),
+            completion_module.as_deref(),
+            end,
+        ) {
             Ok(run) => {
                 if run.status == "completed" {
+                    if run.finish_reason == "exit_process" {
+                        completed_runs_with_process_exit += 1;
+                    }
                     completed_runs.push(run.clone());
                 }
                 let should_stop = run.status != "completed";
@@ -318,7 +382,8 @@ pub(super) fn run_live_startup_profile(
         "workflow": "live_startup_profile",
         "command_line": args.command_line,
         "requested_runs": args.runs,
-        "runs_completed_with_process_exit": completed_runs.len(),
+        "runs_completed": completed_runs.len(),
+        "runs_completed_with_process_exit": completed_runs_with_process_exit,
         "runs": runs,
         "aggregate": startup_profile_aggregate(&completed_runs),
         "target_memory_writes": {
@@ -336,12 +401,15 @@ pub(super) fn run_live_startup_profile(
             "launch_to_create_ms": "Host elapsed time from before DbgEng session creation until windbg-tool observes the DbgEng create-process stop.",
             "phase_elapsed_ms": "Host wall time accumulated only while the target is resumed between observed DbgEng stops. It excludes windbg-tool's intentional stopped-state filter/context work, but includes debugger scheduling and event-delivery latency.",
             "event_timestamps": "Observed when DbgEng returns control to windbg-tool, not target-side instruction timestamps.",
+            "completion_module": "A requested module load is an observable image-load boundary only. It does not establish UI readiness, managed assembly registration, first managed method execution, or successful application initialization.",
+            "quiet_interval": "A requested settle interval establishes only that no configured DbgEng lifecycle stop was observed while the target was resumed for that duration. It does not establish CPU, I/O, UI, or application quiescence.",
             "not_cpu_time": true,
             "regression_interpretation": "Repeated values can identify wall-clock variability or candidates for comparison with a baseline. They do not attribute CPU use or prove a regression."
         },
         "limitations": [
             "DbgEng lifecycle events do not establish managed assembly registration, managed method execution, JIT activity, or CPU attribution.",
             "Debuggee output is not captured into structured JSON because this command does not install an output callback; a target can still inherit the invoking console.",
+            "Largest observed gaps rank only adjacent retained events while the full lifecycle filter set was active. Tail-filter gaps are retained as excluded coverage diagnostics, not ranked evidence.",
             "First-chance exceptions are opt-in because managed startup can generate enough events to consume the bounded timeline."
         ]
     });
@@ -361,6 +429,7 @@ fn collect_startup_profile_run(
     args: &LiveStartupProfileArgs,
     run_index: u32,
     phase_module: Option<&str>,
+    completion_module: Option<&str>,
     end: LiveLaunchEnd,
 ) -> anyhow::Result<StartupProfileRun> {
     let command_started = Instant::now();
@@ -370,8 +439,14 @@ fn collect_startup_profile_run(
         initial_stop: LiveInitialStop::CreateProcessEvent,
     })?;
 
-    let result =
-        collect_startup_profile_stops(&session, args, run_index, phase_module, command_started);
+    let result = collect_startup_profile_stops(
+        &session,
+        args,
+        run_index,
+        phase_module,
+        completion_module,
+        command_started,
+    );
     let cleanup = match &result {
         Ok(run) if run.finish_reason == "exit_process" => Ok(json!({
             "action": "none",
@@ -420,6 +495,7 @@ fn collect_startup_profile_stops(
     args: &LiveStartupProfileArgs,
     run_index: u32,
     phase_module: Option<&str>,
+    completion_module: Option<&str>,
     command_started: Instant,
 ) -> anyhow::Result<StartupProfileRun> {
     let initial_event = session
@@ -445,32 +521,86 @@ fn collect_startup_profile_stops(
 
     let event_filters =
         configure_startup_profile_event_filters(session, args.include_first_chance_exceptions)?;
-    let deadline = Instant::now() + Duration::from_millis(u64::from(args.timeout_ms));
     let mut timeline_truncated = false;
+    let mut event_limit_reached = false;
     let mut tail_filter_commands = Vec::new();
+    let mut tail_filter_started_after_event_index = None;
+    let mut completion = StartupProfileCompletion {
+        requested_module: completion_module.map(ToOwned::to_owned),
+        settle_ms: args.settle_ms,
+        status: if completion_module.is_some() {
+            "waiting_for_module".to_string()
+        } else {
+            "not_requested".to_string()
+        },
+        module_load: None,
+        quiet_resumed_elapsed_ms: None,
+        detail: if completion_module.is_some() {
+            "Waiting for the requested DbgEng module-load event.".to_string()
+        } else {
+            "No early module completion boundary was requested; collecting through exit, timeout, or bounded retention behavior.".to_string()
+        },
+    };
+    let mut quiet_started_at = None;
     let finish_reason = loop {
-        if !timeline_truncated && recording.timeline.len() >= args.max_events as usize - 1 {
+        if completion_module.is_some() {
+            if recording.timeline.len() >= args.max_events as usize {
+                event_limit_reached = true;
+                break "event_limit";
+            }
+        } else if !timeline_truncated && recording.timeline.len() >= args.max_events as usize - 1 {
             tail_filter_commands = configure_startup_profile_exit_tail_filters(
                 session,
                 args.include_first_chance_exceptions,
             )?;
+            tail_filter_started_after_event_index =
+                recording.timeline.last().map(|event| event.index);
             timeline_truncated = true;
         }
-        let remaining = deadline.saturating_duration_since(Instant::now());
+        let remaining =
+            Duration::from_millis(u64::from(args.timeout_ms)).saturating_sub(resumed_elapsed);
         if remaining.is_zero() {
             break "timeout";
         }
+        let wait_budget = quiet_started_at
+            .zip(args.settle_ms)
+            .map(|(started_at, settle_ms)| {
+                Duration::from_millis(u64::from(settle_ms))
+                    .saturating_sub(resumed_elapsed.saturating_sub(started_at))
+            })
+            .unwrap_or(remaining)
+            .min(remaining);
+        ensure!(
+            !wait_budget.is_zero(),
+            "startup-profile computed a zero event wait budget"
+        );
         session.continue_execution()?;
         let resumed_at = Instant::now();
-        let wait_timeout_ms = duration_millis(remaining).clamp(1, u64::from(u32::MAX)) as u32;
+        let wait_timeout_ms = duration_millis(wait_budget).clamp(1, u64::from(u32::MAX)) as u32;
         let wait = session.wait_for_event(wait_timeout_ms)?;
         resumed_elapsed += resumed_at.elapsed();
-        if wait.name.as_deref() == Some("timeout") {
+        let event = (wait.name.as_deref() != Some("timeout"))
+            .then(|| {
+                session
+                    .last_event()
+                    .context("reading a DbgEng lifecycle event")
+            })
+            .transpose()?;
+        if event.as_ref().is_none_or(startup_profile_no_event_sentinel) {
+            if let Some(started_at) = quiet_started_at {
+                let quiet_elapsed = resumed_elapsed.saturating_sub(started_at);
+                if let Some(settle_ms) = args.settle_ms {
+                    if quiet_elapsed >= Duration::from_millis(u64::from(settle_ms)) {
+                        completion.status = "quiet_interval_observed".to_string();
+                        completion.quiet_resumed_elapsed_ms = Some(duration_millis(quiet_elapsed));
+                        completion.detail = "No configured DbgEng lifecycle stop was observed while the target was resumed for the requested settle interval. This is not a UI-ready or target-quiescence signal.".to_string();
+                        break "completion_module_quiet_interval";
+                    }
+                }
+            }
             break "timeout";
         }
-        let event = session
-            .last_event()
-            .context("reading a DbgEng lifecycle event")?;
+        let event = event.expect("a non-timeout DbgEng wait has an event");
         let exiting = event.event_name == "exit_process";
         if !timeline_truncated || exiting {
             record_startup_profile_event(
@@ -482,11 +612,60 @@ fn collect_startup_profile_stops(
             );
         }
         if exiting {
+            if quiet_started_at.is_some() {
+                completion.status = "process_exit_before_quiet_interval".to_string();
+                completion.detail = "DbgEng reported exit_process before the requested lifecycle quiet interval completed.".to_string();
+            } else if completion_module.is_some() && completion.module_load.is_none() {
+                completion.status = "process_exit_before_module".to_string();
+                completion.detail =
+                    "DbgEng reported exit_process before the requested module-load event."
+                        .to_string();
+            }
             break "exit_process";
+        }
+        if completion.module_load.is_none()
+            && completion_module.is_some_and(|module| {
+                startup_profile_event_matches_module(recording.timeline.last(), module)
+            })
+        {
+            completion.module_load = recording
+                .timeline
+                .last()
+                .map(startup_profile_event_reference);
+            if let Some(settle_ms) = args.settle_ms {
+                completion.status = "waiting_for_quiet_interval".to_string();
+                completion.detail = format!(
+                    "Observed the requested module-load boundary; waiting for {settle_ms} ms of target-resumed time without another configured DbgEng lifecycle stop."
+                );
+                quiet_started_at = Some(resumed_elapsed);
+            } else {
+                completion.status = "module_observed".to_string();
+                completion.detail = "Observed the requested DbgEng module-load boundary. This does not establish UI readiness or application initialization completion.".to_string();
+                break "completion_module";
+            }
+        } else if quiet_started_at.is_some() {
+            quiet_started_at = Some(resumed_elapsed);
+            completion.status = "waiting_for_quiet_interval".to_string();
+            completion.detail = "A configured DbgEng lifecycle stop occurred after the completion-module boundary; restarting the observed lifecycle quiet interval.".to_string();
         }
     };
 
     let phase_durations = derive_startup_profile_phases(&recording.timeline, phase_module);
+    if finish_reason == "timeout" && completion_module.is_some() {
+        completion.status = if completion.module_load.is_some() {
+            "quiet_interval_not_observed_before_timeout".to_string()
+        } else {
+            "module_not_observed_before_timeout".to_string()
+        };
+        completion.detail = "The profile target-resumed timeout elapsed before the requested completion condition was observed.".to_string();
+    } else if finish_reason == "event_limit" && completion_module.is_some() {
+        completion.status = if completion.module_load.is_some() {
+            "quiet_interval_not_observed_before_event_limit".to_string()
+        } else {
+            "module_not_observed_before_event_limit".to_string()
+        };
+        completion.detail = "The retained lifecycle event limit was reached before the requested completion condition was observed. The target was not continued with filters disabled, so no quiet interval is inferred.".to_string();
+    }
     let StartupProfileRecording {
         timeline,
         counts,
@@ -500,7 +679,13 @@ fn collect_startup_profile_stops(
     let module_identity_truncated =
         counts.unique_module_identity_count > STARTUP_PROFILE_MAX_MODULE_IDENTITIES;
     let timeline_len = timeline.len();
-    let status = if finish_reason == "exit_process" {
+    let lifecycle_summary = startup_profile_lifecycle_summary(&timeline, phase_module, &completion);
+    let (largest_observed_gaps, gaps_excluded_from_ranking) =
+        rank_startup_profile_observed_gaps(&timeline, tail_filter_started_after_event_index);
+    let status = if matches!(
+        finish_reason,
+        "exit_process" | "completion_module" | "completion_module_quiet_interval"
+    ) {
         "completed"
     } else {
         "incomplete"
@@ -518,11 +703,16 @@ fn collect_startup_profile_stops(
             "timeout_after_create_ms": args.timeout_ms,
             "timeout_clock": "host_monotonic_target_resumed_wall_time",
             "timeline_retention_limit_reached": timeline_truncated,
-            "tail_filter_commands": tail_filter_commands
+            "tail_filter_commands": tail_filter_commands,
+            "tail_filter_started_after_event_index": tail_filter_started_after_event_index
         }),
         event_filters,
+        lifecycle_summary,
+        largest_observed_gaps,
+        gaps_excluded_from_ranking,
         timeline,
         phase_durations,
+        completion,
         counts: json!({
             "module_load_events": counts.module_load_events,
             "module_unload_events": counts.module_unload_events,
@@ -540,6 +730,7 @@ fn collect_startup_profile_stops(
             "timeline_event_limit": args.max_events,
             "timeline_events_returned": timeline_len,
             "timeline_truncated": timeline_truncated,
+            "event_limit_reached": event_limit_reached,
             "truncation_behavior": if timeline_truncated {
                 "After retaining max_events - 1 lifecycle entries, windbg-tool disabled high-volume filters and waited only for exit_process so the final exit boundary remains observable."
             } else {
@@ -547,6 +738,7 @@ fn collect_startup_profile_stops(
             },
             "finished_at_process_exit": finish_reason == "exit_process",
             "phase_module": phase_module,
+            "completion_module": completion_module,
             "first_chance_exceptions_requested": args.include_first_chance_exceptions,
             "stop_context_requested": args.capture_stop_context,
             "stop_contexts_returned": captured_contexts
@@ -634,6 +826,21 @@ fn configure_startup_profile_exit_tail_filters(
         commands.push(command.to_string());
     }
     Ok(commands)
+}
+
+fn startup_profile_no_event_sentinel(event: &windbg_dbgeng::DebuggerEventInfo) -> bool {
+    // DbgEng 10.0.29547 can report S_OK for a bounded wait with no event, then
+    // expose this all-default LastEventInformation record instead of S_FALSE.
+    event.event_type == 0
+        && event.event_name == "unknown"
+        && event.process_system_id == u32::MAX
+        && event.thread_system_id == u32::MAX
+        && event.description.is_none()
+        && event.extra_information_size == 0
+        && event.breakpoint_id.is_none()
+        && event.exception.is_none()
+        && event.module_base.is_none()
+        && event.exit_code.is_none()
 }
 
 fn record_startup_profile_event(
@@ -755,6 +962,255 @@ fn normalize_startup_profile_module(module: ModuleInfo) -> StartupProfileModule 
 
 fn normalize_startup_profile_path(value: &str) -> String {
     value.replace('\\', "/")
+}
+
+fn startup_profile_event_reference(event: &StartupProfileEvent) -> StartupProfileEventReference {
+    StartupProfileEventReference {
+        index: event.index,
+        kind: event.kind.clone(),
+        observed_elapsed_ms: event.observed_elapsed_ms,
+        resumed_wall_elapsed_ms: event.resumed_wall_elapsed_ms,
+        thread_system_id: event.event.thread_system_id,
+        module: event.module.clone(),
+        description: event.event.description.clone(),
+        exception_code: event
+            .event
+            .exception
+            .as_ref()
+            .map(|exception| format!("0x{:08X}", exception.code)),
+        exception_first_chance: event
+            .event
+            .exception
+            .as_ref()
+            .map(|exception| exception.first_chance),
+    }
+}
+
+fn startup_profile_event_matches_module(
+    event: Option<&StartupProfileEvent>,
+    requested_module: &str,
+) -> bool {
+    event.is_some_and(|event| {
+        event.kind == "load_module"
+            && event.module.as_ref().is_some_and(|module| {
+                [
+                    module.basename.as_deref(),
+                    module.module_name.as_deref(),
+                    module.image_path.as_deref(),
+                ]
+                .into_iter()
+                .flatten()
+                .any(|candidate| startup_profile_module_name_matches(candidate, requested_module))
+            })
+    })
+}
+
+fn startup_profile_lifecycle_summary(
+    timeline: &[StartupProfileEvent],
+    phase_module: Option<&str>,
+    completion: &StartupProfileCompletion,
+) -> Value {
+    let first = timeline.first().map(startup_profile_event_reference);
+    let last = timeline.last().map(startup_profile_event_reference);
+    let first_module_load = timeline
+        .iter()
+        .find(|event| event.kind == "load_module")
+        .map(startup_profile_event_reference);
+    let last_module_load = timeline
+        .iter()
+        .rfind(|event| event.kind == "load_module")
+        .map(startup_profile_event_reference);
+    let first_coreclr_load =
+        find_startup_profile_module_event(timeline, STARTUP_PROFILE_CORECLR_MODULE)
+            .map(startup_profile_event_reference);
+    let first_phase_module_load = phase_module
+        .and_then(|module| find_startup_profile_module_event(timeline, module))
+        .map(startup_profile_event_reference);
+    let first_thread_start = timeline
+        .iter()
+        .find(|event| event.kind == "create_thread")
+        .map(startup_profile_event_reference);
+    let last_thread_start = timeline
+        .iter()
+        .rfind(|event| event.kind == "create_thread")
+        .map(startup_profile_event_reference);
+    let first_thread_exit = timeline
+        .iter()
+        .find(|event| event.kind == "exit_thread")
+        .map(startup_profile_event_reference);
+    let last_thread_exit = timeline
+        .iter()
+        .rfind(|event| event.kind == "exit_thread")
+        .map(startup_profile_event_reference);
+    let first_exception = timeline
+        .iter()
+        .find(|event| event.kind == "exception")
+        .map(startup_profile_event_reference);
+    let last_exception = timeline
+        .iter()
+        .rfind(|event| event.kind == "exception")
+        .map(startup_profile_event_reference);
+    let process_exit = timeline
+        .iter()
+        .find(|event| event.kind == "exit_process")
+        .map(startup_profile_event_reference);
+
+    let mut seen = BTreeSet::new();
+    let mut first_seen_modules = Vec::new();
+    let mut runtime_loader_modules = Vec::new();
+    let mut total_unique_modules = 0usize;
+    for event in timeline.iter().filter(|event| event.kind == "load_module") {
+        let Some(module) = event.module.as_ref() else {
+            continue;
+        };
+        let Some(identity) = module.basename.as_deref().or(module.module_name.as_deref()) else {
+            continue;
+        };
+        if !seen.insert(identity.to_ascii_lowercase()) {
+            continue;
+        }
+        total_unique_modules += 1;
+        let classification = startup_profile_module_classification(module, phase_module);
+        let value = json!({
+            "classification": classification,
+            "event": startup_profile_event_reference(event)
+        });
+        if classification == "runtime_loader" {
+            runtime_loader_modules.push(value.clone());
+        }
+        if first_seen_modules.len() < STARTUP_PROFILE_MAX_FIRST_SEEN_MODULES {
+            first_seen_modules.push(value);
+        }
+    }
+    let first_seen_returned = first_seen_modules.len();
+
+    json!({
+        "first_observed_event": first,
+        "last_observed_event": last,
+        "process": {
+            "create": timeline
+                .iter()
+                .find(|event| event.kind == "create_process")
+                .map(startup_profile_event_reference),
+            "exit": process_exit,
+            "exit_observed": timeline.iter().any(|event| event.kind == "exit_process")
+        },
+        "modules": {
+            "first_load": first_module_load,
+            "last_load": last_module_load,
+            "first_coreclr_load": first_coreclr_load,
+            "first_selected_phase_module_load": first_phase_module_load,
+            "first_seen": first_seen_modules,
+            "first_seen_returned": first_seen_returned,
+            "first_seen_total_unique": total_unique_modules,
+            "first_seen_truncated": total_unique_modules > STARTUP_PROFILE_MAX_FIRST_SEEN_MODULES,
+            "runtime_loader_first_seen": runtime_loader_modules
+        },
+        "threads": {
+            "first_start": first_thread_start,
+            "last_start": last_thread_start,
+            "first_exit": first_thread_exit,
+            "last_exit": last_thread_exit
+        },
+        "exceptions": {
+            "first": first_exception,
+            "last": last_exception,
+            "status": if timeline.iter().any(|event| event.kind == "exception") {
+                "observed"
+            } else {
+                "not_observed"
+            }
+        },
+        "debuggee_output": {
+            "status": "not_captured_no_output_callback",
+            "detail": "DbgEng output callbacks are not installed by this event-only profiler. The target can still inherit the invoking console."
+        },
+        "completion_boundary": completion
+    })
+}
+
+fn startup_profile_module_classification(
+    module: &StartupProfileModule,
+    phase_module: Option<&str>,
+) -> &'static str {
+    let candidates = [
+        module.basename.as_deref(),
+        module.module_name.as_deref(),
+        module.image_path.as_deref(),
+    ];
+    if [
+        "coreclr.dll",
+        "hostfxr.dll",
+        "hostpolicy.dll",
+        "clrjit.dll",
+        "mscoree.dll",
+    ]
+    .iter()
+    .any(|runtime_module| {
+        candidates
+            .into_iter()
+            .flatten()
+            .any(|candidate| startup_profile_module_name_matches(candidate, runtime_module))
+    }) {
+        "runtime_loader"
+    } else if phase_module.is_some_and(|phase_module| {
+        candidates
+            .into_iter()
+            .flatten()
+            .any(|candidate| startup_profile_module_name_matches(candidate, phase_module))
+    }) {
+        "selected_phase_module"
+    } else {
+        "other_module"
+    }
+}
+
+fn rank_startup_profile_observed_gaps(
+    timeline: &[StartupProfileEvent],
+    tail_filter_started_after_event_index: Option<usize>,
+) -> (Vec<StartupProfileGap>, Vec<StartupProfileExcludedGap>) {
+    let mut gaps = Vec::new();
+    let mut excluded = Vec::new();
+    for pair in timeline.windows(2) {
+        let [start, end] = pair else {
+            continue;
+        };
+        let Some(elapsed_ms) = end
+            .resumed_wall_elapsed_ms
+            .checked_sub(start.resumed_wall_elapsed_ms)
+        else {
+            continue;
+        };
+        let start = startup_profile_event_reference(start);
+        let end = startup_profile_event_reference(end);
+        if tail_filter_started_after_event_index.is_some_and(|tail_start| start.index >= tail_start)
+        {
+            excluded.push(StartupProfileExcludedGap {
+                start,
+                end,
+                reason: "DbgEng high-volume lifecycle filters were disabled for the exit-only tail, so intervening events may be omitted.".to_string(),
+            });
+            continue;
+        }
+        gaps.push(StartupProfileGap {
+            rank: 0,
+            elapsed_ms,
+            start,
+            end,
+            detail: "Target-resumed host wall time between adjacent observed DbgEng lifecycle stops while the full lifecycle filter set was active; not CPU time.".to_string(),
+        });
+    }
+    gaps.sort_by(|left, right| {
+        right
+            .elapsed_ms
+            .cmp(&left.elapsed_ms)
+            .then_with(|| left.start.index.cmp(&right.start.index))
+    });
+    gaps.truncate(STARTUP_PROFILE_MAX_RANKED_GAPS);
+    for (index, gap) in gaps.iter_mut().enumerate() {
+        gap.rank = index + 1;
+    }
+    (gaps, excluded)
 }
 
 fn derive_startup_profile_phases(
@@ -889,6 +1345,8 @@ fn unavailable_startup_profile_phase(name: &str, detail: &str) -> StartupProfile
 fn startup_profile_aggregate(completed_runs: &[StartupProfileRun]) -> Value {
     let mut values_by_phase = BTreeMap::<String, Vec<u64>>::new();
     let mut phase_occurrences = BTreeMap::<String, usize>::new();
+    let mut largest_gap_values = Vec::new();
+    let mut largest_gap_boundaries = BTreeMap::<String, usize>::new();
     for run in completed_runs {
         for phase in &run.phase_durations {
             *phase_occurrences.entry(phase.name.clone()).or_default() += 1;
@@ -900,6 +1358,12 @@ fn startup_profile_aggregate(completed_runs: &[StartupProfileRun]) -> Value {
                         .push(value);
                 }
             }
+        }
+        if let Some(gap) = run.largest_observed_gaps.first() {
+            largest_gap_values.push(gap.elapsed_ms);
+            *largest_gap_boundaries
+                .entry(startup_profile_gap_boundary_name(gap))
+                .or_default() += 1;
         }
     }
     let phases = phase_occurrences
@@ -932,7 +1396,62 @@ fn startup_profile_aggregate(completed_runs: &[StartupProfileRun]) -> Value {
     json!({
         "completed_run_count": completed_runs.len(),
         "phase_wall_time_ms": phases,
-        "coverage": "Only runs that reached exit_process contribute samples. A missing boundary remains missing rather than inferred."
+        "largest_observed_inter_event_gap_wall_time_ms": startup_profile_gap_distribution(
+            largest_gap_values,
+            largest_gap_boundaries
+        ),
+        "coverage": "Only runs that reached the requested completion condition contribute samples. A missing boundary remains missing rather than inferred."
+    })
+}
+
+fn startup_profile_gap_boundary_name(gap: &StartupProfileGap) -> String {
+    format!(
+        "{} -> {}",
+        startup_profile_event_boundary_name(&gap.start),
+        startup_profile_event_boundary_name(&gap.end)
+    )
+}
+
+fn startup_profile_event_boundary_name(event: &StartupProfileEventReference) -> String {
+    let module = event
+        .module
+        .as_ref()
+        .and_then(|module| module.basename.as_deref().or(module.module_name.as_deref()));
+    match module {
+        Some(module) => format!("{}:{module}", event.kind),
+        None => event.kind.clone(),
+    }
+}
+
+fn startup_profile_gap_distribution(
+    mut values: Vec<u64>,
+    boundary_counts: BTreeMap<String, usize>,
+) -> Value {
+    values.sort_unstable();
+    let sample_count = values.len();
+    let median_ms = if sample_count == 0 {
+        None
+    } else if sample_count % 2 == 1 {
+        Some(values[sample_count / 2] as f64)
+    } else {
+        Some((values[sample_count / 2 - 1] as f64 + values[sample_count / 2] as f64) / 2.0)
+    };
+    let boundaries = boundary_counts
+        .into_iter()
+        .map(|(boundary, occurrence_count)| {
+            json!({
+                "boundary": boundary,
+                "occurrence_count": occurrence_count
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "sample_count": sample_count,
+        "min_ms": values.first(),
+        "median_ms": median_ms,
+        "max_ms": values.last(),
+        "largest_gap_boundaries": boundaries,
+        "detail": "One largest ranked adjacent event gap is sampled from each completed run. Gaps with tail-filtered coverage are excluded."
     })
 }
 
@@ -2674,7 +3193,7 @@ pub(super) fn live_capabilities() -> Value {
             "dbgeng server",
             "live launch --command-line <cmd> --end detach|terminate",
             "live startup-break --command-line <cmd> --initial-break|--address <addr>|--module <name> --module-offset <rva>|--symbol <expr>",
-            "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>]",
+            "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>] [--completion-module <basename> [--settle-ms <milliseconds>]]",
             "live start --command-line <cmd>",
             "live attach --process-id <pid>",
             "dump create --process-id <pid> --output <path>",
@@ -2697,7 +3216,7 @@ pub(super) fn live_capabilities() -> Value {
             {
                 "feature": "startup profile workflow",
                 "status": "non_invasive_bounded_lifecycle_collection",
-                "notes": "Launches at a create-process event, configures DbgEng lifecycle event filters only, and reports host-monotonic wall-time observations. It sets no software/hardware breakpoint, opens no DAC, and performs no target-memory operation."
+                "notes": "Launches at a create-process event, configures DbgEng lifecycle event filters only, and reports host-monotonic wall-time observations. A requested completion module can stop at an observed image load or after a bounded observed lifecycle-quiet interval. It sets no software/hardware breakpoint, opens no DAC, and performs no target-memory operation."
             },
             {
                 "feature": "managed method breakpoint workflow",
@@ -3372,6 +3891,17 @@ mod tests {
                     detail: "test".to_string(),
                 })
                 .collect(),
+            completion: StartupProfileCompletion {
+                requested_module: None,
+                settle_ms: None,
+                status: "not_requested".to_string(),
+                module_load: None,
+                quiet_resumed_elapsed_ms: None,
+                detail: "test".to_string(),
+            },
+            lifecycle_summary: json!({}),
+            largest_observed_gaps: Vec::new(),
+            gaps_excluded_from_ranking: Vec::new(),
             counts: json!({}),
             coverage: json!({}),
             cleanup: json!({}),
@@ -3380,11 +3910,20 @@ mod tests {
 
     #[test]
     fn startup_profile_aggregate_reports_wall_time_median_without_regression_claim() {
-        let runs = [
+        let mut runs = [
             startup_profile_run_for_test(1, &[10]),
             startup_profile_run_for_test(2, &[30]),
             startup_profile_run_for_test(3, &[20]),
         ];
+        let gap_timeline = vec![
+            startup_profile_event_for_test(0, "create_process", 0, 0, None),
+            startup_profile_event_for_test(1, "load_module", 10, 10, Some("coreclr.dll")),
+            startup_profile_event_for_test(2, "create_thread", 40, 40, None),
+        ];
+        let gaps = rank_startup_profile_observed_gaps(&gap_timeline, None).0;
+        for run in &mut runs {
+            run.largest_observed_gaps = gaps.clone();
+        }
 
         let aggregate = startup_profile_aggregate(&runs);
         let phase = &aggregate["phase_wall_time_ms"][0];
@@ -3395,6 +3934,39 @@ mod tests {
         assert_eq!(phase["median_ms"], 20.0);
         assert_eq!(phase["max_ms"], 30);
         assert_eq!(phase["regression_assessment"]["status"], "no_baseline");
+        assert_eq!(
+            aggregate["largest_observed_inter_event_gap_wall_time_ms"]["sample_count"],
+            3
+        );
+        assert_eq!(
+            aggregate["largest_observed_inter_event_gap_wall_time_ms"]["median_ms"],
+            30.0
+        );
+    }
+
+    #[test]
+    fn startup_profile_aggregate_samples_one_largest_gap_per_run() {
+        let mut run = startup_profile_run_for_test(1, &[10]);
+        run.phase_durations.push(StartupProfilePhase {
+            name: "coreclr_load_to_selected_module_load".to_string(),
+            status: "observed".to_string(),
+            elapsed_ms: Some(5),
+            start_event_index: Some(1),
+            end_event_index: Some(2),
+            detail: "test".to_string(),
+        });
+        let timeline = vec![
+            startup_profile_event_for_test(0, "create_process", 0, 0, None),
+            startup_profile_event_for_test(1, "load_module", 10, 10, Some("coreclr.dll")),
+        ];
+        run.largest_observed_gaps = rank_startup_profile_observed_gaps(&timeline, None).0;
+
+        let aggregate = startup_profile_aggregate(&[run]);
+
+        assert_eq!(
+            aggregate["largest_observed_inter_event_gap_wall_time_ms"]["sample_count"],
+            1
+        );
     }
 
     #[test]
@@ -3420,5 +3992,113 @@ mod tests {
             "ManagedBreakpointFixture",
             "ManagedBreakpointFixture.dll"
         ));
+    }
+
+    #[test]
+    fn startup_profile_recognizes_dbgeng_no_event_sentinel() {
+        let sentinel = windbg_dbgeng::DebuggerEventInfo {
+            event_type: 0,
+            event_name: "unknown".to_string(),
+            process_system_id: u32::MAX,
+            thread_system_id: u32::MAX,
+            description: None,
+            extra_information_size: 0,
+            breakpoint_id: None,
+            exception: None,
+            module_base: None,
+            exit_code: None,
+        };
+
+        assert!(startup_profile_no_event_sentinel(&sentinel));
+
+        let real_event = windbg_dbgeng::DebuggerEventInfo {
+            event_name: "create_thread".to_string(),
+            ..sentinel
+        };
+        assert!(!startup_profile_no_event_sentinel(&real_event));
+    }
+
+    #[test]
+    fn startup_profile_lifecycle_summary_classifies_runtime_and_selected_modules() {
+        let mut exception = startup_profile_event_for_test(5, "exception", 100, 100, None);
+        exception.event.exception = Some(windbg_dbgeng::DebuggerExceptionInfo {
+            code: 0xc000_0005,
+            flags: 0,
+            address: 0x1234,
+            first_chance: true,
+            parameters: vec![],
+        });
+        let timeline = vec![
+            startup_profile_event_for_test(0, "create_process", 5, 0, None),
+            startup_profile_event_for_test(1, "load_module", 10, 5, Some("hostfxr.dll")),
+            startup_profile_event_for_test(2, "load_module", 15, 10, Some("coreclr.dll")),
+            startup_profile_event_for_test(
+                3,
+                "load_module",
+                20,
+                15,
+                Some("RemoteDesktopManager.dll"),
+            ),
+            startup_profile_event_for_test(4, "create_thread", 25, 20, None),
+            exception,
+        ];
+        let completion = StartupProfileCompletion {
+            requested_module: Some("RemoteDesktopManager.dll".to_string()),
+            settle_ms: Some(500),
+            status: "waiting_for_quiet_interval".to_string(),
+            module_load: Some(startup_profile_event_reference(&timeline[3])),
+            quiet_resumed_elapsed_ms: None,
+            detail: "test".to_string(),
+        };
+
+        let summary = startup_profile_lifecycle_summary(
+            &timeline,
+            Some("RemoteDesktopManager.dll"),
+            &completion,
+        );
+
+        assert_eq!(
+            summary["modules"]["first_coreclr_load"]["module"]["basename"],
+            "coreclr.dll"
+        );
+        assert_eq!(
+            summary["modules"]["first_selected_phase_module_load"]["module"]["basename"],
+            "RemoteDesktopManager.dll"
+        );
+        assert_eq!(
+            summary["modules"]["runtime_loader_first_seen"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(summary["threads"]["first_start"]["index"], 4);
+        assert_eq!(
+            summary["exceptions"]["first"]["exception_code"],
+            "0xC0000005"
+        );
+        assert_eq!(
+            summary["debuggee_output"]["status"],
+            "not_captured_no_output_callback"
+        );
+    }
+
+    #[test]
+    fn startup_profile_ranks_only_full_filter_observed_gaps() {
+        let timeline = vec![
+            startup_profile_event_for_test(0, "create_process", 1, 0, None),
+            startup_profile_event_for_test(1, "load_module", 11, 10, Some("coreclr.dll")),
+            startup_profile_event_for_test(2, "create_thread", 61, 60, None),
+            startup_profile_event_for_test(3, "exit_process", 161, 160, None),
+        ];
+
+        let (gaps, excluded) = rank_startup_profile_observed_gaps(&timeline, Some(2));
+
+        assert_eq!(gaps.len(), 2);
+        assert_eq!(gaps[0].elapsed_ms, 50);
+        assert_eq!(gaps[0].start.index, 1);
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].start.index, 2);
+        assert_eq!(excluded[0].end.index, 3);
     }
 }

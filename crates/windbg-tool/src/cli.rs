@@ -761,6 +761,20 @@ struct LiveStartupProfileArgs {
     phase_module: Option<String>,
     #[arg(
         long,
+        value_name = "MODULE",
+        help = "Finish the startup observation when this module-load event is observed; does not imply UI readiness"
+    )]
+    completion_module: Option<String>,
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        requires = "completion_module",
+        value_parser = clap::value_parser!(u32).range(1..=60000),
+        help = "After --completion-module, require this much target-resumed time without another configured lifecycle stop before completing; only an observed lifecycle quiet interval"
+    )]
+    settle_ms: Option<u32>,
+    #[arg(
+        long,
         help = "Request first-chance exception stops in addition to lifecycle events; can substantially increase event volume"
     )]
     include_first_chance_exceptions: bool,
@@ -791,9 +805,9 @@ struct LiveStartupProfileArgs {
     output: Option<PathBuf>,
     #[arg(
         long,
-        default_value = "terminate",
+        default_value = "detach",
         value_parser = ["detach", "terminate"],
-        help = "Action if the target has not exited at its event or time bound"
+        help = "Action if the target has not exited at its completion or time bound; terminate is explicit"
     )]
     end: String,
 }
@@ -4626,7 +4640,7 @@ fn discover_manifest() -> Value {
             "live": [
                 "live capabilities",
                 "live launch --command-line <cmd> --end detach|terminate",
-                "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>]",
+                "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>] [--completion-module <basename> [--settle-ms <milliseconds>]]",
                 "live start --command-line <cmd>",
                 "live attach --process-id <pid>"
             ],
@@ -5301,7 +5315,7 @@ fn command_metadata() -> Value {
             "session_required": false,
             "cost": "launches_process_and_collects_bounded_lifecycle_events",
             "safety": "live_debugging_changes_target_execution_state_without_target_memory_writes",
-            "bounds": ["--runs 1..10", "--initial-break-timeout-ms", "--timeout-ms", "--max-events", "--max-context-events", "--end detach|terminate"]
+            "bounds": ["--runs 1..10", "--initial-break-timeout-ms", "--timeout-ms", "--max-events", "--completion-module <basename>", "--settle-ms 1..60000 (requires --completion-module)", "--max-context-events", "--end detach|terminate"]
         },
         {
             "command": "live start",

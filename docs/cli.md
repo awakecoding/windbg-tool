@@ -223,7 +223,7 @@ The command reports two host-monotonic measures:
 - `command_to_create_observed_ms` is the wall time from before DbgEng session creation until windbg-tool observes the create-process event.
 - Timeline `resumed_wall_elapsed_ms` and derived `phase_durations` accumulate only while the target is resumed between observed DbgEng stops. This excludes the collector's intentionally stopped filter/configuration/context work, but includes DbgEng scheduling and event-delivery latency.
 
-Neither measure is target CPU time. A module-load timestamp does not identify managed registration, JIT work, or method execution. Repeated runs report min/median/max wall time only for phases whose two event boundaries were observed in runs that reached `exit_process`; no baseline means the output deliberately does not call a value a regression.
+Neither measure is target CPU time. A module-load timestamp does not identify managed registration, JIT work, or method execution. Repeated runs report min/median/max wall time only for phases whose two event boundaries were observed in runs that reached the requested completion condition; no baseline means the output deliberately does not call a value a regression.
 
 Build and profile the source-only fixture without any DAC or breakpoint workflow:
 
@@ -233,17 +233,19 @@ dotnet build "$fixture\ManagedBreakpointFixture.csproj" -c Release
 $report = Join-Path $env:TEMP "windbg-tool-fixture-startup-profile.json"
 
 target\debug\windbg-tool.exe --compact live startup-profile `
-  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
-  --runs 3 `
+  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`" --startup-observation-delay-ms 2000" `
   --phase-module ManagedBreakpointFixture.dll `
+  --completion-module ManagedBreakpointFixture.dll `
+  --settle-ms 250 `
   --initial-break-timeout-ms 30000 `
   --timeout-ms 30000 `
   --max-events 256 `
-  --output $report `
-  --end terminate
+  --output $report
 ```
 
-`--max-events` bounds retained timeline payload rather than forcing a healthy target to terminate. After retaining `max_events - 1` entries, windbg-tool disables the high-volume thread/module filters and waits only for `exit_process`, preserving the final exit boundary in the last slot. The result marks this as `coverage.timeline_truncated: true` and lists the DbgEng `timing.tail_filter_commands`; it makes no claim about events omitted during that exit-only tail. `--end` is used only if the time bound is reached before process exit. A successful run has `status: "completed"`, `finish_reason: "exit_process"`, and `cleanup.status: "not_needed"`. An incomplete run records `timeout` and then applies `--end`; it is excluded from aggregate samples, and a repeated collection stops after that incomplete run. The optional `--capture-stop-context` captures bounded read-only register/module/symbol/stack context on early stops; it can increase observer overhead and is disabled by default.
+`--completion-module <basename>` ends an observation at the matching DbgEng image-load event. It is an image-load boundary only: it is not UI-ready, managed registration, JIT completion, or application initialization. Add `--settle-ms 1..60000` to require a target-resumed interval without a further configured lifecycle stop after that load. Any observed lifecycle stop restarts the interval. A `quiet_interval_observed` result establishes only that bounded DbgEng condition; it does not prove target quiescence, CPU idleness, I/O completion, or UI readiness. If process exit, timeout, or the event limit occurs first, the result stays incomplete and never infers quietness.
+
+`--max-events` bounds retained timeline payload rather than forcing a healthy target to terminate. For a full-lifetime profile without `--completion-module`, windbg-tool retains `max_events - 1` entries, disables high-volume thread/module filters, and waits only for `exit_process`, preserving the final exit boundary in the last slot. The result marks this as `coverage.timeline_truncated: true` and lists the DbgEng `timing.tail_filter_commands`; it makes no claim about events omitted during that exit-only tail. A completion-bound profile instead stops as incomplete at its retention limit, because disabling the lifecycle filters would make a quiet interval unknowable. A single completion-bound run defaults to `--end detach`, so the target can finish normally. Repeated runs require the explicit `--end terminate` cleanup mode to prevent overlapping detached targets. A full-lifetime successful run has `finish_reason: "exit_process"`; a module completion has `finish_reason: "completion_module"`; a quiet completion has `finish_reason: "completion_module_quiet_interval"`. The optional `--capture-stop-context` captures bounded read-only register/module/symbol/stack context on early stops; it can increase observer overhead and is disabled by default.
 
 The important JSON fields are:
 
@@ -257,7 +259,12 @@ The important JSON fields are:
     "dac_bridge": false
   },
   "runs": [{
-    "finish_reason": "exit_process",
+    "finish_reason": "completion_module_quiet_interval",
+    "completion": {
+      "status": "quiet_interval_observed",
+      "requested_module": "ManagedBreakpointFixture.dll",
+      "settle_ms": 250
+    },
     "timeline": [{
       "kind": "load_module",
       "observed_elapsed_ms": 41,
@@ -268,6 +275,13 @@ The important JSON fields are:
       "name": "create_process_to_coreclr_load",
       "status": "observed",
       "elapsed_ms": 10
+    }],
+    "lifecycle_summary": {
+      "debuggee_output": { "status": "not_captured_no_output_callback" }
+    },
+    "largest_observed_gaps": [{
+      "elapsed_ms": 10,
+      "detail": "Target-resumed host wall time between adjacent observed lifecycle stops; not CPU time."
     }]
   }],
   "aggregate": {
@@ -290,27 +304,45 @@ $rdm = 'D:\dev\.copilot\copilot-worktrees\RDM\bookish-winner\Windows\RemoteDeskt
 target\debug\windbg-tool.exe --compact live startup-profile `
   --command-line "`"$rdm`" /AutoCloseAfter:30" `
   --phase-module RemoteDesktopManager.dll `
+  --completion-module RemoteDesktopManager.dll `
+  --settle-ms 500 `
   --initial-break-timeout-ms 30000 `
-  --timeout-ms 90000 `
+  --timeout-ms 30000 `
   --max-events 512 `
-  --end terminate
+  --output (Join-Path $env:TEMP "windbg-tool-rdm-startup-quiet.json")
 ```
 
-Do not add `live startup-break`, `live managed-break`, DAC options, or an endpoint-security workaround to that RDM command. If the initial safe-mode RDM run is blocked or fails, retain its DbgEng error/event evidence and stop rather than retrying or changing protection policy.
+The default detach is intentional for this one completion-bound RDM observation. For a bounded repeated image-load distribution after that initial result, omit `--settle-ms` and use explicit cleanup:
+
+```powershell
+target\debug\windbg-tool.exe --compact live startup-profile `
+  --command-line "`"$rdm`" /AutoCloseAfter:30" `
+  --runs 3 `
+  --phase-module RemoteDesktopManager.dll `
+  --completion-module RemoteDesktopManager.dll `
+  --initial-break-timeout-ms 30000 `
+  --timeout-ms 30000 `
+  --max-events 128 `
+  --end terminate `
+  --output (Join-Path $env:TEMP "windbg-tool-rdm-startup-module-runs-3.json")
+```
+
+`--end terminate` is explicit cleanup for that repeated command, not a startup boundary or a measurement result. Do not add `live startup-break`, `live managed-break`, DAC options, or an endpoint-security workaround to either RDM command. If the initial safe-mode RDM run is blocked or fails, retain its DbgEng error/event evidence and stop rather than retrying or changing protection policy.
 
 ### Observed local RDM lifecycle evidence
 
-The local Release x64 RDM build above completed an event-only profile with `exit_process` code `0` and `target_memory_writes.requested: false`. After that initial run established the safe lifecycle path, three bounded repetitions used `--runs 3 --max-events 128`; each retained 128 events, switched to exit-only tail collection, and reached `exit_process` code `0`.
+The local Release x64 RDM build completed an event-only completion-bound profile with `target_memory_writes.requested: false`, zero structured DbgEng exception stops, and no synthetic `unknown` events. The first single run saw `coreclr.dll` at resumed-wall 438 ms, `RemoteDesktopManager.dll` at 517 ms, later lifecycle events through 534 ms, then an observed 508 ms lifecycle-quiet interval. It detached rather than observing process exit; this is not a UI-ready signal.
+
+The bounded three-run module-boundary collection used explicit `--end terminate` cleanup after each `completion_module` result. It did not observe process exit, so post-module lifetime is intentionally unavailable:
 
 | Observable host-wall phase | Min ms | Median ms | Max ms |
 | --- | ---: | ---: | ---: |
-| command start to create-process observation | 24 | 25 | 165 |
-| create-process to `coreclr.dll` load | 409 | 444 | 606 |
-| `coreclr.dll` load to `RemoteDesktopManager.dll` load | 36 | 41 | 45 |
-| `RemoteDesktopManager.dll` load to exit-process | 49,183 | 53,327 | 65,624 |
-| create-process to exit-process | 49,633 | 53,807 | 66,275 |
+| command start to create-process observation | 5 | 5 | 178 |
+| create-process to `coreclr.dll` load | 423 | 426 | 427 |
+| `coreclr.dll` load to `RemoteDesktopManager.dll` load | 32 | 33 | 34 |
+| `hostpolicy.dll` load to `coreclr.dll` load (largest adjacent observed gap) | 189 | 191 | 192 |
 
-The first observed run found `coreclr.dll` at event index 22 and `RemoteDesktopManager.dll` at index 34. These are observer wall-clock lifecycle intervals, not CPU samples or proof that a specific RDM phase consumed CPU. The longest observable interval is therefore a follow-up wall-time investigation candidate only. One target-console `HttpListenerException (87)` was printed during the repeated collection, while the structured DbgEng records contained zero exception stops and all three runs exited with code `0`; the profile does not diagnose or attribute that application output.
+The RDM image-load boundary occurred at event index 34 in every repeated sample. A separate 500 ms quiet-bound run reached its 256-event limit after post-module UI/graphics-related loader activity, correctly reporting incomplete rather than claiming startup completion. These are observer wall-clock lifecycle intervals, not CPU samples or proof that a specific RDM phase consumed CPU. The largest gap is a follow-up wall-time investigation candidate only.
 
 ### Verified RDM x64 test-VM run
 
