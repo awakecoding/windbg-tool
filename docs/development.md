@@ -63,6 +63,15 @@ Release packages statically link the MSVC C runtime into Rust code with `RUSTFLA
 
 Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
 
+### Publishing a GitHub Release
+
+Run the **Windows packages** workflow with **Run workflow** and enter an unprefixed semantic version such as `0.1.0`. After both package matrix jobs complete, the workflow creates the `v0.1.0` tag at the commit selected for the dispatch and publishes a GitHub Release containing:
+
+- `windbg-tool-windows-x64.zip`
+- `windbg-tool-windows-arm64.zip`
+
+The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP is validated before upload and contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
+
 To smoke-test the packaged MCP server:
 
 ```powershell
