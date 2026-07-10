@@ -88,6 +88,25 @@ To enable synchronous sudo recording, choose **Input Closed** or **Inline** in *
 sudo config --enable disableInput
 ```
 
+## Live startup breakpoints
+
+`live startup-break` is a one-shot native DbgEng workflow: it launches at the initial debug break, configures one code breakpoint, continues the target once, waits for a bounded event, captures JSON context, and then ends the debug session. It does not shell out to CDB or WinDbg.
+
+Use a module basename and RVA when the executable is present at the initial break:
+
+```powershell
+target\debug\windbg-tool.exe --compact live startup-break `
+  --command-line '"C:\Temp\windbg-tool-ttd\rdm\RemoteDesktopManager_x64.exe" /AutoCloseAfter:10' `
+  --module RemoteDesktopManager_x64.exe `
+  --module-offset 0x1000 `
+  --wait-timeout-ms 10000 `
+  --end terminate
+```
+
+Alternatively specify an absolute `--address`, or a deferred DbgEng `--symbol 'module!symbol'` expression. Deferred symbol breakpoints allow module and symbol loading after process creation. The response includes the initial event, configured breakpoint, an explicit `breakpoint.hit` evidence flag, PID/thread/IP, current module and symbol, core registers, and a bounded stack. A stopped event that does not match the configured breakpoint remains reported as `hit: false`; it is not misrepresented as a breakpoint hit.
+
+`--end terminate` is the default for disposable startup probes. Use `--end detach` only when the debuggee should continue after the captured event.
+
 ## Canonical agent debugging commands
 
 Use `debug capabilities` before choosing actions. With no subject it returns a backend matrix for TTD cursors, daemon-owned live/dump targets, and remote process-server plans. With `--session/--cursor` or `--target`, it includes selected-subject status/evidence where available.
@@ -213,7 +232,7 @@ The schema includes curated metadata where available and inferred metadata for o
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
 | Symbol and source triage | `symbols doctor`, `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `dump create`, `dump open`, `dump inspect`, `target dump`, `windbg status` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `dump create`, `dump open`, `dump inspect`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 

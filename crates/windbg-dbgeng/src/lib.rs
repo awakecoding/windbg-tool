@@ -370,10 +370,17 @@ impl DebuggerSession {
     }
 
     pub fn wait_for_event(&self, timeout_ms: u32) -> anyhow::Result<DebuggerExecutionStatus> {
-        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_STATUS_TIMEOUT, DEBUG_WAIT_DEFAULT,
+        };
 
-        unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms)? };
-        Ok(self.execution_status())
+        let wait = unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) };
+        let status = self.execution_status();
+        match wait {
+            Ok(()) => Ok(status),
+            Err(_) if status.raw == Some(DEBUG_STATUS_TIMEOUT) => Ok(status),
+            Err(error) => Err(error.into()),
+        }
     }
 
     pub fn continue_execution(&self) -> anyhow::Result<DebuggerExecutionStatus> {
@@ -512,6 +519,26 @@ impl DebuggerSession {
         Ok(modules)
     }
 
+    pub fn module_by_offset(&self, address: u64) -> anyhow::Result<Option<ModuleInfo>> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_GETMOD_NO_UNLOADED_MODULES;
+
+        let mut index = 0u32;
+        let mut base_address = 0u64;
+        let result = unsafe {
+            self.symbols.GetModuleByOffset2(
+                address,
+                0,
+                DEBUG_GETMOD_NO_UNLOADED_MODULES,
+                Some(&mut index),
+                Some(&mut base_address),
+            )
+        };
+        if result.is_err() {
+            return Ok(None);
+        }
+        Ok(Some(self.module_info(index, base_address)))
+    }
+
     pub fn symbol_by_offset(&self, address: u64) -> anyhow::Result<Option<SymbolInfo>> {
         self.try_symbol_by_offset(address)
     }
@@ -644,6 +671,28 @@ impl DebuggerSession {
         self.breakpoint_info(&breakpoint)
     }
 
+    pub fn add_code_breakpoint_expression(
+        &self,
+        expression: &str,
+    ) -> anyhow::Result<BreakpointInfo> {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_ANY_ID, DEBUG_BREAKPOINT_CODE, DEBUG_BREAKPOINT_ENABLED,
+        };
+
+        let mut expression_wide = expression.encode_utf16().collect::<Vec<_>>();
+        expression_wide.push(0);
+        let breakpoint = unsafe {
+            self.control
+                .AddBreakpoint2(DEBUG_BREAKPOINT_CODE, DEBUG_ANY_ID)?
+        };
+        unsafe {
+            breakpoint.SetOffsetExpressionWide(PCWSTR(expression_wide.as_ptr()))?;
+            breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+        }
+        self.breakpoint_info(&breakpoint)
+    }
+
     pub fn add_data_breakpoint(
         &self,
         address: u64,
@@ -738,6 +787,32 @@ impl DebuggerSession {
                 .GetModuleNameStringWide(which, index, base_address, Some(buffer), size)
         })
         .ok()
+    }
+
+    fn module_info(&self, index: u32, base_address: u64) -> ModuleInfo {
+        ModuleInfo {
+            base_address,
+            module_name: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_MODULE,
+                index,
+                base_address,
+            ),
+            image_name: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_IMAGE,
+                index,
+                base_address,
+            ),
+            loaded_image_name: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_LOADED_IMAGE,
+                index,
+                base_address,
+            ),
+            symbol_file: self.module_name_string(
+                windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODNAME_SYMBOL_FILE,
+                index,
+                base_address,
+            ),
+        }
     }
 
     fn try_symbol_by_offset(&self, address: u64) -> anyhow::Result<Option<SymbolInfo>> {
@@ -859,6 +934,10 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn module_by_offset(&self, _address: u64) -> anyhow::Result<Option<ModuleInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn symbol_by_offset(&self, _address: u64) -> anyhow::Result<Option<SymbolInfo>> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
@@ -884,6 +963,13 @@ impl DebuggerSession {
     }
 
     pub fn add_code_breakpoint(&self, _address: u64) -> anyhow::Result<BreakpointInfo> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn add_code_breakpoint_expression(
+        &self,
+        _expression: &str,
+    ) -> anyhow::Result<BreakpointInfo> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 

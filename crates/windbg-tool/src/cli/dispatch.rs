@@ -45,6 +45,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
         },
         Some(Commands::Live { command }) => match command {
             LiveCommand::Launch(args) => platform::run_live_launch(args, &output),
+            LiveCommand::StartupBreak(args) => platform::run_live_startup_break(args, &output),
             LiveCommand::Start(args) => live_start_and_print(pipe, args, &output).await,
             LiveCommand::Attach(args) => live_attach_and_print(pipe, args, &output).await,
             LiveCommand::Capabilities => print_value(platform::live_capabilities(), &output),

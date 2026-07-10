@@ -273,6 +273,10 @@ enum LiveCommand {
         about = "Launch a process under DbgEng, wait for the initial event, then detach or terminate"
     )]
     Launch(LiveLaunchArgs),
+    #[command(
+        about = "Launch under DbgEng, set an address/module-RVA/symbol breakpoint, and emit bounded stop context"
+    )]
+    StartupBreak(LiveStartupBreakArgs),
     #[command(about = "Launch a process under DbgEng and keep it as a daemon-owned live target")]
     Start(LiveSessionStartArgs),
     #[command(about = "Attach DbgEng to a process and keep it as a daemon-owned live target")]
@@ -651,6 +655,38 @@ struct LiveLaunchArgs {
     #[arg(long, default_value_t = 5000)]
     initial_break_timeout_ms: u32,
     #[arg(long, default_value = "detach", value_parser = ["detach", "terminate"])]
+    end: String,
+}
+
+#[derive(Debug, Args)]
+struct LiveStartupBreakArgs {
+    #[arg(long, help = "Full command line to launch under DbgEng")]
+    command_line: String,
+    #[arg(long, help = "Absolute code address for the breakpoint")]
+    address: Option<String>,
+    #[arg(
+        long,
+        help = "Loaded module basename or image path for an RVA breakpoint"
+    )]
+    module: Option<String>,
+    #[arg(
+        long,
+        requires = "module",
+        help = "RVA added to --module's loaded base address"
+    )]
+    module_offset: Option<String>,
+    #[arg(
+        long,
+        help = "DbgEng symbol expression; remains deferred until its module and symbol resolve"
+    )]
+    symbol: Option<String>,
+    #[arg(long, default_value_t = 5000)]
+    initial_break_timeout_ms: u32,
+    #[arg(long, default_value_t = 10000)]
+    wait_timeout_ms: u32,
+    #[arg(long, default_value_t = 16)]
+    max_frames: u32,
+    #[arg(long, default_value = "terminate", value_parser = ["detach", "terminate"])]
     end: String,
 }
 
@@ -4333,6 +4369,7 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
             | "dump create"
             | "live capabilities"
             | "live launch"
+            | "live startup-break"
             | "breakpoint capabilities"
             | "datamodel capabilities"
     );
@@ -5057,6 +5094,15 @@ fn command_metadata() -> Value {
             "cost": "launches_process",
             "safety": "live_debugging_changes_target_execution_state",
             "bounds": ["--initial-break-timeout-ms", "--end detach|terminate"]
+        },
+        {
+            "command": "live startup-break",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "launches_process_and_waits_for_bounded_debug_event",
+            "safety": "live_debugging_changes_target_execution_state",
+            "bounds": ["--initial-break-timeout-ms", "--wait-timeout-ms", "--max-frames", "--end detach|terminate"]
         },
         {
             "command": "live start",

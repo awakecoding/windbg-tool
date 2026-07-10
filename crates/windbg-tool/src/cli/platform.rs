@@ -10,8 +10,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 use windbg_dbgeng::{
-    live_launch_initial_break, open_dump_session, start_process_server, write_process_dump,
-    DumpKind, DumpOpenOptions, DumpWriteOptions, LiveLaunchEnd, LiveLaunchOptions,
+    launch_live_session, live_launch_initial_break, open_dump_session, start_process_server,
+    write_process_dump, BreakpointInfo, DebuggerSession, DumpKind, DumpOpenOptions,
+    DumpWriteOptions, LiveLaunchEnd, LiveLaunchOptions, LiveLaunchSessionOptions, ModuleInfo,
     ProcessDumpOptions, ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
@@ -28,7 +29,8 @@ use windows::Win32::System::Threading::{
 use super::output::{print_value, OutputOptions};
 use super::{
     CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
-    TraceRecordArgs, TraceRecordProfile, TraceReplayCpuSupport, WindbgCommand,
+    LiveStartupBreakArgs, TraceRecordArgs, TraceRecordProfile, TraceReplayCpuSupport,
+    WindbgCommand,
 };
 
 pub(super) fn run_dbgeng_server(
@@ -63,6 +65,198 @@ pub(super) fn run_live_launch(args: LiveLaunchArgs, output: &OutputOptions) -> a
         }),
         output,
     )
+}
+
+pub(super) fn run_live_startup_break(
+    args: LiveStartupBreakArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    let end = parse_live_launch_end(&args.end)?;
+    let breakpoint_spec = startup_breakpoint_spec(&args)?;
+    let session = launch_live_session(LiveLaunchSessionOptions {
+        command_line: args.command_line.clone(),
+        initial_break_timeout_ms: args.initial_break_timeout_ms,
+    })?;
+
+    let result = (|| {
+        let initial_event = session.summary();
+        let requested_breakpoint = set_startup_breakpoint(&session, &breakpoint_spec)?;
+        let continued = session.continue_execution()?;
+        let event = session.wait_for_event(args.wait_timeout_ms)?;
+        let registers = session.core_registers()?;
+        let instruction_offset = registers.instruction_offset;
+        let current_module = instruction_offset
+            .map(|address| session.module_by_offset(address))
+            .transpose()?
+            .flatten();
+        let current_symbol = instruction_offset
+            .map(|address| session.symbol_by_offset(address))
+            .transpose()?
+            .flatten();
+        let configured_breakpoint = session
+            .list_breakpoints()?
+            .into_iter()
+            .find(|breakpoint| breakpoint.id == requested_breakpoint.id);
+        let breakpoint_hit = instruction_offset
+            .zip(
+                configured_breakpoint
+                    .as_ref()
+                    .map(|breakpoint| breakpoint.offset),
+            )
+            .is_some_and(|(instruction_offset, breakpoint_offset)| {
+                event.name.as_deref() == Some("break") && instruction_offset == breakpoint_offset
+            });
+
+        Ok(json!({
+            "workflow": "live_startup_break",
+            "command_line": args.command_line,
+            "breakpoint_spec": breakpoint_spec,
+            "initial_event": initial_event,
+            "continued": continued,
+            "event": event,
+            "breakpoint": {
+                "requested": requested_breakpoint,
+                "configured": configured_breakpoint,
+                "hit": breakpoint_hit,
+                "hit_evidence": if breakpoint_hit {
+                    "current instruction pointer equals the configured breakpoint offset"
+                } else {
+                    "DbgEng stopped, but its current instruction pointer did not match the configured breakpoint offset"
+                }
+            },
+            "context": {
+                "target": session.summary(),
+                "registers": registers,
+                "instruction_pointer": instruction_offset,
+                "current_module": current_module,
+                "current_symbol": current_symbol,
+                "stack": session.stack_trace(args.max_frames)?,
+                "stack_frame_limit": args.max_frames
+            },
+            "end": end
+        }))
+    })();
+
+    let cleanup = match end {
+        LiveLaunchEnd::Detach => session.detach(),
+        LiveLaunchEnd::Terminate => session.terminate(),
+    };
+    match (result, cleanup) {
+        (Ok(result), Ok(())) => print_value(result, output),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum StartupBreakpointSpec {
+    Address { address: u64 },
+    ModuleOffset { module: String, offset: u64 },
+    Symbol { expression: String },
+}
+
+fn startup_breakpoint_spec(args: &LiveStartupBreakArgs) -> anyhow::Result<StartupBreakpointSpec> {
+    let selections = usize::from(args.address.is_some())
+        + usize::from(args.module_offset.is_some())
+        + usize::from(args.symbol.is_some());
+    ensure!(
+        selections == 1,
+        "specify exactly one of --address, --module with --module-offset, or --symbol"
+    );
+    if let Some(address) = args.address.as_deref() {
+        return Ok(StartupBreakpointSpec::Address {
+            address: parse_debug_address(address)?,
+        });
+    }
+    if let Some(offset) = args.module_offset.as_deref() {
+        return Ok(StartupBreakpointSpec::ModuleOffset {
+            module: args
+                .module
+                .clone()
+                .context("--module-offset requires --module")?,
+            offset: parse_debug_address(offset)?,
+        });
+    }
+    let expression = args
+        .symbol
+        .as_deref()
+        .context("a startup breakpoint specification is required")?
+        .trim();
+    ensure!(!expression.is_empty(), "--symbol must not be empty");
+    Ok(StartupBreakpointSpec::Symbol {
+        expression: expression.to_string(),
+    })
+}
+
+fn set_startup_breakpoint(
+    session: &DebuggerSession,
+    spec: &StartupBreakpointSpec,
+) -> anyhow::Result<BreakpointInfo> {
+    match spec {
+        StartupBreakpointSpec::Address { address } => session.add_code_breakpoint(*address),
+        StartupBreakpointSpec::ModuleOffset { module, offset } => {
+            let modules = session.modules()?;
+            let module = find_loaded_module(&modules, module)?;
+            let address = module
+                .base_address
+                .checked_add(*offset)
+                .context("module base plus breakpoint offset overflowed")?;
+            session.add_code_breakpoint(address)
+        }
+        StartupBreakpointSpec::Symbol { expression } => {
+            session.add_code_breakpoint_expression(expression)
+        }
+    }
+}
+
+fn find_loaded_module<'a>(
+    modules: &'a [ModuleInfo],
+    requested_module: &str,
+) -> anyhow::Result<&'a ModuleInfo> {
+    modules
+        .iter()
+        .find(|module| {
+            [
+                module.module_name.as_deref(),
+                module.image_name.as_deref(),
+                module.loaded_image_name.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            .any(|candidate| module_name_matches(candidate, requested_module))
+        })
+        .with_context(|| format!("module '{requested_module}' is not loaded at the initial break"))
+}
+
+fn module_name_matches(candidate: &str, requested: &str) -> bool {
+    candidate.eq_ignore_ascii_case(requested)
+        || Path::new(candidate)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+}
+
+fn parse_debug_address(value: &str) -> anyhow::Result<u64> {
+    let value = value.trim();
+    let parsed = match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => value.parse(),
+    };
+    parsed.with_context(|| {
+        format!("invalid address '{value}'; use decimal or 0x-prefixed hexadecimal")
+    })
+}
+
+fn parse_live_launch_end(value: &str) -> anyhow::Result<LiveLaunchEnd> {
+    match value {
+        "detach" => Ok(LiveLaunchEnd::Detach),
+        "terminate" => Ok(LiveLaunchEnd::Terminate),
+        other => bail!("unsupported live launch end action: {other}"),
+    }
 }
 
 pub(super) fn run_trace_record(
@@ -819,6 +1013,7 @@ pub(super) fn live_capabilities() -> Value {
         "implemented": [
             "dbgeng server",
             "live launch --command-line <cmd> --end detach|terminate",
+            "live startup-break --command-line <cmd> --address <addr>|--module <name> --module-offset <rva>|--symbol <expr>",
             "live start --command-line <cmd>",
             "live attach --process-id <pid>",
             "dump create --process-id <pid> --output <path>",
@@ -834,6 +1029,11 @@ pub(super) fn live_capabilities() -> Value {
                 "notes": "Launches under DbgEng, waits for the initial event, reports execution status, then detaches or terminates."
             },
             {
+                "feature": "startup breakpoint workflow",
+                "status": "one_shot_structured_context",
+                "notes": "Launches at the initial break, sets an absolute, module-RVA, or deferred symbol-expression code breakpoint, then reports bounded hit evidence, thread/IP/module/register/stack context."
+            },
+            {
                 "feature": "dump creation",
                 "status": "dbghelp_minidump_writer",
                 "notes": "Creates mini or full process dumps through DbgHelp from the Microsoft Debugging Platform runtime, either one-shot from a process id or from a daemon-owned live target."
@@ -845,7 +1045,6 @@ pub(super) fn live_capabilities() -> Value {
             }
         ],
         "gaps": [
-            "structured debug event polling",
             "step-over/step-out controls",
             "module/symbol reload management",
             "exception filtering and event callbacks",
@@ -888,7 +1087,7 @@ pub(super) fn breakpoint_capabilities() -> Value {
             }
         ],
         "gaps": [
-            "source and symbol breakpoints",
+            "source breakpoints and persistent daemon symbol breakpoints",
             "position watchpoints",
             "call/return trace jobs",
             "breakpoint enable/disable without remove"
@@ -1266,6 +1465,72 @@ mod tests {
     fn ttd_not_found_message_includes_official_install_command() {
         assert!(
             ttd_not_found_message().contains("winget install --id Microsoft.TimeTravelDebugging")
+        );
+    }
+
+    #[test]
+    fn matches_loaded_module_by_basename_or_full_path() {
+        let modules = [ModuleInfo {
+            base_address: 0x140000000,
+            module_name: Some("RemoteDesktopManager_x64".to_string()),
+            image_name: Some(
+                r"C:\Temp\windbg-tool-ttd\rdm\RemoteDesktopManager_x64.exe".to_string(),
+            ),
+            loaded_image_name: None,
+            symbol_file: None,
+        }];
+
+        assert_eq!(
+            find_loaded_module(&modules, "remotedesktopmanager_x64.exe")
+                .unwrap()
+                .base_address,
+            0x140000000
+        );
+        assert_eq!(
+            find_loaded_module(
+                &modules,
+                r"C:\Temp\windbg-tool-ttd\rdm\RemoteDesktopManager_x64.exe"
+            )
+            .unwrap()
+            .base_address,
+            0x140000000
+        );
+    }
+
+    #[test]
+    fn parses_decimal_and_hexadecimal_breakpoint_addresses() {
+        assert_eq!(parse_debug_address("0x140001000").unwrap(), 0x140001000);
+        assert_eq!(parse_debug_address("4096").unwrap(), 4096);
+        assert!(parse_debug_address("not-an-address").is_err());
+    }
+
+    #[test]
+    fn startup_breakpoint_requires_exactly_one_location_kind() {
+        let args = LiveStartupBreakArgs {
+            command_line: "target.exe".to_string(),
+            address: Some("0x140001000".to_string()),
+            module: Some("target.exe".to_string()),
+            module_offset: Some("0x1000".to_string()),
+            symbol: None,
+            initial_break_timeout_ms: 5000,
+            wait_timeout_ms: 10000,
+            max_frames: 16,
+            end: "terminate".to_string(),
+        };
+        assert!(startup_breakpoint_spec(&args).is_err());
+
+        let symbol_args = LiveStartupBreakArgs {
+            address: None,
+            module: None,
+            module_offset: None,
+            symbol: Some("target!entry".to_string()),
+            ..args
+        };
+        assert_eq!(
+            startup_breakpoint_spec(&symbol_args).unwrap(),
+            StartupBreakpointSpec::Symbol {
+                expression: "target!entry".to_string()
+            }
         );
     }
 }
