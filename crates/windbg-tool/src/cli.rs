@@ -277,6 +277,22 @@ enum LiveCommand {
         about = "Launch under DbgEng, set an address/module-RVA/symbol breakpoint, and emit bounded stop context"
     )]
     StartupBreak(LiveStartupBreakArgs),
+    #[command(
+        about = "Profile bounded DbgEng lifecycle events with host-monotonic wall-clock timing and no breakpoints"
+    )]
+    StartupProfile(LiveStartupProfileArgs),
+    #[command(
+        about = "Compare two bounded live startup-profile JSON artifacts without CPU or causal attribution"
+    )]
+    StartupCompare(LiveStartupProfileCompareArgs),
+    #[command(
+        about = "Render a bounded offline module timeline from a live startup-profile JSON artifact"
+    )]
+    StartupReport(LiveStartupProfileReportArgs),
+    #[command(
+        about = "Launch .NET under DbgEng, bind the matching CoreCLR DAC, and emit a managed method hit"
+    )]
+    ManagedBreak(LiveManagedBreakArgs),
     #[command(about = "Launch a process under DbgEng and keep it as a daemon-owned live target")]
     Start(LiveSessionStartArgs),
     #[command(about = "Attach DbgEng to a process and keep it as a daemon-owned live target")]
@@ -464,6 +480,14 @@ enum TargetCommand {
     Step(TargetIdArgs),
     #[command(about = "List threads for a daemon-owned target")]
     Threads(TargetIdArgs),
+    #[command(
+        about = "Read bounded DbgEng per-thread CPU accounting for a stopped daemon-owned target"
+    )]
+    ThreadAccounting(TargetThreadAccountingArgs),
+    #[command(
+        about = "Read bounded DbgEng symbol-readiness parameters for supplied observed module bases"
+    )]
+    ModuleParameters(TargetModuleParametersArgs),
     #[command(about = "List modules for a daemon-owned target")]
     Modules(TargetIdArgs),
     #[command(about = "Read current thread and instruction offsets for a daemon-owned target")]
@@ -474,6 +498,8 @@ enum TargetCommand {
     Event(TargetIdArgs),
     #[command(about = "Read memory from a daemon-owned target")]
     Memory(TargetMemoryReadArgs),
+    #[command(about = "Return a bounded live user-mode virtual-memory map through DbgEng")]
+    MemoryMap(TargetMemoryMapArgs),
     #[command(about = "Walk the current stack for a daemon-owned target")]
     Stack(TargetStackTraceArgs),
     #[command(
@@ -484,6 +510,10 @@ enum TargetCommand {
     Disasm(TargetDisasmArgs),
     #[command(about = "Resolve the nearest symbol for a daemon-owned target address")]
     Symbol(TargetAddressArgs),
+    #[command(
+        about = "Read bounded DbgEng symbol-entry offset regions for an existing native address"
+    )]
+    SymbolEntryRange(TargetAddressArgs),
     #[command(
         about = "Resolve source file and line information for a daemon-owned target address"
     )]
@@ -676,6 +706,11 @@ struct LiveStartupBreakArgs {
         help = "Capture the initial DbgEng break without setting a code breakpoint"
     )]
     initial_break: bool,
+    #[arg(
+        long,
+        help = "Use a one-byte DbgEng processor execute breakpoint instead of a software code breakpoint; uses a create-process initial stop and cannot be combined with --initial-break"
+    )]
+    hardware_execute: bool,
     #[arg(long, help = "Absolute code address for the breakpoint")]
     address: Option<String>,
     #[arg(
@@ -694,9 +729,358 @@ struct LiveStartupBreakArgs {
         help = "DbgEng symbol expression; remains deferred until its module and symbol resolve"
     )]
     symbol: Option<String>,
+    #[arg(
+        long,
+        value_name = "MODULE",
+        help = "Stop on a trusted module-load event before configuring the requested code breakpoint"
+    )]
+    wait_for_module: Option<String>,
     #[arg(long, default_value_t = 5000)]
     initial_break_timeout_ms: u32,
     #[arg(long, default_value_t = 10000)]
+    wait_timeout_ms: u32,
+    #[arg(long, default_value_t = 16)]
+    max_frames: u32,
+    #[arg(long, default_value = "terminate", value_parser = ["detach", "terminate"])]
+    end: String,
+}
+
+#[derive(Debug, Args)]
+struct LiveStartupProfileArgs {
+    #[arg(long, help = "Full command line to launch under DbgEng")]
+    command_line: String,
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=10),
+        help = "Independent bounded launches to collect; stops after the first launch failure"
+    )]
+    runs: u32,
+    #[arg(
+        long,
+        default_value_t = 30000,
+        help = "Maximum time to observe the initial DbgEng create-process event"
+    )]
+    initial_break_timeout_ms: u32,
+    #[arg(
+        long,
+        default_value_t = 90000,
+        help = "Maximum target-resumed wall time for each run after the create-process event"
+    )]
+    timeout_ms: u32,
+    #[arg(
+        long,
+        default_value_t = 256,
+        value_parser = clap::value_parser!(u32).range(2..=1024),
+        help = "Maximum DbgEng lifecycle events retained per run"
+    )]
+    max_events: u32,
+    #[arg(
+        long,
+        value_name = "MODULE",
+        help = "Optional application module basename used for observable module-to-exit phases"
+    )]
+    phase_module: Option<String>,
+    #[arg(
+        long,
+        value_name = "MODULE",
+        help = "Finish the startup observation when this module-load event is observed; does not imply UI readiness"
+    )]
+    completion_module: Option<String>,
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        requires = "completion_module",
+        value_parser = clap::value_parser!(u32).range(1..=60000),
+        help = "After --completion-module, require this much target-resumed time without another configured lifecycle stop before completing; only an observed lifecycle quiet interval"
+    )]
+    settle_ms: Option<u32>,
+    #[arg(
+        long,
+        help = "Request first-chance exception stops in addition to lifecycle events; can substantially increase event volume"
+    )]
+    include_first_chance_exceptions: bool,
+    #[arg(
+        long,
+        help = "Attach bounded read-only register/module/symbol/stack context to early observed stops"
+    )]
+    capture_stop_context: bool,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_enum,
+        requires = "capture_stop_context",
+        value_name = "EVENT",
+        help = "Comma-separated lifecycle event kinds eligible for read-only context; defaults to load-module,create-thread,exception,exit-process when context capture is enabled"
+    )]
+    context_on: Vec<StartupProfileContextEvent>,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        help = "Maximum event contexts captured when --capture-stop-context is set"
+    )]
+    max_context_events: u32,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        help = "Maximum stack frames in each optional stop context"
+    )]
+    max_frames: u32,
+    #[arg(
+        long,
+        requires = "capture_stop_context",
+        help = "Attach one bounded DbgEng symbol-entry range query to each captured stop context; symbol paths can cause host-side resolution I/O"
+    )]
+    capture_native_symbol_entry_range: bool,
+    #[arg(
+        long,
+        help = "Capture bounded read-only DbgEng per-thread accounting snapshots with raw validity-gated counters"
+    )]
+    capture_thread_accounting: bool,
+    #[arg(
+        long,
+        value_delimiter = ',',
+        value_enum,
+        requires = "capture_thread_accounting",
+        value_name = "EVENT",
+        help = "Comma-separated lifecycle event kinds eligible for thread accounting; defaults to create-process,load-module,create-thread,exit-process when enabled"
+    )]
+    thread_accounting_on: Vec<StartupProfileContextEvent>,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        requires = "capture_thread_accounting",
+        help = "Maximum selected lifecycle stops that collect a thread-accounting snapshot"
+    )]
+    max_thread_accounting_snapshots: u32,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_thread_accounting",
+        help = "Maximum threads returned in each DbgEng thread-accounting snapshot"
+    )]
+    max_thread_accounting_threads: u32,
+    #[arg(
+        long,
+        help = "Capture bounded DbgEng debuggee-output callback records; disabled by default because debug strings can contain sensitive content"
+    )]
+    capture_debuggee_output: bool,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_debuggee_output",
+        help = "Maximum debuggee-output callback records retained"
+    )]
+    max_output_records: u32,
+    #[arg(
+        long,
+        default_value_t = 512,
+        value_parser = clap::value_parser!(u32).range(1..=4096),
+        requires = "capture_debuggee_output",
+        help = "Maximum UTF-16 characters retained per debuggee-output callback record"
+    )]
+    max_output_chars: u32,
+    #[arg(
+        long,
+        default_value_t = 8192,
+        value_parser = clap::value_parser!(u32).range(1..=32768),
+        requires = "capture_debuggee_output",
+        help = "Maximum UTF-16 characters retained across all debuggee-output callback records"
+    )]
+    max_total_output_chars: u32,
+    #[arg(
+        long,
+        help = "Read bounded host-side PE/file metadata only for DbgEng-observed module image paths"
+    )]
+    capture_module_provenance: bool,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_module_provenance",
+        help = "Maximum unique DbgEng-observed module image paths inspected for host file metadata"
+    )]
+    max_module_provenance: u32,
+    #[arg(
+        long,
+        help = "Read bounded DbgEng module parameters only for module bases observed in this lifecycle timeline; symbol paths can cause host-side resolution I/O"
+    )]
+    capture_dbgeng_module_parameters: bool,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        requires = "capture_dbgeng_module_parameters",
+        help = "Maximum observed module bases queried through DbgEng IDebugSymbols5"
+    )]
+    max_dbgeng_module_parameters: u32,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the complete JSON result to a new file as well as stdout"
+    )]
+    output: Option<PathBuf>,
+    #[arg(
+        long,
+        default_value = "detach",
+        value_parser = ["detach", "terminate"],
+        help = "Action if the target has not exited at its completion or time bound; terminate is explicit"
+    )]
+    end: String,
+}
+
+#[derive(Debug, Args)]
+struct LiveStartupProfileCompareArgs {
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Earlier startup-profile JSON artifact"
+    )]
+    baseline: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Later startup-profile JSON artifact"
+    )]
+    candidate: PathBuf,
+    #[arg(
+        long,
+        default_value_t = 64,
+        value_parser = clap::value_parser!(u32).range(1..=256),
+        help = "Maximum retained lifecycle events compared per matched run"
+    )]
+    max_sequence_events: u32,
+}
+
+#[derive(Debug, Args)]
+struct LiveStartupProfileReportArgs {
+    #[arg(
+        value_name = "ARTIFACT",
+        help = "Existing live startup-profile JSON artifact to read offline"
+    )]
+    artifact: PathBuf,
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=10),
+        help = "Recorded run number to render; launch-relative timestamps are never combined across runs"
+    )]
+    run: u32,
+    #[arg(
+        long,
+        value_name = "SUBSTRING",
+        help = "Case-insensitive substring filter for module basename, normalized path, or DbgEng module name"
+    )]
+    module: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "rdm_only",
+        help = "Keep only modules classified from their observed identity as runtime/loader modules"
+    )]
+    runtime_only: bool,
+    #[arg(
+        long,
+        conflicts_with = "runtime_only",
+        help = "Keep only modules whose normalized observed image path contains /RemoteDesktopManager/"
+    )]
+    rdm_only: bool,
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        help = "Keep only first-observed modules at or after this target-resumed host wall-time timestamp"
+    )]
+    min_resumed_ms: Option<u64>,
+    #[arg(
+        long,
+        default_value_t = 64,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        help = "Maximum filtered module rows returned; the JSON report states whether this bound truncated rows"
+    )]
+    max_rows: u32,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = StartupProfileReportFormat::Table,
+        help = "Terminal output format; JSON preserves unclipped normalized paths and structured enrichment"
+    )]
+    format: StartupProfileReportFormat,
+    #[arg(
+        long,
+        default_value_t = 56,
+        value_parser = clap::value_parser!(u32).range(24..=256),
+        help = "Maximum normalized-path width in table output; JSON always includes the full normalized path"
+    )]
+    path_width: u32,
+    #[arg(
+        long,
+        help = "Omit the concise milestones and largest-observed-gaps tables from terminal table output"
+    )]
+    no_summary: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the complete structured report JSON to a new file without modifying the source artifact"
+    )]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum StartupProfileReportFormat {
+    Table,
+    Json,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum StartupProfileContextEvent {
+    CreateProcess,
+    ExitProcess,
+    CreateThread,
+    ExitThread,
+    LoadModule,
+    UnloadModule,
+    Exception,
+}
+
+#[derive(Debug, Args)]
+struct LiveManagedBreakArgs {
+    #[arg(long, help = "Full command line to launch under DbgEng")]
+    command_line: String,
+    #[arg(
+        long,
+        value_name = "MODULE",
+        help = "Managed assembly module basename, for example RemoteDesktopManager.dll"
+    )]
+    managed_module: String,
+    #[arg(
+        long,
+        help = "Fully qualified managed metadata method name, for example Namespace.Type.Method"
+    )]
+    method: String,
+    #[arg(
+        long,
+        value_name = "HEX",
+        help = "Optional exact ECMA-335 MethodDef signature bytes in hexadecimal, for example 00010E0E; required to select an overload"
+    )]
+    signature: Option<String>,
+    #[arg(
+        long,
+        help = "Allow the matching DAC to write CLR debugger-notification state; use only in an approved test VM"
+    )]
+    allow_runtime_write: bool,
+    #[arg(
+        long,
+        conflicts_with = "allow_runtime_write",
+        help = "Use only read-only DAC queries and a DbgEng processor execute breakpoint; does not register CLR notifications or use a software breakpoint"
+    )]
+    hardware_execute: bool,
+    #[arg(long, default_value_t = 30000)]
+    initial_break_timeout_ms: u32,
+    #[arg(long, default_value_t = 60000)]
     wait_timeout_ms: u32,
     #[arg(long, default_value_t = 16)]
     max_frames: u32,
@@ -818,6 +1202,11 @@ struct LiveSessionStartArgs {
     command_line: String,
     #[arg(long, default_value_t = 5000)]
     initial_break_timeout_ms: u32,
+    #[arg(
+        long,
+        help = "Stop on DbgEng's create-process event instead of the default software initial-break engine option"
+    )]
+    create_process_stop: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1135,6 +1524,45 @@ struct TargetMemoryReadArgs {
     address: String,
     #[arg(long)]
     size: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetMemoryMapArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(
+        long,
+        default_value_t = 256,
+        value_parser = clap::value_parser!(u32).range(1..=4096),
+        help = "Maximum DbgEng virtual-memory regions returned"
+    )]
+    region_limit: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetThreadAccountingArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(
+        long,
+        default_value_t = 32,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        help = "Maximum DbgEng threads returned"
+    )]
+    max_threads: u32,
+}
+
+#[derive(Debug, Args)]
+struct TargetModuleParametersArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(
+        long = "module-base",
+        required = true,
+        value_name = "ADDRESS",
+        help = "DbgEng-observed module base address; repeat for up to 128 distinct modules"
+    )]
+    module_bases: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -3637,6 +4065,7 @@ fn backend_capability(kind: &str) -> Value {
             "can_stack": true,
             "can_query_symbols": true,
             "can_query_source": true,
+            "can_query_virtual_memory_map": "live_user_mode_only",
             "can_step": true,
             "can_continue": true,
             "can_set_breakpoint": true,
@@ -3646,7 +4075,7 @@ fn backend_capability(kind: &str) -> Value {
             "supports_jobs": false,
             "supports_timeline": false,
             "required_identifiers": ["target_id"],
-            "safe_commands": ["debug snapshot", "target status", "target event", "target thread", "target stack", "target disasm", "breakpoint plan"],
+            "safe_commands": ["debug snapshot", "target status", "target event", "target thread", "target stack", "target disasm", "target memory-map", "breakpoint plan"],
             "mutating_commands": ["target continue", "target step", "breakpoint set", "target dump"],
             "destructive_commands": ["target terminate", "target close"],
             "unsupported_operations": [
@@ -4149,6 +4578,7 @@ async fn live_start_and_print(
             arguments: json!({
                 "command_line": args.command_line,
                 "initial_break_timeout_ms": args.initial_break_timeout_ms,
+                "create_process_stop": args.create_process_stop,
             }),
         },
         output,
@@ -4418,6 +4848,8 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
             | "live capabilities"
             | "live launch"
             | "live startup-break"
+            | "live startup-profile"
+            | "live startup-report"
             | "breakpoint capabilities"
             | "datamodel capabilities"
     );
@@ -4489,7 +4921,10 @@ fn discover_manifest() -> Value {
             "live": [
                 "live capabilities",
                 "live launch --command-line <cmd> --end detach|terminate",
-                "live start --command-line <cmd>",
+                "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>] [--completion-module <basename> [--settle-ms <milliseconds>]]",
+                "live startup-compare --baseline <path> --candidate <path>",
+                "live startup-report <artifact> [--run <number>] [--format table|json]",
+                "live start --command-line <cmd> [--create-process-stop]",
                 "live attach --process-id <pid>"
             ],
             "dump": ["dump open <path>", "dump inspect <path>", "dump create --process-id <pid> --output <path>"],
@@ -4527,6 +4962,7 @@ fn discover_manifest() -> Value {
                 "target event --target <id>",
                 "target thread --target <id> --engine-thread-id <id>",
                 "target memory --target <id> --address <addr> --size <n>",
+                "target memory-map --target <id> [--region-limit <n>]",
                 "target dump --target <id> --output <path>",
                 "target stack --target <id>",
                 "target disasm --target <id>",
@@ -4913,6 +5349,7 @@ fn tool_command_map() -> Value {
         { "tool": "target_core_registers", "commands": ["target registers"] },
         { "tool": "target_last_event", "commands": ["target event", "debug snapshot --include event"] },
         { "tool": "target_read_memory", "commands": ["target memory"] },
+        { "tool": "target_memory_map", "commands": ["target memory-map"] },
         { "tool": "target_list_threads", "commands": ["target threads"] },
         { "tool": "target_list_modules", "commands": ["target modules"] },
         { "tool": "target_symbol_by_offset", "commands": ["target symbol"] },
@@ -5157,13 +5594,40 @@ fn command_metadata() -> Value {
             "bounds": ["--initial-break-timeout-ms", "--wait-timeout-ms", "--max-frames", "--end detach|terminate"]
         },
         {
+            "command": "live startup-profile",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "launches_process_and_collects_bounded_lifecycle_events",
+            "safety": "live_debugging_changes_target_execution_state_without_target_memory_writes",
+            "bounds": ["--runs 1..10", "--initial-break-timeout-ms", "--timeout-ms", "--max-events", "--completion-module <basename>", "--settle-ms 1..60000 (requires --completion-module)", "--max-context-events", "--context-on", "--max-output-records", "--max-output-chars", "--max-total-output-chars", "--max-module-provenance", "--end detach|terminate"]
+        },
+        {
+            "command": "live startup-compare",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_local_json_comparison",
+            "safety": "read_only_host_artifact",
+            "bounds": ["artifacts <= 16 MiB", "--max-sequence-events 1..256"]
+        },
+        {
+            "command": "live startup-report",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_local_json_report",
+            "safety": "read_only_host_artifact",
+            "bounds": ["artifact <= 16 MiB", "--run 1..10", "--max-rows 1..128", "--path-width 24..256"]
+        },
+        {
             "command": "live start",
             "requires_daemon": true,
             "requires_native_ttd": false,
             "session_required": false,
             "cost": "launches_process_and_persists_target",
             "safety": "live_debugging_changes_target_execution_state",
-            "bounds": ["--initial-break-timeout-ms"]
+            "bounds": ["--initial-break-timeout-ms", "--create-process-stop"]
         },
         {
             "command": "live attach",
@@ -5231,6 +5695,16 @@ fn command_metadata() -> Value {
             "cost": "bounded_memory_read",
             "safety": "read_only_memory",
             "bounds": ["--size"]
+        },
+        {
+            "command": "target memory-map",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_dbgeng_virtual_memory_query",
+            "safety": "read_only_dbgeng_data_space",
+            "bounds": ["--region-limit 1..4096"],
+            "limitations": ["Live user-mode targets only; bounded, partial, or unavailable coverage is explicit."]
         },
         {
             "command": "target dump",
@@ -5471,6 +5945,52 @@ fn target_memory_call(args: TargetMemoryReadArgs) -> anyhow::Result<ToolCall> {
             "target_id": args.target,
             "address": parse_u64_argument(&args.address)?,
             "size": args.size,
+        }),
+    })
+}
+
+fn target_memory_map_call(args: TargetMemoryMapArgs) -> ToolCall {
+    ToolCall {
+        name: "target_memory_map".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "region_limit": args.region_limit,
+        }),
+    }
+}
+
+fn target_thread_accounting_call(args: TargetThreadAccountingArgs) -> ToolCall {
+    ToolCall {
+        name: "target_thread_accounting".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "max_threads": args.max_threads,
+        }),
+    }
+}
+
+fn target_module_parameters_call(args: TargetModuleParametersArgs) -> anyhow::Result<ToolCall> {
+    ensure!(
+        (1..=128).contains(&args.module_bases.len()),
+        "target module-parameters requires from 1 through 128 --module-base values"
+    );
+    let module_base_addresses = args
+        .module_bases
+        .iter()
+        .map(|address| parse_u64_argument(address))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut unique = module_base_addresses.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    ensure!(
+        unique.len() == module_base_addresses.len(),
+        "target module-parameters requires distinct --module-base values"
+    );
+    Ok(ToolCall {
+        name: "target_module_parameters".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "module_base_addresses": module_base_addresses,
         }),
     })
 }
@@ -7802,5 +8322,32 @@ mod tests {
         assert_eq!(call.arguments["path"], r"C:\dumps\app.dmp");
         assert_eq!(call.arguments["kind"], "full");
         assert_eq!(call.arguments["overwrite"], true);
+    }
+
+    #[test]
+    fn builds_bounded_target_observability_tool_calls() -> anyhow::Result<()> {
+        let accounting = target_thread_accounting_call(TargetThreadAccountingArgs {
+            target: 7,
+            max_threads: 32,
+        });
+        assert_eq!(accounting.name, "target_thread_accounting");
+        assert_eq!(accounting.arguments["target_id"], 7);
+        assert_eq!(accounting.arguments["max_threads"], 32);
+
+        let parameters = target_module_parameters_call(TargetModuleParametersArgs {
+            target: 7,
+            module_bases: vec!["0x1000".to_string(), "0x2000".to_string()],
+        })?;
+        assert_eq!(parameters.name, "target_module_parameters");
+        assert_eq!(
+            parameters.arguments["module_base_addresses"],
+            json!([0x1000, 0x2000])
+        );
+        assert!(target_module_parameters_call(TargetModuleParametersArgs {
+            target: 7,
+            module_bases: vec!["0x1000".to_string(), "0x1000".to_string()],
+        })
+        .is_err());
+        Ok(())
     }
 }

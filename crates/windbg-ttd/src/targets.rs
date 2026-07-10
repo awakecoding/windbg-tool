@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -7,9 +7,11 @@ use windbg_dbgeng::{
     attach_live_session, launch_live_session, open_dump_session, BreakpointInfo, CoreRegisterState,
     DebuggerEventInfo, DebuggerExecutionStatus, DebuggerSession, DebuggerSessionKind,
     DebuggerSessionSummary, DisassemblyResult, DumpKind, DumpOpenOptions, DumpWriteOptions,
-    DumpWriteResult, EvaluationResult, LiveAttachOptions, LiveLaunchSessionOptions,
-    MemoryReadResult, ModuleInfo, SourceLocation, StackFrameInfo, SymbolInfo, ThreadContext,
-    ThreadInfo,
+    DumpWriteResult, EvaluationResult, LiveAttachOptions, LiveInitialStop,
+    LiveLaunchSessionOptions, MemoryReadResult, ModuleDebugParameters, ModuleInfo, SourceLocation,
+    StackFrameInfo, SymbolEntryRange, SymbolInfo, ThreadAccountingSnapshot, ThreadContext,
+    ThreadInfo, VirtualMemoryMap, MAX_MODULE_PARAMETER_QUERIES, MAX_THREAD_ACCOUNTING_THREADS,
+    MAX_VIRTUAL_MEMORY_MAP_REGIONS,
 };
 
 pub type TargetId = u64;
@@ -29,6 +31,8 @@ pub struct LiveLaunchRequest {
     pub command_line: String,
     #[serde(default = "default_live_wait_timeout_ms")]
     pub initial_break_timeout_ms: u32,
+    #[serde(default)]
+    pub create_process_stop: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -60,6 +64,38 @@ pub struct TargetMemoryReadRequest {
     pub target_id: TargetId,
     pub address: u64,
     pub size: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetMemoryMapRequest {
+    pub target_id: TargetId,
+    #[serde(default = "default_target_memory_map_regions")]
+    #[schemars(
+        range(min = 1, max = 4096),
+        description = "Maximum DbgEng virtual-memory regions returned; must be from 1 through 4096."
+    )]
+    pub region_limit: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetThreadAccountingRequest {
+    pub target_id: TargetId,
+    #[serde(default = "default_target_thread_accounting_threads")]
+    #[schemars(
+        range(min = 1, max = 128),
+        description = "Maximum DbgEng threads returned; must be from 1 through 128."
+    )]
+    pub max_threads: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetModuleParametersRequest {
+    pub target_id: TargetId,
+    #[schemars(
+        length(min = 1, max = 128),
+        description = "Distinct DbgEng-observed module base addresses; at most 128."
+    )]
+    pub module_base_addresses: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -199,6 +235,32 @@ pub struct TargetMemoryReadResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TargetMemoryMapResponse {
+    pub target_id: TargetId,
+    pub memory_map: VirtualMemoryMap,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetThreadAccountingResponse {
+    pub target_id: TargetId,
+    pub thread_accounting: ThreadAccountingSnapshot,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetModuleParametersResponse {
+    pub target_id: TargetId,
+    pub source: String,
+    pub parameters: Vec<ModuleDebugParameters>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetSymbolEntryRangeResponse {
+    pub target_id: TargetId,
+    pub symbol_entry_range: SymbolEntryRange,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TargetModuleList {
     pub target_id: TargetId,
     pub modules: Vec<ModuleInfo>,
@@ -292,6 +354,11 @@ impl TargetRegistry {
         let session = launch_live_session(LiveLaunchSessionOptions {
             command_line: request.command_line,
             initial_break_timeout_ms: request.initial_break_timeout_ms,
+            initial_stop: if request.create_process_stop {
+                LiveInitialStop::CreateProcessEvent
+            } else {
+                LiveInitialStop::SoftwareBreakpoint
+            },
         })?;
         Ok(self.insert_target(session))
     }
@@ -409,11 +476,65 @@ impl TargetRegistry {
         })
     }
 
+    pub fn memory_map(
+        &self,
+        request: TargetMemoryMapRequest,
+    ) -> anyhow::Result<TargetMemoryMapResponse> {
+        validate_target_memory_map_region_limit(request.region_limit)?;
+        let target = self.target(request.target_id)?;
+        ensure_live_target(request.target_id, &target.session)?;
+        Ok(TargetMemoryMapResponse {
+            target_id: request.target_id,
+            memory_map: target.session.virtual_memory_map(request.region_limit)?,
+        })
+    }
+
     pub fn list_threads(&self, request: TargetRequest) -> anyhow::Result<TargetThreadList> {
         let target = self.target(request.target_id)?;
         Ok(TargetThreadList {
             target_id: request.target_id,
             threads: target.session.threads()?,
+        })
+    }
+
+    pub fn thread_accounting(
+        &self,
+        request: TargetThreadAccountingRequest,
+    ) -> anyhow::Result<TargetThreadAccountingResponse> {
+        validate_target_thread_accounting_limit(request.max_threads)?;
+        let target = self.target(request.target_id)?;
+        Ok(TargetThreadAccountingResponse {
+            target_id: request.target_id,
+            thread_accounting: target
+                .session
+                .thread_accounting_snapshot(request.max_threads)?,
+        })
+    }
+
+    pub fn module_parameters(
+        &self,
+        request: TargetModuleParametersRequest,
+    ) -> anyhow::Result<TargetModuleParametersResponse> {
+        validate_target_module_parameter_bases(&request.module_base_addresses)?;
+        let target = self.target(request.target_id)?;
+        Ok(TargetModuleParametersResponse {
+            target_id: request.target_id,
+            source: "dbgeng_idebugsymbols5_getmoduleparameters".to_string(),
+            parameters: target.session.module_parameters(&request.module_base_addresses)?,
+            detail: "This bounded DbgEng symbol-readiness query applies only to supplied module base addresses. Its result describes debugger module metadata, not target timing; configured symbol paths can cause host-side symbol-resolution I/O.".to_string(),
+        })
+    }
+
+    pub fn symbol_entry_range(
+        &self,
+        request: TargetAddressRequest,
+    ) -> anyhow::Result<TargetSymbolEntryRangeResponse> {
+        let target = self.target(request.target_id)?;
+        Ok(TargetSymbolEntryRangeResponse {
+            target_id: request.target_id,
+            symbol_entry_range: target
+                .session
+                .symbol_entry_range_by_offset(request.address)?,
         })
     }
 
@@ -602,6 +723,49 @@ fn default_target_stack_frames() -> u32 {
     32
 }
 
+fn default_target_memory_map_regions() -> u32 {
+    256
+}
+
+fn default_target_thread_accounting_threads() -> u32 {
+    32
+}
+
+fn validate_target_memory_map_region_limit(region_limit: u32) -> anyhow::Result<()> {
+    ensure!(
+        (1..=MAX_VIRTUAL_MEMORY_MAP_REGIONS).contains(&region_limit),
+        "target memory-map region_limit must be from 1 through {MAX_VIRTUAL_MEMORY_MAP_REGIONS}"
+    );
+    Ok(())
+}
+
+fn validate_target_thread_accounting_limit(max_threads: u32) -> anyhow::Result<()> {
+    ensure!(
+        (1..=MAX_THREAD_ACCOUNTING_THREADS).contains(&max_threads),
+        "target thread-accounting max_threads must be from 1 through {MAX_THREAD_ACCOUNTING_THREADS}"
+    );
+    Ok(())
+}
+
+fn validate_target_module_parameter_bases(base_addresses: &[u64]) -> anyhow::Result<()> {
+    ensure!(
+        !base_addresses.is_empty(),
+        "target module-parameters requires at least one module base address"
+    );
+    ensure!(
+        base_addresses.len() <= MAX_MODULE_PARAMETER_QUERIES,
+        "target module-parameters supports at most {MAX_MODULE_PARAMETER_QUERIES} module base addresses"
+    );
+    let mut unique_bases = base_addresses.to_vec();
+    unique_bases.sort_unstable();
+    unique_bases.dedup();
+    ensure!(
+        unique_bases.len() == base_addresses.len(),
+        "target module-parameters requires distinct module base addresses"
+    );
+    Ok(())
+}
+
 fn default_target_disasm_count() -> u32 {
     16
 }
@@ -619,5 +783,41 @@ impl From<TargetDumpKind> for DumpKind {
             TargetDumpKind::Mini => DumpKind::Mini,
             TargetDumpKind::Full => DumpKind::Full,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validates_memory_map_region_limit_before_accessing_a_target() {
+        assert!(validate_target_memory_map_region_limit(1).is_ok());
+        assert!(validate_target_memory_map_region_limit(MAX_VIRTUAL_MEMORY_MAP_REGIONS).is_ok());
+        assert!(validate_target_memory_map_region_limit(0).is_err());
+        assert!(
+            validate_target_memory_map_region_limit(MAX_VIRTUAL_MEMORY_MAP_REGIONS + 1).is_err()
+        );
+    }
+
+    #[test]
+    fn validates_thread_accounting_limit_before_accessing_a_target() {
+        assert!(validate_target_thread_accounting_limit(1).is_ok());
+        assert!(validate_target_thread_accounting_limit(MAX_THREAD_ACCOUNTING_THREADS).is_ok());
+        assert!(validate_target_thread_accounting_limit(0).is_err());
+        assert!(
+            validate_target_thread_accounting_limit(MAX_THREAD_ACCOUNTING_THREADS + 1).is_err()
+        );
+    }
+
+    #[test]
+    fn validates_module_parameter_bases_before_accessing_a_target() {
+        assert!(validate_target_module_parameter_bases(&[0x1000]).is_ok());
+        assert!(validate_target_module_parameter_bases(&[]).is_err());
+        assert!(validate_target_module_parameter_bases(&[0x1000, 0x1000]).is_err());
+        assert!(validate_target_module_parameter_bases(
+            &(0..=MAX_MODULE_PARAMETER_QUERIES as u64).collect::<Vec<_>>()
+        )
+        .is_err());
     }
 }

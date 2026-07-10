@@ -1,15 +1,45 @@
 use anyhow::{bail, ensure, Context};
 use serde::Serialize;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
+#[cfg(windows)]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::OnceLock,
+    time::Instant,
+};
+
+#[cfg(windows)]
+mod coreclr_dac;
+#[cfg(windows)]
+pub use coreclr_dac::{
+    CoreClrDacBridge, ManagedCodeAvailability, ManagedMethodInfo, ManagedRuntimeInfo,
 };
 
 pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
 pub const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
 pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
 pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
+pub const DBGENG_RUNTIME_DIR_ENV: &str = "WINDBG_DBGENG_RUNTIME_DIR";
+pub const MAX_VIRTUAL_MEMORY_MAP_REGIONS: u32 = 4096;
+pub const MAX_THREAD_ACCOUNTING_THREADS: u32 = 128;
+pub const MAX_MODULE_PARAMETER_QUERIES: usize = 128;
+pub const MAX_SYMBOL_ENTRY_OFFSET_REGIONS: usize = 16;
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
+const DBGENG_DLL_NAME: &str = "dbgeng.dll";
+#[cfg(windows)]
+const DBGENG_RUNTIME_COMPONENTS: [&str; 4] = [
+    "dbgcore.dll",
+    "dbghelp.dll",
+    "dbgmodel.dll",
+    DBGENG_DLL_NAME,
+];
+const DBGENG_WAIT_TIMEOUT_HRESULT: i32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandardSymbolEnvironment {
@@ -88,6 +118,189 @@ fn env_path(name: &str) -> Option<String> {
     })
 }
 
+#[cfg(windows)]
+fn dbgeng_runtime_dll(
+    explicit_runtime_dir: Option<&Path>,
+    executable_path: Option<&Path>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(runtime_dir) = explicit_runtime_dir {
+        let dll = runtime_dir.join(DBGENG_DLL_NAME);
+        ensure!(
+            dll.is_file(),
+            "{DBGENG_RUNTIME_DIR_ENV} must name a directory containing {}",
+            dll.display()
+        );
+        return Ok(Some(dll));
+    }
+
+    Ok(executable_path
+        .and_then(Path::parent)
+        .map(|directory| directory.join(DBGENG_DLL_NAME))
+        .filter(|dll| dll.is_file()))
+}
+
+#[cfg(windows)]
+fn load_library_from_path(
+    path: &Path,
+    component: &str,
+) -> anyhow::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+
+    let mut path_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    path_wide.push(0);
+    unsafe {
+        LoadLibraryExW(
+            PCWSTR(path_wide.as_ptr()),
+            None,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+    }
+    .with_context(|| format!("loading {component} {}", path.display()))
+}
+
+#[cfg(windows)]
+fn ensure_dbgeng_runtime_loaded() -> anyhow::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    static LOAD_RESULT: OnceLock<Result<usize, String>> = OnceLock::new();
+
+    let result = LOAD_RESULT.get_or_init(|| {
+        (|| -> anyhow::Result<usize> {
+            let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
+            let executable_path = env::current_exe().ok();
+            let dll =
+                dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref())?;
+            let Some(dll) = dll else {
+                let mut component_wide = "dbgeng.dll".encode_utf16().collect::<Vec<_>>();
+                component_wide.push(0);
+                let module = unsafe {
+                    LoadLibraryExW(
+                        PCWSTR(component_wide.as_ptr()),
+                        None,
+                        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                    )
+                }
+                .context("loading DbgEng from the system runtime")?;
+                return Ok(module.0 as usize);
+            };
+            let runtime_dir = dll
+                .parent()
+                .context("the selected DbgEng runtime DLL has no parent directory")?;
+            // Load the version-matched companions before DbgEng so its imports resolve from the
+            // staged runtime set instead of depending on ambient DLL-search state.
+            for component_name in DBGENG_RUNTIME_COMPONENTS {
+                let component = runtime_dir.join(component_name);
+                ensure!(
+                    component.is_file(),
+                    "the selected DbgEng runtime is missing required component {}",
+                    component.display()
+                );
+                let module = load_library_from_path(&component, "DbgEng runtime component")?;
+                if component_name == DBGENG_DLL_NAME {
+                    return Ok(module.0 as usize);
+                }
+            }
+            unreachable!("the DbgEng runtime component list must include dbgeng.dll")
+        })()
+        .map_err(|error| format!("{error:#}"))
+    });
+
+    match result {
+        Ok(module) => Ok(HMODULE(*module as *mut _)),
+        Err(error) => bail!("{error}"),
+    }
+}
+
+#[cfg(windows)]
+fn enable_create_process_stop(
+    control: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+) -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_THIS_CLIENT,
+    };
+
+    let command = "sxe cpr\0".encode_utf16().collect::<Vec<_>>();
+    unsafe {
+        control.ExecuteWide(
+            DEBUG_OUTCTL_THIS_CLIENT,
+            PCWSTR(command.as_ptr()),
+            DEBUG_EXECUTE_DEFAULT,
+        )
+    }
+    .context("configuring DbgEng to stop on the create-process debug event")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_debug_client(
+) -> anyhow::Result<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5> {
+    use std::ffi::c_void;
+    use windows::core::{Interface, PCSTR};
+    use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5;
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
+
+    type DebugCreateFn = unsafe extern "system" fn(
+        *const windows::core::GUID,
+        *mut *mut c_void,
+    ) -> windows::core::HRESULT;
+
+    let module = ensure_dbgeng_runtime_loaded()?;
+    let procedure = unsafe { GetProcAddress(module, PCSTR(c"DebugCreate".as_ptr().cast())) }
+        .context("the selected DbgEng runtime does not export DebugCreate")?;
+    // GetProcAddress returns an untyped module export. DebugCreate has the documented
+    // DbgEng ABI and the module is retained by ensure_dbgeng_runtime_loaded.
+    let debug_create: DebugCreateFn = unsafe { std::mem::transmute(procedure) };
+    let mut client = std::ptr::null_mut();
+    unsafe { debug_create(&IDebugClient5::IID, &mut client) }
+        .ok()
+        .context("DbgEng DebugCreate failed")?;
+    ensure!(
+        !client.is_null(),
+        "DbgEng DebugCreate succeeded without returning an IDebugClient5"
+    );
+    Ok(unsafe { IDebugClient5::from_raw(client) })
+}
+
+#[cfg(windows)]
+fn enable_initial_break(
+    control: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+) -> anyhow::Result<()> {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_ENGOPT_INITIAL_BREAK;
+
+    unsafe { control.AddEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) }
+        .context("enabling the DbgEng initial-break engine option")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_initial_event(
+    control: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+    timeout_ms: u32,
+    operation: &str,
+) -> anyhow::Result<()> {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT;
+
+    match unsafe { control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) } {
+        Ok(()) => Ok(()),
+        Err(error) if is_dbgeng_wait_timeout_hresult(error.code().0) => {
+            bail!("DbgEng {operation} initial WaitForEvent timed out after {timeout_ms} ms")
+        }
+        Err(error) => Err(error).context(format!("DbgEng {operation} initial WaitForEvent failed")),
+    }
+}
+
+fn is_dbgeng_wait_timeout_hresult(hresult: i32) -> bool {
+    hresult == DBGENG_WAIT_TIMEOUT_HRESULT
+}
+
 #[derive(Debug, Clone)]
 pub struct ProcessServerOptions {
     pub transport: String,
@@ -110,6 +323,13 @@ pub struct LiveLaunchOptions {
 pub struct LiveLaunchSessionOptions {
     pub command_line: String,
     pub initial_break_timeout_ms: u32,
+    pub initial_stop: LiveInitialStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LiveInitialStop {
+    SoftwareBreakpoint,
+    CreateProcessEvent,
 }
 
 #[derive(Debug, Clone)]
@@ -217,9 +437,100 @@ pub struct MemoryReadResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct VirtualMemoryRegion {
+    pub base_address: u64,
+    pub allocation_base: u64,
+    pub allocation_protection: u32,
+    pub region_size: u64,
+    pub state: u32,
+    pub protection: u32,
+    pub kind: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VirtualMemoryMap {
+    pub source: String,
+    pub status: String,
+    pub region_limit: u32,
+    pub regions: Vec<VirtualMemoryRegion>,
+    pub truncated: bool,
+    pub next_query_address: Option<u64>,
+    pub query_error: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct DebuggerOutputCaptureOptions {
+    pub started_at: Instant,
+    pub max_records: u32,
+    pub max_chars_per_record: u32,
+    pub max_total_chars: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerOutputRecord {
+    pub elapsed_ms: u64,
+    pub preceding_event_index: Option<usize>,
+    pub mask: u32,
+    pub categories: Vec<String>,
+    pub text: String,
+    pub text_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerOutputCaptureResult {
+    pub status: String,
+    pub source: String,
+    pub records: Vec<DebuggerOutputRecord>,
+    pub records_returned: usize,
+    pub dropped_record_count: u32,
+    pub dropped_text_char_count: u32,
+    pub max_records: u32,
+    pub max_chars_per_record: u32,
+    pub max_total_chars: u32,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct ThreadInfo {
     pub engine_id: u32,
     pub system_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadAccountingEntry {
+    pub thread: ThreadInfo,
+    pub basic_information_status: String,
+    pub basic_information_size_bytes: Option<u32>,
+    pub name_status: String,
+    pub name: Option<String>,
+    pub name_size_bytes: Option<u32>,
+    pub valid_mask: Option<u32>,
+    pub exit_status: Option<u32>,
+    pub priority_class: Option<u32>,
+    pub priority: Option<u32>,
+    pub create_time_raw: Option<u64>,
+    pub exit_time_raw: Option<u64>,
+    pub kernel_time_raw: Option<u64>,
+    pub user_time_raw: Option<u64>,
+    pub kernel_time_ms: Option<f64>,
+    pub user_time_ms: Option<f64>,
+    pub start_offset: Option<u64>,
+    pub affinity: Option<u64>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadAccountingSnapshot {
+    pub source: String,
+    pub status: String,
+    pub counter_units: String,
+    pub total_threads: Option<usize>,
+    pub threads: Vec<ThreadAccountingEntry>,
+    pub returned: usize,
+    pub limit: u32,
+    pub truncated: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -229,6 +540,46 @@ pub struct ModuleInfo {
     pub image_name: Option<String>,
     pub loaded_image_name: Option<String>,
     pub symbol_file: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModuleDebugParameters {
+    pub base_address: u64,
+    pub image_size: u32,
+    pub time_date_stamp: u32,
+    pub checksum: u32,
+    pub flags: u32,
+    pub symbol_type: u32,
+    pub symbol_type_name: String,
+    pub image_name_size: u32,
+    pub module_name_size: u32,
+    pub loaded_image_name_size: u32,
+    pub symbol_file_name_size: u32,
+    pub mapped_image_name_size: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolEntryOffsetRegion {
+    pub base_address: u64,
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SymbolEntryRange {
+    pub source: String,
+    pub status: String,
+    pub address: u64,
+    pub symbol_module_base: Option<u64>,
+    pub symbol_offset: Option<u64>,
+    pub symbol_size: Option<u32>,
+    pub displacement: Option<u64>,
+    pub symbol_tag: Option<u32>,
+    pub symbol_flags: Option<u32>,
+    pub symbol_token: Option<u32>,
+    pub regions: Vec<SymbolEntryOffsetRegion>,
+    pub regions_available: Option<u32>,
+    pub regions_truncated: bool,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -371,6 +722,180 @@ pub struct DebuggerSession {
 }
 
 #[cfg(windows)]
+const OUTPUT_CAPTURE_NO_EVENT_INDEX: usize = usize::MAX;
+#[cfg(windows)]
+const DEBUG_OUTPUT_DEBUGGEE_MASK: u32 = 0x0000_0080;
+#[cfg(windows)]
+const DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK: u32 = 0x0000_0100;
+
+#[cfg(windows)]
+struct DebuggerOutputCaptureShared {
+    started_at: Instant,
+    max_records: usize,
+    max_chars_per_record: usize,
+    max_total_chars: usize,
+    preceding_event_index: AtomicUsize,
+    state: Mutex<DebuggerOutputCaptureState>,
+}
+
+#[cfg(windows)]
+#[derive(Default)]
+struct DebuggerOutputCaptureState {
+    records: Vec<DebuggerOutputRecord>,
+    total_text_chars: usize,
+    dropped_record_count: u32,
+    dropped_text_char_count: u32,
+}
+
+#[cfg(windows)]
+#[windows::core::implement(
+    windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide
+)]
+struct DebuggerOutputCallback {
+    shared: Arc<DebuggerOutputCaptureShared>,
+}
+
+#[cfg(windows)]
+impl windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide_Impl
+    for DebuggerOutputCallback_Impl
+{
+    fn Output(&self, mask: u32, text: &windows::core::PCWSTR) -> windows::core::Result<()> {
+        if mask & (DEBUG_OUTPUT_DEBUGGEE_MASK | DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK) == 0 {
+            return Ok(());
+        }
+        let text = unsafe { text.to_string() }
+            .unwrap_or_else(|_| "<invalid UTF-16 DbgEng output>".to_string());
+        self.shared.record(mask, text);
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl DebuggerOutputCaptureShared {
+    fn record(&self, mask: u32, text: String) {
+        let original_chars = text.chars().count();
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return,
+        };
+        if state.records.len() >= self.max_records {
+            state.dropped_record_count = state.dropped_record_count.saturating_add(1);
+            state.dropped_text_char_count = state
+                .dropped_text_char_count
+                .saturating_add(saturating_u32(original_chars));
+            return;
+        }
+
+        let remaining_total = self.max_total_chars.saturating_sub(state.total_text_chars);
+        let retained_chars = original_chars
+            .min(self.max_chars_per_record)
+            .min(remaining_total);
+        let text_truncated = retained_chars < original_chars;
+        let retained_text = text.chars().take(retained_chars).collect::<String>();
+        if text_truncated {
+            state.dropped_text_char_count = state
+                .dropped_text_char_count
+                .saturating_add(saturating_u32(original_chars - retained_chars));
+        }
+        state.total_text_chars += retained_chars;
+        let preceding_event_index = self.preceding_event_index.load(Ordering::Relaxed);
+        state.records.push(DebuggerOutputRecord {
+            elapsed_ms: duration_millis(self.started_at.elapsed()),
+            preceding_event_index: (preceding_event_index != OUTPUT_CAPTURE_NO_EVENT_INDEX)
+                .then_some(preceding_event_index),
+            mask,
+            categories: debug_output_categories(mask),
+            text: retained_text,
+            text_truncated,
+        });
+    }
+
+    fn snapshot(&self, options: &DebuggerOutputCaptureOptions) -> DebuggerOutputCaptureResult {
+        let state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => {
+                return DebuggerOutputCaptureResult {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_output_callback".to_string(),
+                    records: Vec::new(),
+                    records_returned: 0,
+                    dropped_record_count: 0,
+                    dropped_text_char_count: 0,
+                    max_records: options.max_records,
+                    max_chars_per_record: options.max_chars_per_record,
+                    max_total_chars: options.max_total_chars,
+                    detail:
+                        "The host-side output capture lock was poisoned; no output is returned."
+                            .to_string(),
+                }
+            }
+        };
+        DebuggerOutputCaptureResult {
+            status: "captured".to_string(),
+            source: "dbgeng_output_callback".to_string(),
+            records: state.records.clone(),
+            records_returned: state.records.len(),
+            dropped_record_count: state.dropped_record_count,
+            dropped_text_char_count: state.dropped_text_char_count,
+            max_records: options.max_records,
+            max_chars_per_record: options.max_chars_per_record,
+            max_total_chars: options.max_total_chars,
+            detail: "Only DbgEng debuggee output categories are enabled. Records are bounded host-side and preceding_event_index identifies the latest retained lifecycle event when the callback entered; it is not a causal association.".to_string(),
+        }
+    }
+}
+
+#[cfg(windows)]
+pub struct DebuggerOutputCapture {
+    client: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5,
+    previous_callback:
+        Option<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide>,
+    previous_output_mask: u32,
+    _callback: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide,
+    shared: Arc<DebuggerOutputCaptureShared>,
+    options: DebuggerOutputCaptureOptions,
+    restored: bool,
+}
+
+#[cfg(windows)]
+impl DebuggerOutputCapture {
+    pub fn set_preceding_event_index(&self, index: Option<usize>) {
+        self.shared.preceding_event_index.store(
+            index.unwrap_or(OUTPUT_CAPTURE_NO_EVENT_INDEX),
+            Ordering::Relaxed,
+        );
+    }
+
+    pub fn finish(mut self) -> anyhow::Result<DebuggerOutputCaptureResult> {
+        self.restore()?;
+        Ok(self.shared.snapshot(&self.options))
+    }
+
+    fn restore(&mut self) -> anyhow::Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        unsafe {
+            self.client
+                .SetOutputCallbacksWide(self.previous_callback.as_ref())
+                .context("restoring the previous DbgEng output callback")?;
+            self.client
+                .SetOutputMask(self.previous_output_mask)
+                .context("restoring the previous DbgEng output mask")?;
+        }
+        self.restored = true;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+impl Drop for DebuggerOutputCapture {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(windows)]
 unsafe impl Send for DebuggerSession {}
 
 #[cfg(not(windows))]
@@ -403,17 +928,92 @@ impl DebuggerSession {
         }
     }
 
+    pub fn begin_debuggee_output_capture(
+        &self,
+        options: DebuggerOutputCaptureOptions,
+    ) -> anyhow::Result<DebuggerOutputCapture> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugOutputCallbacksWide;
+
+        ensure!(
+            options.max_records > 0,
+            "DbgEng output capture requires a positive record limit"
+        );
+        ensure!(
+            options.max_chars_per_record > 0,
+            "DbgEng output capture requires a positive per-record character limit"
+        );
+        ensure!(
+            options.max_total_chars > 0,
+            "DbgEng output capture requires a positive total character limit"
+        );
+        let previous_callback = unsafe { self.client.GetOutputCallbacksWide().ok() };
+        let previous_output_mask = unsafe {
+            self.client
+                .GetOutputMask()
+                .context("reading the current DbgEng output mask")?
+        };
+        let shared = Arc::new(DebuggerOutputCaptureShared {
+            started_at: options.started_at,
+            max_records: options.max_records as usize,
+            max_chars_per_record: options.max_chars_per_record as usize,
+            max_total_chars: options.max_total_chars as usize,
+            preceding_event_index: AtomicUsize::new(OUTPUT_CAPTURE_NO_EVENT_INDEX),
+            state: Mutex::new(DebuggerOutputCaptureState::default()),
+        });
+        let callback: IDebugOutputCallbacksWide = DebuggerOutputCallback {
+            shared: Arc::clone(&shared),
+        }
+        .into();
+        unsafe {
+            self.client
+                .SetOutputCallbacksWide(&callback)
+                .context("installing the bounded DbgEng output callback")?;
+            if let Err(error) = self.client.SetOutputMask(
+                previous_output_mask
+                    | DEBUG_OUTPUT_DEBUGGEE_MASK
+                    | DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK,
+            ) {
+                let _ = self
+                    .client
+                    .SetOutputCallbacksWide(previous_callback.as_ref());
+                return Err(error).context("enabling DbgEng debuggee output categories");
+            }
+        }
+        Ok(DebuggerOutputCapture {
+            client: self.client.clone(),
+            previous_callback,
+            previous_output_mask,
+            _callback: callback,
+            shared,
+            options,
+            restored: false,
+        })
+    }
+
+    pub fn open_coreclr_dac_bridge(
+        &self,
+        coreclr_path: &Path,
+        allow_target_writes: bool,
+    ) -> anyhow::Result<CoreClrDacBridge> {
+        CoreClrDacBridge::open(self, coreclr_path, allow_target_writes)
+    }
+
     pub fn wait_for_event(&self, timeout_ms: u32) -> anyhow::Result<DebuggerExecutionStatus> {
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
             DEBUG_STATUS_TIMEOUT, DEBUG_WAIT_DEFAULT,
         };
 
         let wait = unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) };
-        let status = self.execution_status();
         match wait {
-            Ok(()) => Ok(status),
-            Err(_) if status.raw == Some(DEBUG_STATUS_TIMEOUT) => Ok(status),
-            Err(error) => Err(error.into()),
+            Ok(()) => Ok(self.execution_status()),
+            // DbgEng documents S_FALSE as its bounded wait timeout result.
+            Err(error) if is_dbgeng_wait_timeout_hresult(error.code().0) => {
+                Ok(DebuggerExecutionStatus {
+                    raw: Some(DEBUG_STATUS_TIMEOUT),
+                    name: Some(status_name(DEBUG_STATUS_TIMEOUT)),
+                })
+            }
+            Err(error) => Err(error).context("DbgEng WaitForEvent failed"),
         }
     }
 
@@ -422,6 +1022,15 @@ impl DebuggerSession {
 
         unsafe {
             self.control.SetExecutionStatus(DEBUG_STATUS_GO)?;
+        }
+        Ok(self.execution_status())
+    }
+
+    pub fn continue_execution_handled(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STATUS_GO_HANDLED;
+
+        unsafe {
+            self.control.SetExecutionStatus(DEBUG_STATUS_GO_HANDLED)?;
         }
         Ok(self.execution_status())
     }
@@ -600,6 +1209,89 @@ impl DebuggerSession {
         })
     }
 
+    pub fn virtual_memory_map(&self, region_limit: u32) -> anyhow::Result<VirtualMemoryMap> {
+        use windows::Win32::System::Memory::MEMORY_BASIC_INFORMATION64;
+
+        ensure!(
+            self.kind == DebuggerSessionKind::Live,
+            "DbgEng QueryVirtual is only supported for live user-mode targets"
+        );
+        ensure!(
+            region_limit > 0,
+            "DbgEng virtual-memory map requires a positive region limit"
+        );
+        ensure!(
+            region_limit <= MAX_VIRTUAL_MEMORY_MAP_REGIONS,
+            "DbgEng virtual-memory map region limit must not exceed {MAX_VIRTUAL_MEMORY_MAP_REGIONS}"
+        );
+
+        let mut regions = Vec::with_capacity((region_limit as usize).min(256));
+        let mut query_address = 0u64;
+        loop {
+            if regions.len() >= region_limit as usize {
+                return Ok(VirtualMemoryMap {
+                    source: "dbgeng_idata_spaces4_query_virtual".to_string(),
+                    status: "bounded".to_string(),
+                    region_limit,
+                    regions,
+                    truncated: true,
+                    next_query_address: Some(query_address),
+                    query_error: None,
+                    detail: "The requested region limit was reached before the DbgEng virtual-address query completed.".to_string(),
+                });
+            }
+
+            let mut info = MEMORY_BASIC_INFORMATION64::default();
+            let query = unsafe { self.data_spaces.QueryVirtual(query_address, &mut info) };
+            if let Err(error) = query {
+                return Ok(VirtualMemoryMap {
+                    source: "dbgeng_idata_spaces4_query_virtual".to_string(),
+                    status: if regions.is_empty() {
+                        "unavailable".to_string()
+                    } else {
+                        "partial_query_error".to_string()
+                    },
+                    region_limit,
+                    regions,
+                    truncated: true,
+                    next_query_address: Some(query_address),
+                    query_error: Some(error.to_string()),
+                    detail: "DbgEng QueryVirtual did not return another region. The returned list is not claimed to cover the full address space.".to_string(),
+                });
+            }
+            ensure!(
+                info.RegionSize > 0,
+                "DbgEng QueryVirtual returned a zero-sized region at 0x{query_address:X}"
+            );
+            regions.push(VirtualMemoryRegion {
+                base_address: info.BaseAddress,
+                allocation_base: info.AllocationBase,
+                allocation_protection: info.AllocationProtect.0,
+                region_size: info.RegionSize,
+                state: info.State.0,
+                protection: info.Protect.0,
+                kind: info.Type.0,
+            });
+            let next_query_address = info
+                .BaseAddress
+                .checked_add(info.RegionSize)
+                .filter(|next| *next > query_address);
+            let Some(next_query_address) = next_query_address else {
+                return Ok(VirtualMemoryMap {
+                    source: "dbgeng_idata_spaces4_query_virtual".to_string(),
+                    status: "address_space_exhausted".to_string(),
+                    region_limit,
+                    regions,
+                    truncated: false,
+                    next_query_address: None,
+                    query_error: None,
+                    detail: "DbgEng QueryVirtual reached the end of the representable virtual address range.".to_string(),
+                });
+            };
+            query_address = next_query_address;
+        }
+    }
+
     pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {
         let count = unsafe { self.system_objects.GetNumberThreads()? };
         let mut engine_ids = vec![0u32; count as usize];
@@ -620,6 +1312,167 @@ impl DebuggerSession {
                 system_id,
             })
             .collect())
+    }
+
+    pub fn thread_accounting_snapshot(
+        &self,
+        max_threads: u32,
+    ) -> anyhow::Result<ThreadAccountingSnapshot> {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            IDebugAdvanced2, DEBUG_SYSOBJINFO_THREAD_BASIC_INFORMATION,
+            DEBUG_SYSOBJINFO_THREAD_NAME_WIDE, DEBUG_TBINFO_AFFINITY, DEBUG_TBINFO_EXIT_STATUS,
+            DEBUG_TBINFO_PRIORITY, DEBUG_TBINFO_PRIORITY_CLASS, DEBUG_TBINFO_START_OFFSET,
+            DEBUG_TBINFO_TIMES, DEBUG_THREAD_BASIC_INFORMATION,
+        };
+
+        ensure!(
+            (1..=MAX_THREAD_ACCOUNTING_THREADS).contains(&max_threads),
+            "DbgEng thread-accounting limit must be from 1 through {MAX_THREAD_ACCOUNTING_THREADS}"
+        );
+        let threads = self.threads()?;
+        let total_threads = threads.len();
+        let truncated = total_threads > max_threads as usize;
+        let advanced: IDebugAdvanced2 = match self.client.cast() {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                return Ok(ThreadAccountingSnapshot {
+                    source: "dbgeng_iddebugadvanced2_getsystemobjectinformation".to_string(),
+                    status: "unavailable".to_string(),
+                    counter_units: "100ns".to_string(),
+                    total_threads: Some(total_threads),
+                    threads: Vec::new(),
+                    returned: 0,
+                    limit: max_threads,
+                    truncated,
+                    detail: format!(
+                        "DbgEng did not expose IDebugAdvanced2 for thread accounting: {error}"
+                    ),
+                });
+            }
+        };
+
+        const MAX_THREAD_NAME_CHARS: usize = 128;
+        let mut entries = Vec::with_capacity(total_threads.min(max_threads as usize));
+        for thread in threads.into_iter().take(max_threads as usize) {
+            let mut basic = DEBUG_THREAD_BASIC_INFORMATION::default();
+            let mut basic_information_size_bytes = 0u32;
+            let basic_result = unsafe {
+                advanced.GetSystemObjectInformation(
+                    DEBUG_SYSOBJINFO_THREAD_BASIC_INFORMATION,
+                    0,
+                    thread.engine_id,
+                    Some((&mut basic as *mut DEBUG_THREAD_BASIC_INFORMATION).cast()),
+                    std::mem::size_of::<DEBUG_THREAD_BASIC_INFORMATION>() as u32,
+                    Some(&mut basic_information_size_bytes),
+                )
+            };
+
+            let mut name_buffer = vec![0u16; MAX_THREAD_NAME_CHARS];
+            let mut name_size_bytes = 0u32;
+            let name_result = unsafe {
+                advanced.GetSystemObjectInformation(
+                    DEBUG_SYSOBJINFO_THREAD_NAME_WIDE,
+                    0,
+                    thread.engine_id,
+                    Some(name_buffer.as_mut_ptr().cast()),
+                    (name_buffer.len() * std::mem::size_of::<u16>()) as u32,
+                    Some(&mut name_size_bytes),
+                )
+            };
+            let basic_captured = basic_result.is_ok();
+            let name_captured = name_result.is_ok();
+
+            let mut errors = Vec::new();
+            let basic_information_status = match &basic_result {
+                Ok(()) => "captured".to_string(),
+                Err(error) => {
+                    errors.push(format!("basic_information: {error}"));
+                    "unavailable".to_string()
+                }
+            };
+            let (name_status, name) = match &name_result {
+                Ok(()) => {
+                    let capacity_bytes = (name_buffer.len() * std::mem::size_of::<u16>()) as u32;
+                    let used_chars = if name_size_bytes == 0 {
+                        name_buffer
+                            .iter()
+                            .position(|character| *character == 0)
+                            .unwrap_or(name_buffer.len())
+                    } else {
+                        (name_size_bytes as usize / std::mem::size_of::<u16>())
+                            .min(name_buffer.len())
+                    };
+                    let name_slice = &name_buffer[..used_chars];
+                    let name_len = name_slice
+                        .iter()
+                        .position(|character| *character == 0)
+                        .unwrap_or(name_slice.len());
+                    let name = String::from_utf16_lossy(&name_slice[..name_len]);
+                    (
+                        if name_size_bytes > capacity_bytes {
+                            "truncated".to_string()
+                        } else if name.is_empty() {
+                            "not_provided".to_string()
+                        } else {
+                            "captured".to_string()
+                        },
+                        (!name.is_empty()).then_some(name),
+                    )
+                }
+                Err(error) => {
+                    errors.push(format!("thread_name: {error}"));
+                    ("unavailable".to_string(), None)
+                }
+            };
+            let valid = basic.Valid;
+            let has = |flag| basic_captured && valid & flag != 0;
+            entries.push(ThreadAccountingEntry {
+                thread,
+                basic_information_status,
+                basic_information_size_bytes: basic_captured
+                    .then_some(basic_information_size_bytes),
+                name_status,
+                name,
+                name_size_bytes: name_captured.then_some(name_size_bytes),
+                valid_mask: basic_captured.then_some(valid),
+                exit_status: has(DEBUG_TBINFO_EXIT_STATUS).then_some(basic.ExitStatus),
+                priority_class: has(DEBUG_TBINFO_PRIORITY_CLASS).then_some(basic.PriorityClass),
+                priority: has(DEBUG_TBINFO_PRIORITY).then_some(basic.Priority),
+                create_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.CreateTime),
+                exit_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.ExitTime),
+                kernel_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.KernelTime),
+                user_time_raw: has(DEBUG_TBINFO_TIMES).then_some(basic.UserTime),
+                kernel_time_ms: has(DEBUG_TBINFO_TIMES)
+                    .then_some(basic.KernelTime as f64 / 10_000.0),
+                user_time_ms: has(DEBUG_TBINFO_TIMES).then_some(basic.UserTime as f64 / 10_000.0),
+                start_offset: has(DEBUG_TBINFO_START_OFFSET).then_some(basic.StartOffset),
+                affinity: has(DEBUG_TBINFO_AFFINITY).then_some(basic.Affinity),
+                errors,
+            });
+        }
+        let unavailable_entries = entries
+            .iter()
+            .filter(|entry| entry.basic_information_status != "captured")
+            .count();
+        let status = if entries.is_empty() || unavailable_entries == entries.len() {
+            "unavailable"
+        } else if unavailable_entries > 0 || truncated {
+            "partial"
+        } else {
+            "captured"
+        };
+        Ok(ThreadAccountingSnapshot {
+            source: "dbgeng_iddebugadvanced2_getsystemobjectinformation".to_string(),
+            status: status.to_string(),
+            counter_units: "100ns".to_string(),
+            total_threads: Some(total_threads),
+            returned: entries.len(),
+            threads: entries,
+            limit: max_threads,
+            truncated,
+            detail: "Per-thread fields are returned only when their DEBUG_THREAD_BASIC_INFORMATION valid-mask bit is set. KernelTime and UserTime use 100 ns DbgEng counters; their millisecond projections were fixture-validated against a bounded CPU-burn run. They remain per-thread accounting samples, not lifecycle-gap causality.".to_string(),
+        })
     }
 
     pub fn modules(&self) -> anyhow::Result<Vec<ModuleInfo>> {
@@ -656,6 +1509,125 @@ impl DebuggerSession {
             });
         }
         Ok(modules)
+    }
+
+    pub fn module_parameters(
+        &self,
+        base_addresses: &[u64],
+    ) -> anyhow::Result<Vec<ModuleDebugParameters>> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_MODULE_PARAMETERS;
+
+        ensure!(
+            !base_addresses.is_empty(),
+            "DbgEng module-parameter query requires at least one observed module base address"
+        );
+        ensure!(
+            base_addresses.len() <= MAX_MODULE_PARAMETER_QUERIES,
+            "DbgEng module-parameter query supports at most {MAX_MODULE_PARAMETER_QUERIES} module base addresses"
+        );
+        let mut parameters = vec![DEBUG_MODULE_PARAMETERS::default(); base_addresses.len()];
+        unsafe {
+            self.symbols.GetModuleParameters(
+                base_addresses.len() as u32,
+                Some(base_addresses.as_ptr()),
+                0,
+                parameters.as_mut_ptr(),
+            )?;
+        }
+        Ok(parameters
+            .into_iter()
+            .map(|parameters| ModuleDebugParameters {
+                base_address: parameters.Base,
+                image_size: parameters.Size,
+                time_date_stamp: parameters.TimeDateStamp,
+                checksum: parameters.Checksum,
+                flags: parameters.Flags,
+                symbol_type: parameters.SymbolType,
+                symbol_type_name: dbgeng_symbol_type_name(parameters.SymbolType).to_string(),
+                image_name_size: parameters.ImageNameSize,
+                module_name_size: parameters.ModuleNameSize,
+                loaded_image_name_size: parameters.LoadedImageNameSize,
+                symbol_file_name_size: parameters.SymbolFileNameSize,
+                mapped_image_name_size: parameters.MappedImageNameSize,
+            })
+            .collect())
+    }
+
+    pub fn symbol_entry_range_by_offset(&self, address: u64) -> anyhow::Result<SymbolEntryRange> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_MODULE_AND_ID, DEBUG_OFFSET_REGION, DEBUG_SYMBOL_ENTRY,
+        };
+
+        let mut id = DEBUG_MODULE_AND_ID::default();
+        let mut displacement = 0u64;
+        let mut entries = 0u32;
+        unsafe {
+            self.symbols.GetSymbolEntriesByOffset(
+                address,
+                0,
+                Some(&mut id),
+                Some(&mut displacement),
+                1,
+                Some(&mut entries),
+            )?;
+        }
+        if entries == 0 {
+            return Ok(SymbolEntryRange {
+                source: "dbgeng_idebugsymbols5_symbol_entry".to_string(),
+                status: "not_found".to_string(),
+                address,
+                symbol_module_base: None,
+                symbol_offset: None,
+                symbol_size: None,
+                displacement: None,
+                symbol_tag: None,
+                symbol_flags: None,
+                symbol_token: None,
+                regions: Vec::new(),
+                regions_available: Some(0),
+                regions_truncated: false,
+                detail: "DbgEng returned no symbol entry for the requested address.".to_string(),
+            });
+        }
+
+        let mut entry = DEBUG_SYMBOL_ENTRY::default();
+        unsafe {
+            self.symbols.GetSymbolEntryInformation(&id, &mut entry)?;
+        }
+        let mut regions = vec![DEBUG_OFFSET_REGION::default(); MAX_SYMBOL_ENTRY_OFFSET_REGIONS];
+        let mut regions_available = 0u32;
+        unsafe {
+            self.symbols.GetSymbolEntryOffsetRegions(
+                &id,
+                0,
+                Some(regions.as_mut_slice()),
+                Some(&mut regions_available),
+            )?;
+        }
+        let returned = regions_available.min(MAX_SYMBOL_ENTRY_OFFSET_REGIONS as u32) as usize;
+        regions.truncate(returned);
+        Ok(SymbolEntryRange {
+            source: "dbgeng_idebugsymbols5_symbol_entry".to_string(),
+            status: "captured".to_string(),
+            address,
+            symbol_module_base: Some(entry.ModuleBase),
+            symbol_offset: Some(entry.Offset),
+            symbol_size: Some(entry.Size),
+            displacement: Some(displacement),
+            symbol_tag: Some(entry.Tag),
+            symbol_flags: Some(entry.Flags),
+            symbol_token: Some(entry.Token),
+            regions: regions
+                .into_iter()
+                .map(|region| SymbolEntryOffsetRegion {
+                    base_address: region.Base,
+                    size: region.Size,
+                })
+                .collect(),
+            regions_available: Some(regions_available),
+            regions_truncated: regions_available > MAX_SYMBOL_ENTRY_OFFSET_REGIONS as u32,
+            detail: "This is a bounded DbgEng symbol-entry offset-region query. It identifies debugger symbol coverage at an observed native address, but does not establish managed method execution. Symbol queries can trigger host-side symbol resolution I/O according to the configured symbol path.".to_string(),
+        })
     }
 
     pub fn module_by_offset(&self, address: u64) -> anyhow::Result<Option<ModuleInfo>> {
@@ -902,6 +1874,25 @@ impl DebuggerSession {
         self.breakpoint_info(&breakpoint)
     }
 
+    pub fn execute_command(&self, command: &str) -> anyhow::Result<()> {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_THIS_CLIENT,
+        };
+
+        let mut command_wide = command.encode_utf16().collect::<Vec<_>>();
+        command_wide.push(0);
+        unsafe {
+            self.control.ExecuteWide(
+                DEBUG_OUTCTL_THIS_CLIENT,
+                PCWSTR(command_wide.as_ptr()),
+                DEBUG_EXECUTE_DEFAULT,
+            )
+        }
+        .with_context(|| format!("executing DbgEng command '{command}'"))?;
+        Ok(())
+    }
+
     pub fn add_data_breakpoint(
         &self,
         address: u64,
@@ -917,6 +1908,28 @@ impl DebuggerSession {
             breakpoint.SetOffset(address)?;
             breakpoint.SetDataParameters(size, access_type)?;
             breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+        }
+        self.breakpoint_info(&breakpoint)
+    }
+
+    pub fn add_hardware_execute_breakpoint(&self, address: u64) -> anyhow::Result<BreakpointInfo> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_ENABLED, DEBUG_BREAK_EXECUTE,
+        };
+
+        let breakpoint = self
+            .add_compatible_breakpoint(DEBUG_BREAKPOINT_DATA)
+            .context("DbgEng could not create a processor execute breakpoint")?;
+        unsafe {
+            breakpoint.SetOffset(address).with_context(|| {
+                format!("DbgEng could not set processor execute breakpoint offset 0x{address:X}")
+            })?;
+            breakpoint
+                .SetDataParameters(1, DEBUG_BREAK_EXECUTE)
+                .context("DbgEng could not configure a one-byte processor execute breakpoint")?;
+            breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .context("DbgEng could not enable the processor execute breakpoint")?;
         }
         self.breakpoint_info(&breakpoint)
     }
@@ -1234,6 +2247,10 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn continue_execution_handled(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn add_code_breakpoint_expression(
         &self,
         _expression: &str,
@@ -1289,17 +2306,37 @@ fn status_name(status: u32) -> String {
 }
 
 #[cfg(windows)]
+fn dbgeng_symbol_type_name(symbol_type: u32) -> &'static str {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_SYMTYPE_CODEVIEW, DEBUG_SYMTYPE_COFF, DEBUG_SYMTYPE_DEFERRED, DEBUG_SYMTYPE_DIA,
+        DEBUG_SYMTYPE_EXPORT, DEBUG_SYMTYPE_NONE, DEBUG_SYMTYPE_PDB, DEBUG_SYMTYPE_SYM,
+    };
+
+    match symbol_type {
+        DEBUG_SYMTYPE_NONE => "none",
+        DEBUG_SYMTYPE_COFF => "coff",
+        DEBUG_SYMTYPE_CODEVIEW => "codeview",
+        DEBUG_SYMTYPE_PDB => "pdb",
+        DEBUG_SYMTYPE_EXPORT => "export",
+        DEBUG_SYMTYPE_DEFERRED => "deferred",
+        DEBUG_SYMTYPE_SYM => "sym",
+        DEBUG_SYMTYPE_DIA => "dia",
+        _ => "unknown",
+    }
+}
+
+#[cfg(windows)]
 fn start_process_server_impl(options: ProcessServerOptions) -> anyhow::Result<ProcessServerResult> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, DEBUG_CLASS_USER_WINDOWS,
+        IDebugClient5, DEBUG_CLASS_USER_WINDOWS,
     };
     use windows::Win32::System::Threading::INFINITE;
 
     let mut transport = options.transport.encode_utf16().collect::<Vec<_>>();
     transport.push(0);
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
+    let client: IDebugClient5 = create_debug_client()?;
     unsafe {
         client.StartProcessServerWide(
             DEBUG_CLASS_USER_WINDOWS,
@@ -1320,6 +2357,7 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
     let session = launch_live_session_impl(LiveLaunchSessionOptions {
         command_line: options.command_line.clone(),
         initial_break_timeout_ms: options.initial_break_timeout_ms,
+        initial_stop: LiveInitialStop::SoftwareBreakpoint,
     })?;
     let execution_status = session.execution_status();
     let symbol_path = session.symbol_path.clone();
@@ -1343,20 +2381,25 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
 fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result<DebuggerSession> {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
-        IDebugSymbols5, IDebugSystemObjects, DEBUG_PROCESS_ONLY_THIS_PROCESS,
+        IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters, IDebugSymbols5,
+        IDebugSystemObjects, DEBUG_PROCESS_ONLY_THIS_PROCESS,
     };
 
     let mut command_line = options.command_line.encode_utf16().collect::<Vec<_>>();
     command_line.push(0);
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
-    let control: IDebugControl5 = client.cast()?;
-    let data_spaces: IDebugDataSpaces4 = client.cast()?;
-    let registers: IDebugRegisters = client.cast()?;
-    let symbols: IDebugSymbols5 = client.cast()?;
-    let system_objects: IDebugSystemObjects = client.cast()?;
+    let client: IDebugClient5 = create_debug_client()?;
+    let control: IDebugControl5 = client.cast().context("querying IDebugControl5")?;
+    let data_spaces: IDebugDataSpaces4 = client.cast().context("querying IDebugDataSpaces4")?;
+    let registers: IDebugRegisters = client.cast().context("querying IDebugRegisters")?;
+    let symbols: IDebugSymbols5 = client.cast().context("querying IDebugSymbols5")?;
+    let system_objects: IDebugSystemObjects =
+        client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
+    match options.initial_stop {
+        LiveInitialStop::SoftwareBreakpoint => enable_initial_break(&control)?,
+        LiveInitialStop::CreateProcessEvent => enable_create_process_stop(&control)?,
+    }
     unsafe {
         // DbgEng can mutate the command buffer; command_line is owned and remains live for the call.
         client
@@ -1366,11 +2409,12 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
                 DEBUG_PROCESS_ONLY_THIS_PROCESS,
             )
             .context("DbgEng CreateProcessWide failed")?;
-        control.WaitForEvent(
-            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT,
-            options.initial_break_timeout_ms,
-        )?;
     }
+    let initial_stop = match options.initial_stop {
+        LiveInitialStop::SoftwareBreakpoint => "software initial-break",
+        LiveInitialStop::CreateProcessEvent => "create-process",
+    };
+    wait_for_initial_event(&control, options.initial_break_timeout_ms, initial_stop)?;
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Live,
@@ -1391,21 +2435,23 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
 fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<DebuggerSession> {
     use windows::core::Interface;
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
-        IDebugSymbols5, IDebugSystemObjects, DEBUG_ATTACH_DEFAULT, DEBUG_WAIT_DEFAULT,
+        IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters, IDebugSymbols5,
+        IDebugSystemObjects, DEBUG_ATTACH_DEFAULT,
     };
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
-    let control: IDebugControl5 = client.cast()?;
-    let data_spaces: IDebugDataSpaces4 = client.cast()?;
-    let registers: IDebugRegisters = client.cast()?;
-    let symbols: IDebugSymbols5 = client.cast()?;
-    let system_objects: IDebugSystemObjects = client.cast()?;
+    let client: IDebugClient5 = create_debug_client()?;
+    let control: IDebugControl5 = client.cast().context("querying IDebugControl5")?;
+    let data_spaces: IDebugDataSpaces4 = client.cast().context("querying IDebugDataSpaces4")?;
+    let registers: IDebugRegisters = client.cast().context("querying IDebugRegisters")?;
+    let symbols: IDebugSymbols5 = client.cast().context("querying IDebugSymbols5")?;
+    let system_objects: IDebugSystemObjects =
+        client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
+    enable_initial_break(&control)?;
     unsafe {
         client.AttachProcess(0, options.process_id, DEBUG_ATTACH_DEFAULT)?;
-        control.WaitForEvent(DEBUG_WAIT_DEFAULT, options.initial_break_timeout_ms)?;
     }
+    wait_for_initial_event(&control, options.initial_break_timeout_ms, "attach")?;
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Live,
@@ -1426,24 +2472,27 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
 fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSession> {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
-        IDebugSymbols5, IDebugSystemObjects, DEBUG_WAIT_DEFAULT,
+        IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters, IDebugSymbols5,
+        IDebugSystemObjects, DEBUG_WAIT_DEFAULT,
     };
 
     let path_string = options.path.to_string_lossy().to_string();
     let mut path = path_string.encode_utf16().collect::<Vec<_>>();
     path.push(0);
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
-    let control: IDebugControl5 = client.cast()?;
-    let data_spaces: IDebugDataSpaces4 = client.cast()?;
-    let registers: IDebugRegisters = client.cast()?;
-    let symbols: IDebugSymbols5 = client.cast()?;
-    let system_objects: IDebugSystemObjects = client.cast()?;
+    let client: IDebugClient5 = create_debug_client()?;
+    let control: IDebugControl5 = client.cast().context("querying IDebugControl5")?;
+    let data_spaces: IDebugDataSpaces4 = client.cast().context("querying IDebugDataSpaces4")?;
+    let registers: IDebugRegisters = client.cast().context("querying IDebugRegisters")?;
+    let symbols: IDebugSymbols5 = client.cast().context("querying IDebugSymbols5")?;
+    let system_objects: IDebugSystemObjects =
+        client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
-        control.WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)?;
+        control
+            .WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)
+            .context("DbgEng dump WaitForEvent failed")?;
     }
 
     Ok(DebuggerSession {
@@ -1565,6 +2614,77 @@ fn encode_hex(bytes: &[u8]) -> String {
     result
 }
 
+fn duration_millis(duration: std::time::Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(windows)]
+fn saturating_u32(value: usize) -> u32 {
+    value.min(u32::MAX as usize) as u32
+}
+
+#[cfg(windows)]
+fn debug_output_categories(mask: u32) -> Vec<String> {
+    const OUTPUT_CATEGORIES: &[(u32, &str)] = &[
+        (0x0000_0001, "normal"),
+        (0x0000_0002, "error"),
+        (0x0000_0004, "warning"),
+        (0x0000_0008, "verbose"),
+        (0x0000_0010, "prompt"),
+        (0x0000_0020, "prompt_registers"),
+        (0x0000_0040, "extension_warning"),
+        (DEBUG_OUTPUT_DEBUGGEE_MASK, "debuggee"),
+        (DEBUG_OUTPUT_DEBUGGEE_PROMPT_MASK, "debuggee_prompt"),
+        (0x0000_0200, "symbols"),
+        (0x0000_0400, "status"),
+    ];
+    let mut categories = OUTPUT_CATEGORIES
+        .iter()
+        .filter(|(flag, _)| mask & *flag != 0)
+        .map(|(_, name)| (*name).to_string())
+        .collect::<Vec<_>>();
+    if categories.is_empty() {
+        categories.push("unknown".to_string());
+    }
+    categories
+}
+
+#[cfg(windows)]
+fn load_dbghelp_module() -> anyhow::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
+    let executable_path = env::current_exe().ok();
+    if let Some(dbgeng) =
+        dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref())?
+    {
+        let runtime_dir = dbgeng
+            .parent()
+            .context("the selected DbgEng runtime DLL has no parent directory")?;
+        let dbghelp = runtime_dir.join("dbghelp.dll");
+        ensure!(
+            dbghelp.is_file(),
+            "the selected DbgEng runtime is missing required component {}",
+            dbghelp.display()
+        );
+        return load_library_from_path(&dbghelp, "DbgHelp runtime component");
+    }
+
+    let mut component_wide = "dbghelp.dll".encode_utf16().collect::<Vec<_>>();
+    component_wide.push(0);
+    unsafe {
+        LoadLibraryExW(
+            PCWSTR(component_wide.as_ptr()),
+            None,
+            LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+    }
+    .context("loading DbgHelp from the system runtime")
+}
+
 #[cfg(windows)]
 fn write_process_dump_file(
     process_id: u32,
@@ -1572,14 +2692,17 @@ fn write_process_dump_file(
     detached: bool,
     options: DumpWriteOptions,
 ) -> anyhow::Result<DumpWriteResult> {
+    use std::ffi::c_void;
     use std::fs::OpenOptions;
     use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::core::{Error, PCSTR};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
     use windows::Win32::System::Diagnostics::Debug::{
         MiniDumpWithDataSegs, MiniDumpWithFullMemory, MiniDumpWithFullMemoryInfo,
         MiniDumpWithHandleData, MiniDumpWithProcessThreadData, MiniDumpWithThreadInfo,
-        MiniDumpWithUnloadedModules, MiniDumpWriteDump, MINIDUMP_TYPE,
+        MiniDumpWithUnloadedModules, MINIDUMP_TYPE,
     };
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
@@ -1616,23 +2739,41 @@ fn write_process_dump_file(
         }
     };
 
+    type MiniDumpWriteDumpFn = unsafe extern "system" fn(
+        HANDLE,
+        u32,
+        HANDLE,
+        MINIDUMP_TYPE,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+    ) -> BOOL;
+
+    let dbghelp = load_dbghelp_module()?;
+    let procedure = unsafe { GetProcAddress(dbghelp, PCSTR(c"MiniDumpWriteDump".as_ptr().cast())) }
+        .context("the selected DbgHelp runtime does not export MiniDumpWriteDump")?;
+    // GetProcAddress returns an untyped module export. MiniDumpWriteDump has the documented
+    // DbgHelp ABI and the module remains loaded for the duration of this call.
+    let mini_dump_write_dump: MiniDumpWriteDumpFn = unsafe { std::mem::transmute(procedure) };
     let write_result = unsafe {
-        MiniDumpWriteDump(
+        mini_dump_write_dump(
             process,
             process_id,
             HANDLE(file.as_raw_handle()),
             dump_type,
-            None,
-            None,
-            None,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
         )
     };
     unsafe {
         CloseHandle(process)?;
     }
-    if let Err(error) = write_result {
-        return Err(error).context("MiniDumpWriteDump failed");
-    }
+    ensure!(
+        write_result.as_bool(),
+        "MiniDumpWriteDump failed: {}",
+        Error::from_win32()
+    );
     drop(file);
     let metadata = std::fs::metadata(&options.path)
         .with_context(|| format!("dump file was not created: {}", options.path.display()))?;
@@ -1765,5 +2906,33 @@ mod tests {
         assert_eq!(event_type_name(2), "exception");
         assert_eq!(event_type_name(64), "load_module");
         assert_eq!(event_type_name(0xFFFF), "unknown");
+    }
+
+    #[test]
+    fn recognizes_dbgeng_s_false_as_wait_timeout() {
+        assert!(is_dbgeng_wait_timeout_hresult(1));
+        assert!(!is_dbgeng_wait_timeout_hresult(0));
+        assert!(!is_dbgeng_wait_timeout_hresult(-1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_dbgeng_runtime_overrides_an_adjacent_runtime() {
+        use std::fs;
+
+        let root =
+            env::temp_dir().join(format!("windbg-dbgeng-runtime-test-{}", std::process::id()));
+        let explicit_runtime = root.join("explicit");
+        let executable = root.join("bin").join("windbg-tool.exe");
+        let adjacent_runtime = executable.parent().unwrap().join(DBGENG_DLL_NAME);
+        fs::create_dir_all(&explicit_runtime).unwrap();
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(explicit_runtime.join(DBGENG_DLL_NAME), []).unwrap();
+        fs::write(&adjacent_runtime, []).unwrap();
+
+        let resolved = dbgeng_runtime_dll(Some(&explicit_runtime), Some(&executable)).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(resolved, Some(explicit_runtime.join(DBGENG_DLL_NAME)));
     }
 }
