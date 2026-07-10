@@ -468,10 +468,18 @@ enum TargetCommand {
     Modules(TargetIdArgs),
     #[command(about = "Read current thread and instruction offsets for a daemon-owned target")]
     Registers(TargetIdArgs),
+    #[command(
+        about = "Read the last DbgEng event with bounded exception, breakpoint, module, or exit evidence"
+    )]
+    Event(TargetIdArgs),
     #[command(about = "Read memory from a daemon-owned target")]
     Memory(TargetMemoryReadArgs),
     #[command(about = "Walk the current stack for a daemon-owned target")]
     Stack(TargetStackTraceArgs),
+    #[command(
+        about = "Inspect one engine thread without leaving it selected after the bounded query"
+    )]
+    Thread(TargetThreadContextArgs),
     #[command(about = "Disassemble instructions from a daemon-owned target")]
     Disasm(TargetDisasmArgs),
     #[command(about = "Resolve the nearest symbol for a daemon-owned target address")]
@@ -1150,6 +1158,21 @@ struct TargetStackTraceArgs {
 }
 
 #[derive(Debug, Args)]
+struct TargetThreadContextArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(
+        long,
+        help = "DbgEng engine thread id returned by `target threads --target <id>`"
+    )]
+    engine_thread_id: u32,
+    #[arg(long, default_value_t = 32)]
+    max_frames: u32,
+    #[arg(long, default_value_t = 16)]
+    disassembly_count: u32,
+}
+
+#[derive(Debug, Args)]
 struct TargetDisasmArgs {
     #[arg(short = 't', long = "target")]
     target: u64,
@@ -1818,9 +1841,11 @@ async fn target_capabilities_and_print(
                         "continue",
                         "step_into",
                         "registers",
+                        "last_event",
                         "memory",
                         "modules",
                         "threads",
+                        "thread_context",
                         "stack",
                         "symbol_lookup",
                         "source_lookup",
@@ -1843,6 +1868,7 @@ async fn target_capabilities_and_print(
                         "threads",
                         "registers",
                         "stack",
+                        "thread_context",
                         "symbols",
                         "source",
                         "disassembly",
@@ -2057,6 +2083,22 @@ async fn debug_target_snapshot_value(
                         .await,
                 ),
                 Some("target registers --target <id>"),
+                None,
+            ),
+        );
+    }
+    if snapshot_section_enabled(&args, "event") {
+        let started = Instant::now();
+        sections.insert(
+            "event".to_string(),
+            composite_section(
+                started,
+                call_status_value(
+                    client
+                        .call_tool(target_call("target_last_event", target))
+                        .await,
+                ),
+                Some("target event --target <id>"),
                 None,
             ),
         );
@@ -3604,7 +3646,7 @@ fn backend_capability(kind: &str) -> Value {
             "supports_jobs": false,
             "supports_timeline": false,
             "required_identifiers": ["target_id"],
-            "safe_commands": ["debug snapshot", "target status", "target stack", "target disasm", "breakpoint plan"],
+            "safe_commands": ["debug snapshot", "target status", "target event", "target thread", "target stack", "target disasm", "breakpoint plan"],
             "mutating_commands": ["target continue", "target step", "breakpoint set", "target dump"],
             "destructive_commands": ["target terminate", "target close"],
             "unsupported_operations": [
@@ -3627,7 +3669,7 @@ fn backend_capability(kind: &str) -> Value {
             "supports_jobs": false,
             "supports_timeline": false,
             "required_identifiers": ["target_id"],
-            "safe_commands": ["debug snapshot", "target status", "target stack", "target disasm"],
+            "safe_commands": ["debug snapshot", "target status", "target thread", "target stack", "target disasm"],
             "mutating_commands": [],
             "destructive_commands": ["target close"],
             "unsupported_operations": [
@@ -4482,6 +4524,8 @@ fn discover_manifest() -> Value {
                 "target threads --target <id>",
                 "target modules --target <id>",
                 "target registers --target <id>",
+                "target event --target <id>",
+                "target thread --target <id> --engine-thread-id <id>",
                 "target memory --target <id> --address <addr> --size <n>",
                 "target dump --target <id> --output <path>",
                 "target stack --target <id>",
@@ -4867,12 +4911,14 @@ fn tool_command_map() -> Value {
         { "tool": "target_continue", "commands": ["target continue"] },
         { "tool": "target_step_into", "commands": ["target step"] },
         { "tool": "target_core_registers", "commands": ["target registers"] },
+        { "tool": "target_last_event", "commands": ["target event", "debug snapshot --include event"] },
         { "tool": "target_read_memory", "commands": ["target memory"] },
         { "tool": "target_list_threads", "commands": ["target threads"] },
         { "tool": "target_list_modules", "commands": ["target modules"] },
         { "tool": "target_symbol_by_offset", "commands": ["target symbol"] },
         { "tool": "target_source_by_offset", "commands": ["target source"] },
         { "tool": "target_stack_trace", "commands": ["target stack"] },
+        { "tool": "target_thread_context", "commands": ["target thread"] },
         { "tool": "target_disassemble", "commands": ["target disasm"] },
         { "tool": "target_list_breakpoints", "commands": ["breakpoint list"] },
         { "tool": "target_set_breakpoint", "commands": ["breakpoint set"] },
@@ -5447,6 +5493,18 @@ fn target_stack_call(args: TargetStackTraceArgs) -> ToolCall {
         arguments: json!({
             "target_id": args.target,
             "max_frames": args.max_frames,
+        }),
+    }
+}
+
+fn target_thread_context_call(args: TargetThreadContextArgs) -> ToolCall {
+    ToolCall {
+        name: "target_thread_context".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "engine_thread_id": args.engine_thread_id,
+            "max_frames": args.max_frames,
+            "disassembly_count": args.disassembly_count,
         }),
     }
 }

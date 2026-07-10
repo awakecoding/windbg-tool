@@ -109,6 +109,24 @@ Use `--initial-break` when no reliable code breakpoint is available or the host 
 
 `--end terminate` is the default for disposable startup probes. Use `--end detach` only when the debuggee should continue after the captured event.
 
+## AI-oriented DbgEng target inspection
+
+Daemon-owned live and dump targets expose bounded, read-only inspection commands for agent workflows. After `target wait` reports a stop on a live target, use `target event` to identify the DbgEng event that caused it. The response includes the process/thread IDs, event type, and, where DbgEng provides it, a breakpoint ID, exception code/address/first-chance state, module base, or exit code. It does not return unbounded debugger output. Event inspection is unavailable for dump targets because a dump has no live event stream.
+
+```powershell
+target\debug\windbg-tool.exe --compact target event --target 1
+```
+
+`target threads` returns DbgEng engine thread IDs. Use one of those IDs with `target thread` to capture that thread's core registers, nearest module/symbol, bounded stack, and bounded disassembly. The command restores the previously selected DbgEng thread before returning, so it is safe for agents to inspect worker threads without changing subsequent target commands.
+
+```powershell
+target\debug\windbg-tool.exe --compact target threads --target 1
+target\debug\windbg-tool.exe --compact target thread --target 1 `
+  --engine-thread-id 3 --max-frames 16 --disassembly-count 8
+```
+
+`debug snapshot --target <id>` now includes a best-effort `event` section by default for live targets. Use `--exclude event` when an event query is not relevant, or `--include event` to request it alone.
+
 ## Canonical agent debugging commands
 
 Use `debug capabilities` before choosing actions. With no subject it returns a backend matrix for TTD cursors, daemon-owned live/dump targets, and remote process-server plans. With `--session/--cursor` or `--target`, it includes selected-subject status/evidence where available.
@@ -234,7 +252,7 @@ The schema includes curated metadata where available and inferred metadata for o
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
 | Symbol and source triage | `symbols doctor`, `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `dump create`, `dump open`, `dump inspect`, `target dump`, `windbg status` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `dump create`, `dump open`, `dump inspect`, `target event`, `target thread`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 

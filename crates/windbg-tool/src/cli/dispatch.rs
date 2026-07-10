@@ -307,11 +307,17 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
                 )
                 .await
             }
+            TargetCommand::Event(args) => {
+                call_and_print(pipe, target_call("target_last_event", args.target), &output).await
+            }
             TargetCommand::Memory(args) => {
                 call_and_print(pipe, target_memory_call(args)?, &output).await
             }
             TargetCommand::Stack(args) => {
                 call_and_print(pipe, target_stack_call(args), &output).await
+            }
+            TargetCommand::Thread(args) => {
+                call_and_print(pipe, target_thread_context_call(args), &output).await
             }
             TargetCommand::Disasm(args) => {
                 call_and_print(pipe, target_disasm_call(args)?, &output).await

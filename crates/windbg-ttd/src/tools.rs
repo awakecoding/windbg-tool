@@ -4,7 +4,7 @@ use crate::targets::{
     DumpOpenRequest, LiveAttachRequest, LiveLaunchRequest, TargetAddressRequest,
     TargetBreakpointRemoveRequest, TargetBreakpointSetRequest, TargetDisassembleRequest,
     TargetExpressionRequest, TargetMemoryReadRequest, TargetRequest, TargetStackTraceRequest,
-    TargetWaitRequest, TargetWriteDumpRequest,
+    TargetThreadContextRequest, TargetWaitRequest, TargetWriteDumpRequest,
 };
 use crate::ttd_replay::{
     AddressInfoRequest, CursorId, IndexBuildRequest, IndexStatsRequest, IndexStatusRequest,
@@ -207,6 +207,10 @@ pub fn definitions() -> Vec<Tool> {
             "target_core_registers",
             "Read current thread and instruction, stack, and frame offsets from a daemon-owned target session.",
         ),
+        tool::<TargetRequest>(
+            "target_last_event",
+            "Read the last DbgEng event, including bounded exception, breakpoint, module, or exit evidence when available.",
+        ),
         tool::<TargetMemoryReadRequest>(
             "target_read_memory",
             "Read memory from a daemon-owned live or dump target session.",
@@ -230,6 +234,10 @@ pub fn definitions() -> Vec<Tool> {
         tool::<TargetStackTraceRequest>(
             "target_stack_trace",
             "Walk the current stack for a daemon-owned live or dump target session.",
+        ),
+        tool::<TargetThreadContextRequest>(
+            "target_thread_context",
+            "Read bounded registers, module/symbol, stack, and disassembly for one engine thread, then restore the prior current thread.",
         ),
         tool::<TargetDisassembleRequest>(
             "target_disassemble",
@@ -488,6 +496,10 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
                 state.targets.core_registers(request)?,
             )?)
         }
+        "target_last_event" => {
+            let request = parse::<TargetRequest>(call.arguments)?;
+            Ok(serde_json::to_value(state.targets.last_event(request)?)?)
+        }
         "target_read_memory" => {
             let request = parse::<TargetMemoryReadRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.read_memory(request)?)?)
@@ -515,6 +527,12 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         "target_stack_trace" => {
             let request = parse::<TargetStackTraceRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.stack_trace(request)?)?)
+        }
+        "target_thread_context" => {
+            let request = parse::<TargetThreadContextRequest>(call.arguments)?;
+            Ok(serde_json::to_value(
+                state.targets.thread_context(request)?,
+            )?)
         }
         "target_disassemble" => {
             let request = parse::<TargetDisassembleRequest>(call.arguments)?;

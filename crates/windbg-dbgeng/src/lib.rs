@@ -1,4 +1,4 @@
-use anyhow::{bail, Context};
+use anyhow::{bail, ensure, Context};
 use serde::Serialize;
 use std::{
     env,
@@ -297,6 +297,40 @@ pub struct EvaluationResult {
     pub float64_value: Option<f64>,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerExceptionInfo {
+    pub code: u32,
+    pub flags: u32,
+    pub address: u64,
+    pub first_chance: bool,
+    pub parameters: Vec<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerEventInfo {
+    pub event_type: u32,
+    pub event_name: String,
+    pub process_system_id: u32,
+    pub thread_system_id: u32,
+    pub description: Option<String>,
+    pub extra_information_size: u32,
+    pub breakpoint_id: Option<u32>,
+    pub exception: Option<DebuggerExceptionInfo>,
+    pub module_base: Option<u64>,
+    pub exit_code: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadContext {
+    pub thread: ThreadInfo,
+    pub registers: CoreRegisterState,
+    pub current_module: Option<ModuleInfo>,
+    pub current_symbol: Option<SymbolInfo>,
+    pub stack: Vec<StackFrameInfo>,
+    pub disassembly: Option<DisassemblyResult>,
+    pub current_thread_preserved: bool,
+}
+
 pub fn start_process_server(options: ProcessServerOptions) -> anyhow::Result<ProcessServerResult> {
     start_process_server_impl(options)
 }
@@ -399,6 +433,111 @@ impl DebuggerSession {
             self.control.SetExecutionStatus(DEBUG_STATUS_STEP_INTO)?;
         }
         Ok(self.execution_status())
+    }
+
+    pub fn last_event(&self) -> anyhow::Result<DebuggerEventInfo> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_EVENT_BREAKPOINT, DEBUG_EVENT_EXCEPTION, DEBUG_EVENT_EXIT_PROCESS,
+            DEBUG_EVENT_EXIT_THREAD, DEBUG_EVENT_LOAD_MODULE, DEBUG_EVENT_UNLOAD_MODULE,
+            DEBUG_LAST_EVENT_INFO_BREAKPOINT, DEBUG_LAST_EVENT_INFO_EXCEPTION,
+            DEBUG_LAST_EVENT_INFO_EXIT_PROCESS, DEBUG_LAST_EVENT_INFO_EXIT_THREAD,
+            DEBUG_LAST_EVENT_INFO_LOAD_MODULE, DEBUG_LAST_EVENT_INFO_UNLOAD_MODULE,
+        };
+
+        const MAX_EVENT_DESCRIPTION_CHARS: usize = 512;
+        const MAX_EVENT_EXTRA_BYTES: usize = 512;
+
+        let mut event_type = 0u32;
+        let mut process_system_id = 0u32;
+        let mut thread_system_id = 0u32;
+        let mut extra_information = vec![0u8; MAX_EVENT_EXTRA_BYTES];
+        let mut extra_information_used = 0u32;
+        let mut description = vec![0u16; MAX_EVENT_DESCRIPTION_CHARS];
+        let mut description_used = 0u32;
+        unsafe {
+            self.control.GetLastEventInformationWide(
+                &mut event_type,
+                &mut process_system_id,
+                &mut thread_system_id,
+                Some(extra_information.as_mut_ptr().cast()),
+                extra_information.len() as u32,
+                Some(&mut extra_information_used),
+                Some(&mut description),
+                Some(&mut description_used),
+            )?;
+        }
+        ensure!(
+            extra_information_used as usize <= extra_information.len(),
+            "DbgEng last-event payload exceeds the bounded {MAX_EVENT_EXTRA_BYTES}-byte limit"
+        );
+        ensure!(
+            description_used as usize <= description.len(),
+            "DbgEng last-event description exceeds the bounded {MAX_EVENT_DESCRIPTION_CHARS}-character limit"
+        );
+
+        let description_len = description_used as usize;
+        let description = &description[..description_len];
+        let description_len = if description.last().is_some_and(|character| *character == 0) {
+            description_len - 1
+        } else {
+            description_len
+        };
+        let description = String::from_utf16_lossy(&description[..description_len]);
+        let description = (!description.is_empty()).then_some(description);
+        let extra_information = &extra_information[..extra_information_used as usize];
+        let breakpoint_id = (event_type == DEBUG_EVENT_BREAKPOINT)
+            .then(|| read_event_info::<DEBUG_LAST_EVENT_INFO_BREAKPOINT>(extra_information))
+            .flatten()
+            .map(|info| info.Id);
+        let exception = (event_type == DEBUG_EVENT_EXCEPTION)
+            .then(|| read_event_info::<DEBUG_LAST_EVENT_INFO_EXCEPTION>(extra_information))
+            .flatten()
+            .map(|info| {
+                let count = (info.ExceptionRecord.NumberParameters as usize)
+                    .min(info.ExceptionRecord.ExceptionInformation.len());
+                DebuggerExceptionInfo {
+                    code: info.ExceptionRecord.ExceptionCode.0 as u32,
+                    flags: info.ExceptionRecord.ExceptionFlags,
+                    address: info.ExceptionRecord.ExceptionAddress,
+                    first_chance: info.FirstChance != 0,
+                    parameters: info.ExceptionRecord.ExceptionInformation[..count].to_vec(),
+                }
+            });
+        let module_base = match event_type {
+            DEBUG_EVENT_LOAD_MODULE => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_LOAD_MODULE>(extra_information)
+                    .map(|info| info.Base)
+            }
+            DEBUG_EVENT_UNLOAD_MODULE => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_UNLOAD_MODULE>(extra_information)
+                    .map(|info| info.Base)
+            }
+            _ => None,
+        };
+        let exit_code = match event_type {
+            DEBUG_EVENT_EXIT_PROCESS => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_EXIT_PROCESS>(extra_information)
+                    .map(|info| info.ExitCode)
+            }
+            DEBUG_EVENT_EXIT_THREAD => {
+                read_event_info::<DEBUG_LAST_EVENT_INFO_EXIT_THREAD>(extra_information)
+                    .map(|info| info.ExitCode)
+            }
+            _ => None,
+        };
+
+        Ok(DebuggerEventInfo {
+            event_type,
+            event_name: event_type_name(event_type).to_string(),
+            process_system_id,
+            thread_system_id,
+            description,
+            extra_information_size: extra_information_used,
+            breakpoint_id,
+            exception,
+            module_base,
+            exit_code,
+        })
     }
 
     pub fn detach(&self) -> anyhow::Result<()> {
@@ -606,6 +745,72 @@ impl DebuggerSession {
                     .flatten(),
             })
             .collect())
+    }
+
+    pub fn thread_context(
+        &self,
+        engine_thread_id: u32,
+        max_frames: u32,
+        disassembly_count: u32,
+    ) -> anyhow::Result<ThreadContext> {
+        ensure!(max_frames > 0, "max_frames must be greater than zero");
+        ensure!(
+            disassembly_count > 0,
+            "disassembly_count must be greater than zero"
+        );
+        ensure!(
+            engine_thread_id != u32::MAX,
+            "engine_thread_id cannot be DEBUG_ANY_ID"
+        );
+
+        let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
+        let changed_thread = previous_thread_id != engine_thread_id;
+        if changed_thread {
+            unsafe {
+                self.system_objects.SetCurrentThreadId(engine_thread_id)?;
+            }
+        }
+
+        let context = (|| {
+            let registers = self.core_registers()?;
+            let instruction_offset = registers.instruction_offset;
+            let current_module = instruction_offset
+                .map(|address| self.module_by_offset(address))
+                .transpose()?
+                .flatten();
+            let current_symbol = instruction_offset
+                .map(|address| self.symbol_by_offset(address))
+                .transpose()?
+                .flatten();
+            let stack = self.stack_trace(max_frames)?;
+            let disassembly = instruction_offset
+                .map(|address| self.disassemble(Some(address), disassembly_count))
+                .transpose()?;
+            let system_id = self.current_thread_system_id()?;
+            Ok(ThreadContext {
+                thread: ThreadInfo {
+                    engine_id: engine_thread_id,
+                    system_id,
+                },
+                registers,
+                current_module,
+                current_symbol,
+                stack,
+                disassembly,
+                current_thread_preserved: true,
+            })
+        })();
+
+        let restore = changed_thread
+            .then(|| unsafe { self.system_objects.SetCurrentThreadId(previous_thread_id) });
+        match (context, restore) {
+            (Ok(context), Some(Ok(()))) | (Ok(context), None) => Ok(context),
+            (Ok(_), Some(Err(error))) => Err(error).context("failed to restore the current thread"),
+            (Err(error), Some(Err(restore_error))) => Err(error).context(format!(
+                "failed to inspect the requested thread and failed to restore the current thread: {restore_error}"
+            )),
+            (Err(error), _) => Err(error),
+        }
     }
 
     pub fn disassemble(
@@ -889,6 +1094,32 @@ impl DebuggerSession {
     }
 }
 
+#[cfg(windows)]
+fn read_event_info<T: Copy>(bytes: &[u8]) -> Option<T> {
+    (bytes.len() >= std::mem::size_of::<T>())
+        .then(|| unsafe { bytes.as_ptr().cast::<T>().read_unaligned() })
+}
+
+fn event_type_name(event_type: u32) -> &'static str {
+    match event_type {
+        1 => "breakpoint",
+        2 => "exception",
+        4 => "create_thread",
+        8 => "exit_thread",
+        16 => "create_process",
+        32 => "exit_process",
+        64 => "load_module",
+        128 => "unload_module",
+        256 => "system_error",
+        512 => "session_status",
+        1024 => "change_debuggee_state",
+        2048 => "change_engine_state",
+        4096 => "change_symbol_state",
+        8192 => "service_exception",
+        _ => "unknown",
+    }
+}
+
 #[cfg(not(windows))]
 impl DebuggerSession {
     pub fn summary(&self) -> DebuggerSessionSummary {
@@ -927,6 +1158,10 @@ impl DebuggerSession {
     }
 
     pub fn step_into(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn last_event(&self) -> anyhow::Result<DebuggerEventInfo> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -971,6 +1206,15 @@ impl DebuggerSession {
     }
 
     pub fn stack_trace(&self, _max_frames: u32) -> anyhow::Result<Vec<StackFrameInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn thread_context(
+        &self,
+        _engine_thread_id: u32,
+        _max_frames: u32,
+        _disassembly_count: u32,
+    ) -> anyhow::Result<ThreadContext> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -1513,5 +1757,13 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn names_documented_dbgeng_event_types() {
+        assert_eq!(event_type_name(1), "breakpoint");
+        assert_eq!(event_type_name(2), "exception");
+        assert_eq!(event_type_name(64), "load_module");
+        assert_eq!(event_type_name(0xFFFF), "unknown");
     }
 }
