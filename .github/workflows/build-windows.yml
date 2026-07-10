@@ -27,13 +27,13 @@ jobs:
             rust_target: x86_64-pc-windows-msvc
             nuget_arch: amd64
             vcvars_arch: x64
-            artifact: windbg-tool-windows-x64
+            artifact: windbg-tool-x64
             can_run: true
           - label: windows-arm64
             rust_target: aarch64-pc-windows-msvc
             nuget_arch: arm64
             vcvars_arch: x64_arm64
-            artifact: windbg-tool-windows-arm64
+            artifact: windbg-tool-arm64
             can_run: false
 
     env:
@@ -210,8 +210,8 @@ jobs:
 
           $tag = "v$env:VERSION"
           $assets = @(
-            'windbg-tool-windows-x64.zip',
-            'windbg-tool-windows-arm64.zip'
+            'windbg-tool-x64.zip',
+            'windbg-tool-arm64.zip'
           )
           foreach ($asset in $assets) {
             $path = Join-Path $PWD "release-assets\$asset"
@@ -238,8 +238,8 @@ jobs:
 
           $tag = "v$env:VERSION"
           $assets = @(
-            (Join-Path $PWD 'release-assets\windbg-tool-windows-x64.zip'),
-            (Join-Path $PWD 'release-assets\windbg-tool-windows-arm64.zip')
+            (Join-Path $PWD 'release-assets\windbg-tool-x64.zip'),
+            (Join-Path $PWD 'release-assets\windbg-tool-arm64.zip')
           )
           & gh release create $tag $assets `
             --repo $env:GITHUB_REPOSITORY `

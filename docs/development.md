@@ -54,7 +54,7 @@ rustup target add x86_64-pc-windows-msvc
 cargo xtask deps --arch amd64
 cargo xtask native-build --arch amd64 --static-crt
 cargo build -p windbg-tool --release --target x86_64-pc-windows-msvc
-cargo xtask package --arch amd64 --target x86_64-pc-windows-msvc --profile release --out target\package\windbg-tool-windows-x64
+cargo xtask package --arch amd64 --target x86_64-pc-windows-msvc --profile release --out target\package\windbg-tool-x64
 ```
 
 Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64 package. Architecture-specific dependency staging uses `target\runtime\<arch>\...`, while the legacy no-argument `cargo xtask deps`, `cargo xtask native-build`, and `cargo xtask package` commands keep using the existing host-architecture directories.
@@ -67,8 +67,8 @@ Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio
 
 Run the **Windows packages** workflow with **Run workflow** and enter an unprefixed semantic version such as `0.1.0`. After both package matrix jobs complete, the workflow creates the `v0.1.0` tag at the commit selected for the dispatch and publishes a GitHub Release containing:
 
-- `windbg-tool-windows-x64.zip`
-- `windbg-tool-windows-arm64.zip`
+- `windbg-tool-x64.zip`
+- `windbg-tool-arm64.zip`
 
 The workflow rejects existing tags and invalid versions rather than replacing a release. Each ZIP is validated before upload and contains the statically linked Rust executable and native bridge plus the required dynamic TTD Replay, DbgEng, and symbol runtime DLLs.
 
