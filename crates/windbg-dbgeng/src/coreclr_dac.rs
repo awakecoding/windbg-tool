@@ -20,6 +20,8 @@ const WINDBG_DAC_NOT_FOUND: u32 = 3;
 const WINDBG_DAC_AMBIGUOUS: u32 = 4;
 const WINDBG_DAC_CODE_UNAVAILABLE: u32 = 5;
 const MAX_WIDE_CHARS: usize = 1024;
+const MAX_SIGNATURE_HEX_CHARS: usize = 1024;
+const MAX_METHOD_CANDIDATES: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -41,6 +43,15 @@ impl Default for NativeRuntimeInfo {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct NativeMethodCandidate {
+    method_token: u32,
+    signature_truncated: u8,
+    reserved: [u8; 3],
+    signature_hex: [u16; MAX_SIGNATURE_HEX_CHARS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct NativeMethodInfo {
     method_token: u32,
     matching_method_count: u32,
@@ -49,6 +60,11 @@ struct NativeMethodInfo {
     code_available: u8,
     reserved: [u8; 3],
     resolved_method: [u16; MAX_WIDE_CHARS],
+    resolved_signature_hex: [u16; MAX_SIGNATURE_HEX_CHARS],
+    reported_candidate_count: u32,
+    candidates_truncated: u8,
+    reserved2: [u8; 3],
+    candidates: [NativeMethodCandidate; MAX_METHOD_CANDIDATES],
 }
 
 impl Default for NativeMethodInfo {
@@ -77,6 +93,8 @@ type ResolveAndNotify = unsafe extern "C" fn(
     bridge: *mut c_void,
     managed_module_path: *const u16,
     fully_qualified_method: *const u16,
+    signature_blob: *const u8,
+    signature_blob_length: u32,
     method_info: *mut NativeMethodInfo,
 ) -> u32;
 type RefreshMethodCode =
@@ -92,10 +110,20 @@ pub struct ManagedRuntimeInfo {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ManagedMethodCandidate {
+    pub token: u32,
+    pub signature_hex: String,
+    pub signature_truncated: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ManagedMethodInfo {
     pub token: u32,
     pub matching_method_count: u32,
+    pub matching_method_candidates: Vec<ManagedMethodCandidate>,
+    pub matching_method_candidates_truncated: bool,
     pub resolved_method: String,
+    pub signature_hex: String,
     pub code_notification_flags: u32,
     pub representative_entry_address: Option<u64>,
 }
@@ -247,15 +275,28 @@ impl CoreClrDacBridge {
         &mut self,
         managed_module_path: &Path,
         fully_qualified_method: &str,
+        signature_blob: Option<&[u8]>,
     ) -> anyhow::Result<(ManagedMethodInfo, ManagedCodeAvailability)> {
         let managed_module_path = to_wide(managed_module_path.as_os_str())?;
         let method = to_wide(OsStr::new(fully_qualified_method))?;
+        let (signature_blob, signature_blob_length) = signature_blob
+            .map(|signature| {
+                ensure!(
+                    !signature.is_empty(),
+                    "the CoreCLR DAC bridge signature selector must not be empty"
+                );
+                Ok((signature.as_ptr(), signature.len() as u32))
+            })
+            .transpose()?
+            .unwrap_or((std::ptr::null(), 0));
         let mut native_method = NativeMethodInfo::default();
         let status = unsafe {
             (self.resolve_and_notify)(
                 self.bridge.as_ptr(),
                 managed_module_path.as_ptr(),
                 method.as_ptr(),
+                signature_blob,
+                signature_blob_length,
                 &mut native_method,
             )
         };
@@ -286,8 +327,9 @@ impl CoreClrDacBridge {
             WINDBG_DAC_OK => Ok(()),
             WINDBG_DAC_NOT_FOUND => bail!("{operation} failed: {}", bridge_error(self.last_error)),
             WINDBG_DAC_AMBIGUOUS => bail!(
-                "{operation} failed because {} method definitions matched; exact signature selection is required",
-                native_method.matching_method_count
+                "{operation} failed because {} method definitions matched: {}. Supply --signature with an exact ECMA-335 MethodDef signature blob",
+                native_method.matching_method_count,
+                method_candidate_summary(native_method)
             ),
             WINDBG_DAC_CODE_UNAVAILABLE => {
                 bail!("{operation} failed: {}", bridge_error(self.last_error))
@@ -375,12 +417,55 @@ fn managed_method_info(native: &NativeMethodInfo) -> anyhow::Result<ManagedMetho
     Ok(ManagedMethodInfo {
         token: native.method_token,
         matching_method_count: native.matching_method_count,
+        matching_method_candidates: native_method_candidates(native)?,
+        matching_method_candidates_truncated: native.candidates_truncated != 0,
         resolved_method: utf16_field(&native.resolved_method, "managed method name")?,
+        signature_hex: utf16_field(
+            &native.resolved_signature_hex,
+            "managed method metadata signature",
+        )?,
         code_notification_flags: native.code_notification_flags,
         representative_entry_address: (native.code_available != 0)
             .then_some(native.representative_entry_address)
             .filter(|address| *address != 0),
     })
+}
+
+fn native_method_candidates(
+    native: &NativeMethodInfo,
+) -> anyhow::Result<Vec<ManagedMethodCandidate>> {
+    let count = native.reported_candidate_count as usize;
+    ensure!(
+        count <= MAX_METHOD_CANDIDATES,
+        "the native bridge reported too many managed method candidates"
+    );
+    native.candidates[..count]
+        .iter()
+        .map(|candidate| {
+            Ok(ManagedMethodCandidate {
+                token: candidate.method_token,
+                signature_hex: utf16_field(
+                    &candidate.signature_hex,
+                    "managed method candidate metadata signature",
+                )?,
+                signature_truncated: candidate.signature_truncated != 0,
+            })
+        })
+        .collect()
+}
+
+fn method_candidate_summary(native: &NativeMethodInfo) -> String {
+    match native_method_candidates(native) {
+        Ok(candidates) if candidates.is_empty() => {
+            "no candidate signatures were returned".to_string()
+        }
+        Ok(candidates) => candidates
+            .into_iter()
+            .map(|candidate| format!("0x{:08X}:{}", candidate.token, candidate.signature_hex))
+            .collect::<Vec<_>>()
+            .join(", "),
+        Err(error) => format!("candidate signature diagnostics were unavailable: {error}"),
+    }
 }
 
 fn utf16_field(value: &[u16], name: &str) -> anyhow::Result<String> {

@@ -33,6 +33,18 @@ typedef struct WindbgDacRuntimeInfo {
     uint32_t dac_version_ls;
 } WindbgDacRuntimeInfo;
 
+enum {
+    WINDBG_DAC_MAX_METHOD_CANDIDATES = 8,
+    WINDBG_DAC_MAX_SIGNATURE_HEX_CHARS = 1024,
+};
+
+typedef struct WindbgDacMethodCandidate {
+    uint32_t method_token;
+    uint8_t signature_truncated;
+    uint8_t reserved[3];
+    wchar_t signature_hex[WINDBG_DAC_MAX_SIGNATURE_HEX_CHARS];
+} WindbgDacMethodCandidate;
+
 typedef struct WindbgDacMethodInfo {
     uint32_t method_token;
     uint32_t matching_method_count;
@@ -41,6 +53,11 @@ typedef struct WindbgDacMethodInfo {
     uint8_t code_available;
     uint8_t reserved[3];
     wchar_t resolved_method[1024];
+    wchar_t resolved_signature_hex[WINDBG_DAC_MAX_SIGNATURE_HEX_CHARS];
+    uint32_t reported_candidate_count;
+    uint8_t candidates_truncated;
+    uint8_t reserved2[3];
+    WindbgDacMethodCandidate candidates[WINDBG_DAC_MAX_METHOD_CANDIDATES];
 } WindbgDacMethodInfo;
 
 // The debug_client parameter is an IDebugClient5 pointer retained by the caller for the bridge lifetime.
@@ -68,6 +85,8 @@ WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_resolve_and_notify(
     WindbgDacBridge* bridge,
     const wchar_t* managed_module_path,
     const wchar_t* fully_qualified_method,
+    const uint8_t* signature_blob,
+    uint32_t signature_blob_length,
     WindbgDacMethodInfo* method_info);
 
 WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_refresh_method_code(

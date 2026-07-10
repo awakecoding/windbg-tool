@@ -16,7 +16,199 @@
 
 using CLRDATA_ADDRESS = ULONG64;
 using CLRDATA_ENUM = ULONG64;
+using HCORENUM = void*;
+using mdToken = ULONG32;
+using mdTypeDef = ULONG32;
+using mdTypeRef = ULONG32;
+using mdInterfaceImpl = ULONG32;
+using mdFieldDef = ULONG32;
 using mdMethodDef = ULONG32;
+using mdParamDef = ULONG32;
+using mdMemberRef = ULONG32;
+using mdPermission = ULONG32;
+using PCCOR_SIGNATURE = const BYTE*;
+
+static const CLSID CLSID_CorMetaDataDispenser =
+    {0xe5cb7a31, 0x7512, 0x11d2, {0x89, 0xce, 0x00, 0x80, 0xc7, 0x92, 0xe5, 0xd8}};
+static const IID IID_IMetaDataDispenser =
+    {0x809c652e, 0x7396, 0x11d2, {0x97, 0x71, 0x00, 0xa0, 0xc9, 0xb4, 0xd5, 0x0c}};
+static const IID IID_IMetaDataImport =
+    {0x7dac8207, 0xd3ae, 0x4c75, {0x9b, 0x67, 0x92, 0x80, 0x1a, 0x49, 0x7d, 0x44}};
+
+// This prefix follows the stable, MIT-licensed CoreCLR metadata contract in cor.h.
+// Only methods through GetMethodProps are declared because the bridge never mutates metadata.
+struct IMetaDataDispenser : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE DefineScope(
+        REFCLSID rclsid,
+        DWORD create_flags,
+        REFIID iid,
+        IUnknown** scope) = 0;
+    virtual HRESULT STDMETHODCALLTYPE OpenScope(
+        LPCWSTR path,
+        DWORD open_flags,
+        REFIID iid,
+        IUnknown** scope) = 0;
+    virtual HRESULT STDMETHODCALLTYPE OpenScopeOnMemory(
+        LPCVOID data,
+        ULONG size,
+        DWORD open_flags,
+        REFIID iid,
+        IUnknown** scope) = 0;
+};
+
+struct IMetaDataImport : IUnknown {
+    virtual void STDMETHODCALLTYPE CloseEnum(HCORENUM enumeration) = 0;
+    virtual HRESULT STDMETHODCALLTYPE CountEnum(HCORENUM enumeration, ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ResetEnum(HCORENUM enumeration, ULONG position) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumTypeDefs(
+        HCORENUM* enumeration,
+        mdTypeDef types[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumInterfaceImpls(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        mdInterfaceImpl implementations[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumTypeRefs(
+        HCORENUM* enumeration,
+        mdTypeRef references[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindTypeDefByName(
+        LPCWSTR type_name,
+        mdToken enclosing_type,
+        mdTypeDef* type) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetScopeProps(
+        LPWSTR name,
+        ULONG name_capacity,
+        ULONG* name_length,
+        GUID* mvid) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetModuleFromScope(mdToken* module) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetTypeDefProps(
+        mdTypeDef type,
+        LPWSTR name,
+        ULONG name_capacity,
+        ULONG* name_length,
+        DWORD* attributes,
+        mdToken* extends) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetInterfaceImplProps(
+        mdInterfaceImpl implementation,
+        mdTypeDef* type,
+        mdToken* interface_type) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetTypeRefProps(
+        mdTypeRef reference,
+        mdToken* resolution_scope,
+        LPWSTR name,
+        ULONG name_capacity,
+        ULONG* name_length) = 0;
+    virtual HRESULT STDMETHODCALLTYPE ResolveTypeRef(
+        mdTypeRef reference,
+        REFIID iid,
+        IUnknown** scope,
+        mdTypeDef* type) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumMembers(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        mdToken members[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumMembersWithName(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        LPCWSTR name,
+        mdToken members[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumMethods(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        mdMethodDef methods[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumMethodsWithName(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        LPCWSTR name,
+        mdMethodDef methods[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumFields(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        mdFieldDef fields[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumFieldsWithName(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        LPCWSTR name,
+        mdFieldDef fields[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumParams(
+        HCORENUM* enumeration,
+        mdMethodDef method,
+        mdParamDef parameters[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumMemberRefs(
+        HCORENUM* enumeration,
+        mdToken parent,
+        mdMemberRef references[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumMethodImpls(
+        HCORENUM* enumeration,
+        mdTypeDef type,
+        mdToken bodies[],
+        mdToken declarations[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumPermissionSets(
+        HCORENUM* enumeration,
+        mdToken token,
+        DWORD actions,
+        mdPermission permissions[],
+        ULONG maximum,
+        ULONG* count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindMember(
+        mdTypeDef type,
+        LPCWSTR name,
+        PCCOR_SIGNATURE signature,
+        ULONG signature_size,
+        mdToken* member) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindMethod(
+        mdTypeDef type,
+        LPCWSTR name,
+        PCCOR_SIGNATURE signature,
+        ULONG signature_size,
+        mdMethodDef* method) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindField(
+        mdTypeDef type,
+        LPCWSTR name,
+        PCCOR_SIGNATURE signature,
+        ULONG signature_size,
+        mdFieldDef* field) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FindMemberRef(
+        mdTypeRef type,
+        LPCWSTR name,
+        PCCOR_SIGNATURE signature,
+        ULONG signature_size,
+        mdMemberRef* reference) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetMethodProps(
+        mdMethodDef method,
+        mdTypeDef* type,
+        LPWSTR name,
+        ULONG name_capacity,
+        ULONG* name_length,
+        DWORD* attributes,
+        PCCOR_SIGNATURE* signature,
+        ULONG* signature_size,
+        ULONG* code_rva,
+        DWORD* implementation_flags) = 0;
+};
 
 struct CLRDATA_ADDRESS_RANGE {
     CLRDATA_ADDRESS start_address;
@@ -315,6 +507,93 @@ private:
     T* pointer_ = nullptr;
 };
 
+using MetaDataGetDispenserFn =
+    HRESULT(STDAPICALLTYPE*)(REFCLSID dispenser_class, REFIID iid, LPVOID* interface_pointer);
+
+class MetadataImport final {
+public:
+    ~MetadataImport() {
+        importer_.reset();
+        dispenser_.reset();
+        if (mscoree_ != nullptr) {
+            FreeLibrary(mscoree_);
+        }
+    }
+
+    static HRESULT Open(const wchar_t* managed_module_path, std::unique_ptr<MetadataImport>* metadata) {
+        if (managed_module_path == nullptr || metadata == nullptr) {
+            return E_INVALIDARG;
+        }
+        *metadata = nullptr;
+
+        auto result = std::make_unique<MetadataImport>();
+        result->mscoree_ = LoadLibraryExW(
+            L"mscoree.dll",
+            nullptr,
+            LOAD_LIBRARY_SEARCH_SYSTEM32);
+        if (result->mscoree_ == nullptr) {
+            return HRESULT_FROM_WIN32(GetLastError());
+        }
+        const auto get_dispenser = reinterpret_cast<MetaDataGetDispenserFn>(
+            GetProcAddress(result->mscoree_, "MetaDataGetDispenser"));
+        if (get_dispenser == nullptr) {
+            return HRESULT_FROM_WIN32(ERROR_PROC_NOT_FOUND);
+        }
+
+        HRESULT open_result = get_dispenser(
+            CLSID_CorMetaDataDispenser,
+            IID_IMetaDataDispenser,
+            reinterpret_cast<void**>(result->dispenser_.put()));
+        if (FAILED(open_result)) {
+            return open_result;
+        }
+        open_result = result->dispenser_.get()->OpenScope(
+            managed_module_path,
+            0,
+            IID_IMetaDataImport,
+            reinterpret_cast<IUnknown**>(result->importer_.put()));
+        if (FAILED(open_result)) {
+            return open_result;
+        }
+
+        *metadata = std::move(result);
+        return S_OK;
+    }
+
+    HRESULT GetMethodSignature(mdMethodDef method, std::vector<BYTE>* signature) const {
+        if (signature == nullptr) {
+            return E_POINTER;
+        }
+        signature->clear();
+        PCCOR_SIGNATURE signature_data = nullptr;
+        ULONG signature_length = 0;
+        const HRESULT result = importer_.get()->GetMethodProps(
+            method,
+            nullptr,
+            nullptr,
+            0,
+            nullptr,
+            nullptr,
+            &signature_data,
+            &signature_length,
+            nullptr,
+            nullptr);
+        if (FAILED(result)) {
+            return result;
+        }
+        if (signature_data == nullptr || signature_length == 0) {
+            return E_UNEXPECTED;
+        }
+        signature->assign(signature_data, signature_data + signature_length);
+        return S_OK;
+    }
+
+private:
+    HMODULE mscoree_ = nullptr;
+    ComReference<IMetaDataDispenser> dispenser_;
+    ComReference<IMetaDataImport> importer_;
+};
+
 thread_local std::wstring g_last_error;
 
 void set_error(const std::wstring& error) {
@@ -360,6 +639,53 @@ bool read_file_version(const wchar_t* path, uint32_t* version_ms, uint32_t* vers
 
 void copy_string(wchar_t* destination, size_t destination_count, const std::wstring& source) {
     wcsncpy_s(destination, destination_count, source.c_str(), _TRUNCATE);
+}
+
+void copy_signature_hex(
+    wchar_t* destination,
+    size_t destination_count,
+    const std::vector<BYTE>& signature,
+    uint8_t* truncated) {
+    static constexpr wchar_t hexadecimal[] = L"0123456789ABCDEF";
+    if (destination == nullptr || destination_count == 0 || truncated == nullptr) {
+        return;
+    }
+
+    const size_t maximum_bytes = (destination_count - 1) / 2;
+    const size_t copied_bytes = std::min(signature.size(), maximum_bytes);
+    for (size_t index = 0; index < copied_bytes; ++index) {
+        destination[index * 2] = hexadecimal[signature[index] >> 4];
+        destination[index * 2 + 1] = hexadecimal[signature[index] & 0x0f];
+    }
+    destination[copied_bytes * 2] = L'\0';
+    *truncated = static_cast<uint8_t>(copied_bytes != signature.size());
+}
+
+void record_method_candidate(
+    WindbgDacMethodInfo* method_info,
+    mdMethodDef method_token,
+    const std::vector<BYTE>& signature) {
+    if (method_info->reported_candidate_count >= WINDBG_DAC_MAX_METHOD_CANDIDATES) {
+        method_info->candidates_truncated = 1;
+        return;
+    }
+
+    auto* candidate = &method_info->candidates[method_info->reported_candidate_count++];
+    candidate->method_token = method_token;
+    copy_signature_hex(
+        candidate->signature_hex,
+        std::size(candidate->signature_hex),
+        signature,
+        &candidate->signature_truncated);
+}
+
+void record_resolved_signature(WindbgDacMethodInfo* method_info, const std::vector<BYTE>& signature) {
+    uint8_t ignored = 0;
+    copy_signature_hex(
+        method_info->resolved_signature_hex,
+        std::size(method_info->resolved_signature_hex),
+        signature,
+        &ignored);
 }
 
 std::wstring sibling_dac_path(const wchar_t* coreclr_path) {
@@ -756,6 +1082,11 @@ struct WindbgDacBridge {
     std::wstring dac_path;
     std::wstring managed_module_path;
     mdMethodDef method_token = 0;
+    std::vector<BYTE> method_signature;
+    uint32_t matching_method_count = 0;
+    uint32_t reported_candidate_count = 0;
+    uint8_t candidates_truncated = 0;
+    std::array<WindbgDacMethodCandidate, WINDBG_DAC_MAX_METHOD_CANDIDATES> method_candidates{};
 };
 
 HRESULT find_method_instance(
@@ -785,8 +1116,6 @@ HRESULT populate_method_info(
     IXCLRDataMethodDefinition* method,
     ComReference<IXCLRDataMethodInstance>* method_instance,
     WindbgDacMethodInfo* info) {
-    memset(info, 0, sizeof(*info));
-
     std::array<wchar_t, 1024> name{};
     ULONG32 name_length = 0;
     if (SUCCEEDED(method->GetName(0, static_cast<ULONG32>(name.size()), &name_length, name.data()))) {
@@ -1049,6 +1378,8 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
     WindbgDacBridge* bridge,
     const wchar_t* managed_module_path,
     const wchar_t* fully_qualified_method,
+    const uint8_t* signature_blob,
+    uint32_t signature_blob_length,
     WindbgDacMethodInfo* method_info) {
     g_last_error.clear();
     if (bridge == nullptr || managed_module_path == nullptr || fully_qualified_method == nullptr ||
@@ -1058,12 +1389,25 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
             L"A bridge, managed module path, fully-qualified method name, and method output are required.");
     }
     memset(method_info, 0, sizeof(*method_info));
+    if ((signature_blob == nullptr) != (signature_blob_length == 0)) {
+        return fail(
+            WINDBG_DAC_INVALID_ARGUMENT,
+            L"An exact metadata signature must provide both a non-null byte buffer and a non-zero length.");
+    }
 
     ComReference<IXCLRDataModule> module;
     const WindbgDacStatus module_status =
         find_module_by_path(bridge->process.get(), managed_module_path, &module);
     if (module_status != WINDBG_DAC_OK) {
         return module_status;
+    }
+
+    std::unique_ptr<MetadataImport> metadata;
+    const HRESULT metadata_result = MetadataImport::Open(managed_module_path, &metadata);
+    if (FAILED(metadata_result)) {
+        return fail(
+            WINDBG_DAC_ERROR,
+            format_hresult(L"Opening the selected managed module metadata", metadata_result));
     }
 
     CLRDATA_ENUM enumeration = 0;
@@ -1075,6 +1419,8 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
 
     ComReference<IXCLRDataMethodDefinition> selected;
     uint32_t count = 0;
+    uint32_t selected_count = 0;
+    std::vector<BYTE> selected_signature;
     while (true) {
         ComReference<IXCLRDataMethodDefinition> candidate;
         result = module.get()->EnumMethodDefinitionByName(&enumeration, candidate.put());
@@ -1087,8 +1433,36 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
         }
 
         ++count;
-        if (count == 1) {
-            selected.reset(candidate.detach());
+        mdMethodDef candidate_token = 0;
+        ComReference<IXCLRDataModule> candidate_scope;
+        result = candidate.get()->GetTokenAndScope(&candidate_token, candidate_scope.put());
+        if (FAILED(result) || candidate_token == 0) {
+            module.get()->EndEnumMethodDefinitionsByName(enumeration);
+            return fail(
+                WINDBG_DAC_ERROR,
+                format_hresult(L"Obtaining a managed method definition token", result));
+        }
+
+        std::vector<BYTE> candidate_signature;
+        result = metadata->GetMethodSignature(candidate_token, &candidate_signature);
+        if (FAILED(result)) {
+            module.get()->EndEnumMethodDefinitionsByName(enumeration);
+            return fail(
+                WINDBG_DAC_ERROR,
+                format_hresult(L"Reading a managed MethodDef signature", result));
+        }
+        record_method_candidate(method_info, candidate_token, candidate_signature);
+
+        const bool selected_by_name = signature_blob == nullptr;
+        const bool selected_by_signature = signature_blob != nullptr &&
+            candidate_signature.size() == signature_blob_length &&
+            std::equal(candidate_signature.begin(), candidate_signature.end(), signature_blob);
+        if (selected_by_name || selected_by_signature) {
+            ++selected_count;
+            if (selected_count == 1) {
+                selected_signature = std::move(candidate_signature);
+                selected.reset(candidate.detach());
+            }
         }
     }
     module.get()->EndEnumMethodDefinitionsByName(enumeration);
@@ -1097,10 +1471,20 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
     if (count == 0) {
         return fail(WINDBG_DAC_NOT_FOUND, L"The requested managed method was not found in the selected module.");
     }
-    if (count != 1) {
+    if (signature_blob == nullptr && count != 1) {
         return fail(
             WINDBG_DAC_AMBIGUOUS,
-            L"The requested managed method is ambiguous. Supply an exact metadata signature once signature selection is available.");
+            L"The requested managed method is ambiguous. Supply --signature with the exact ECMA-335 MethodDef signature bytes.");
+    }
+    if (signature_blob != nullptr && selected_count == 0) {
+        return fail(
+            WINDBG_DAC_NOT_FOUND,
+            L"No managed method definition with the requested name has the supplied exact metadata signature.");
+    }
+    if (selected_count != 1) {
+        return fail(
+            WINDBG_DAC_AMBIGUOUS,
+            L"More than one managed method definition matched the supplied exact metadata signature.");
     }
 
     bridge->method.reset(selected.detach());
@@ -1117,11 +1501,25 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
             format_hresult(L"Resolving a native code instance for the managed method", result));
     }
     method_info->matching_method_count = count;
+    record_resolved_signature(method_info, selected_signature);
     bridge->managed_module_path = managed_module_path;
     bridge->method_token = method_info->method_token;
+    bridge->method_signature = std::move(selected_signature);
+    bridge->matching_method_count = method_info->matching_method_count;
+    bridge->reported_candidate_count = method_info->reported_candidate_count;
+    bridge->candidates_truncated = method_info->candidates_truncated;
+    memcpy(
+        bridge->method_candidates.data(),
+        method_info->candidates,
+        sizeof(method_info->candidates));
     result = bridge->method.get()->SetCodeNotification(method_info->code_notification_flags);
     if (FAILED(result)) {
         bridge->method.reset();
+        bridge->method_signature.clear();
+        bridge->matching_method_count = 0;
+        bridge->reported_candidate_count = 0;
+        bridge->candidates_truncated = 0;
+        bridge->method_candidates.fill({});
         return fail(
             WINDBG_DAC_ERROR,
             format_hresult(L"Requesting CLR code-generation notification", result) +
@@ -1147,6 +1545,15 @@ extern "C" WindbgDacStatus windbg_dac_refresh_method_code(
             WINDBG_DAC_ERROR,
             L"The resolved managed method does not retain a module path and metadata token.");
     }
+    memset(method_info, 0, sizeof(*method_info));
+    method_info->matching_method_count = bridge->matching_method_count;
+    method_info->reported_candidate_count = bridge->reported_candidate_count;
+    method_info->candidates_truncated = bridge->candidates_truncated;
+    memcpy(
+        method_info->candidates,
+        bridge->method_candidates.data(),
+        sizeof(method_info->candidates));
+    record_resolved_signature(method_info, bridge->method_signature);
     ComReference<IXCLRDataModule> module;
     const WindbgDacStatus module_status =
         find_module_by_path(bridge->process.get(), bridge->managed_module_path.c_str(), &module);
@@ -1171,7 +1578,6 @@ extern "C" WindbgDacStatus windbg_dac_refresh_method_code(
             WINDBG_DAC_ERROR,
             format_hresult(L"Refreshing the managed method native code instance", result));
     }
-    method_info->matching_method_count = 1;
     if (method_info->code_available == 0) {
         return fail(WINDBG_DAC_CODE_UNAVAILABLE, L"The managed method does not have a representative native entry address yet.");
     }

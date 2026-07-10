@@ -731,6 +731,12 @@ struct LiveManagedBreakArgs {
     method: String,
     #[arg(
         long,
+        value_name = "HEX",
+        help = "Optional exact ECMA-335 MethodDef signature bytes in hexadecimal, for example 00010E0E; required to select an overload"
+    )]
+    signature: Option<String>,
+    #[arg(
+        long,
         help = "Allow the matching DAC to write CLR debugger-notification state; use only in an approved test VM"
     )]
     allow_runtime_write: bool,

@@ -189,6 +189,7 @@ pub(super) fn run_live_managed_break(
     let end = parse_live_launch_end(&args.end)?;
     let managed_module = validate_managed_module(&args.managed_module)?;
     let method = validate_managed_breakpoint_token(&args.method, "--method")?;
+    let signature = parse_managed_method_signature(args.signature.as_deref())?;
     let session = launch_live_session(LiveLaunchSessionOptions {
         command_line: args.command_line.clone(),
         initial_break_timeout_ms: args.initial_break_timeout_ms,
@@ -266,7 +267,7 @@ pub(super) fn run_live_managed_break(
         dac.disable_module_load_notifications()
             .context("disabling CLR managed-module load notifications after module discovery")?;
         let (resolved_method, availability) = dac
-            .resolve_and_notify(&managed_module_path, &method)
+            .resolve_and_notify(&managed_module_path, &method, signature.as_deref())
             .with_context(|| {
                 format!(
                     "resolving {method} in the selected managed module {managed_module} through the DAC"
@@ -356,10 +357,11 @@ pub(super) fn run_live_managed_break(
             },
             "managed_resolution": {
                 "method_request": method,
+                "signature_request_hex": signature.as_deref().map(format_managed_method_signature),
                 "resolved_method": resolved_method,
                 "method_after_code_generation": generated_method,
                 "runtime_writes_explicitly_allowed": args.allow_runtime_write,
-                "exact_overload_signature_selection": false,
+                "exact_overload_signature_selection": signature.is_some(),
                 "private_methods_supported": true
             },
             "code_generation": {
@@ -380,7 +382,7 @@ pub(super) fn run_live_managed_break(
             },
             "context": context,
             "limitations": [
-                "This vertical slice requires one unambiguous metadata method name; exact overload signature selection is not yet implemented.",
+                "Overloads require --signature with an exact ECMA-335 MethodDef signature blob; generic instantiations are not selected separately.",
                 "The breakpoint covers the DAC representative entry address. Generic instantiations, tiered recompilation, ReadyToRun entry indirection, and re-JIT/unload transitions require additional validation."
             ],
             "end": end
@@ -537,6 +539,54 @@ fn validate_managed_breakpoint_token(value: &str, argument: &str) -> anyhow::Res
         "{argument} contains unsupported characters"
     );
     Ok(value.to_string())
+}
+
+fn parse_managed_method_signature(value: Option<&str>) -> anyhow::Result<Option<Vec<u8>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+
+    let value = value.trim();
+    ensure!(!value.is_empty(), "--signature must not be empty");
+    ensure!(
+        value.chars().all(|character| {
+            character.is_ascii_hexdigit()
+                || character.is_ascii_whitespace()
+                || matches!(character, '-' | '_' | ':')
+        }),
+        "--signature must contain hexadecimal byte pairs separated only by whitespace, '-', '_', or ':'"
+    );
+    let hexadecimal = value
+        .chars()
+        .filter(|character| character.is_ascii_hexdigit())
+        .collect::<String>();
+    ensure!(
+        hexadecimal.len() % 2 == 0,
+        "--signature must contain complete hexadecimal byte pairs"
+    );
+    ensure!(
+        hexadecimal.len() <= 1022,
+        "--signature exceeds the 511-byte direct DAC selector limit"
+    );
+
+    let signature = hexadecimal
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = (pair[0] as char)
+                .to_digit(16)
+                .context("parsing the high nibble of --signature")?;
+            let low = (pair[1] as char)
+                .to_digit(16)
+                .context("parsing the low nibble of --signature")?;
+            Ok((high << 4 | low) as u8)
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(Some(signature))
+}
+
+fn format_managed_method_signature(signature: &[u8]) -> String {
+    signature.iter().map(|byte| format!("{byte:02X}")).collect()
 }
 
 fn validate_managed_module(value: &str) -> anyhow::Result<String> {
@@ -1589,7 +1639,7 @@ pub(super) fn live_capabilities() -> Value {
             {
                 "feature": "managed method breakpoint workflow",
                 "status": "x64_coreclr_dac_vertical_slice",
-                "notes": "Uses a matching CoreCLR DAC through the active DbgEng client, resolves one unambiguous metadata method, requests CLR code generation, and then sets a DbgEng hardware execute breakpoint. CLR notification writes require --allow-runtime-write and an approved test VM."
+                "notes": "Uses a matching CoreCLR DAC through the active DbgEng client, resolves a metadata method by name and optional exact signature, requests CLR code generation, and then sets a DbgEng software code breakpoint. CLR notification writes require --allow-runtime-write and an approved test VM."
             },
             {
                 "feature": "dump creation",
@@ -2121,6 +2171,23 @@ mod tests {
         );
         assert!(validate_managed_breakpoint_token("Program.Main;qd", "--method").is_err());
         assert!(validate_managed_breakpoint_token(r#"Program.Main""#, "--method").is_err());
+    }
+
+    #[test]
+    fn parses_exact_managed_method_signature_bytes() {
+        assert_eq!(
+            parse_managed_method_signature(Some("00-01:0E 0e")).unwrap(),
+            Some(vec![0x00, 0x01, 0x0e, 0x0e])
+        );
+        assert_eq!(
+            format_managed_method_signature(&[0x00, 0x01, 0x0e, 0x0e]),
+            "00010E0E"
+        );
+        assert_eq!(parse_managed_method_signature(None).unwrap(), None);
+        assert!(parse_managed_method_signature(Some("")).is_err());
+        assert!(parse_managed_method_signature(Some("001")).is_err());
+        assert!(parse_managed_method_signature(Some("00zz")).is_err());
+        assert!(parse_managed_method_signature(Some(&"AA".repeat(512))).is_err());
     }
 
     #[test]

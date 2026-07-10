@@ -22,6 +22,13 @@ pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
 pub const DBGENG_RUNTIME_DIR_ENV: &str = "WINDBG_DBGENG_RUNTIME_DIR";
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
 const DBGENG_DLL_NAME: &str = "dbgeng.dll";
+#[cfg(windows)]
+const DBGENG_RUNTIME_COMPONENTS: [&str; 4] = [
+    "dbgcore.dll",
+    "dbghelp.dll",
+    "dbgmodel.dll",
+    DBGENG_DLL_NAME,
+];
 const DBGENG_WAIT_TIMEOUT_HRESULT: i32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,44 +130,82 @@ fn dbgeng_runtime_dll(
 }
 
 #[cfg(windows)]
-fn ensure_dbgeng_runtime_loaded() -> anyhow::Result<()> {
+fn load_library_from_path(
+    path: &Path,
+    component: &str,
+) -> anyhow::Result<windows::Win32::Foundation::HMODULE> {
     use windows::core::PCWSTR;
     use windows::Win32::System::LibraryLoader::{
         LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
     };
 
-    static LOAD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+    let mut path_wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    path_wide.push(0);
+    unsafe {
+        LoadLibraryExW(
+            PCWSTR(path_wide.as_ptr()),
+            None,
+            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+    }
+    .with_context(|| format!("loading {component} {}", path.display()))
+}
+
+#[cfg(windows)]
+fn ensure_dbgeng_runtime_loaded() -> anyhow::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HMODULE;
+    use windows::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    static LOAD_RESULT: OnceLock<Result<usize, String>> = OnceLock::new();
 
     let result = LOAD_RESULT.get_or_init(|| {
-        (|| -> anyhow::Result<()> {
+        (|| -> anyhow::Result<usize> {
             let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
             let executable_path = env::current_exe().ok();
             let dll =
                 dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref())?;
             let Some(dll) = dll else {
-                return Ok(());
+                let mut component_wide = "dbgeng.dll".encode_utf16().collect::<Vec<_>>();
+                component_wide.push(0);
+                let module = unsafe {
+                    LoadLibraryExW(
+                        PCWSTR(component_wide.as_ptr()),
+                        None,
+                        LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                    )
+                }
+                .context("loading DbgEng from the system runtime")?;
+                return Ok(module.0 as usize);
             };
-            let mut dll_wide = dll.as_os_str().encode_wide().collect::<Vec<_>>();
-            dll_wide.push(0);
-            // Keep the explicitly loaded module alive so DbgEng resolves all of its runtime
-            // dependencies from its own directory before DebugCreate is invoked.
-            unsafe {
-                LoadLibraryExW(
-                    PCWSTR(dll_wide.as_ptr()),
-                    None,
-                    LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-                )
+            let runtime_dir = dll
+                .parent()
+                .context("the selected DbgEng runtime DLL has no parent directory")?;
+            // Load the version-matched companions before DbgEng so its imports resolve from the
+            // staged runtime set instead of depending on ambient DLL-search state.
+            for component_name in DBGENG_RUNTIME_COMPONENTS {
+                let component = runtime_dir.join(component_name);
+                ensure!(
+                    component.is_file(),
+                    "the selected DbgEng runtime is missing required component {}",
+                    component.display()
+                );
+                let module = load_library_from_path(&component, "DbgEng runtime component")?;
+                if component_name == DBGENG_DLL_NAME {
+                    return Ok(module.0 as usize);
+                }
             }
-            .with_context(|| format!("loading DbgEng runtime {}", dll.display()))?;
-            Ok(())
+            unreachable!("the DbgEng runtime component list must include dbgeng.dll")
         })()
         .map_err(|error| format!("{error:#}"))
     });
 
-    if let Err(error) = result {
-        bail!("{error}");
+    match result {
+        Ok(module) => Ok(HMODULE(*module as *mut _)),
+        Err(error) => bail!("{error}"),
     }
-    Ok(())
 }
 
 #[cfg(windows)]
@@ -187,10 +232,31 @@ fn enable_create_process_stop(
 #[cfg(windows)]
 fn create_debug_client(
 ) -> anyhow::Result<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5> {
-    use windows::Win32::System::Diagnostics::Debug::Extensions::DebugCreate;
+    use std::ffi::c_void;
+    use windows::core::{Interface, PCSTR};
+    use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5;
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
 
-    ensure_dbgeng_runtime_loaded()?;
-    unsafe { DebugCreate() }.context("DbgEng DebugCreate failed")
+    type DebugCreateFn = unsafe extern "system" fn(
+        *const windows::core::GUID,
+        *mut *mut c_void,
+    ) -> windows::core::HRESULT;
+
+    let module = ensure_dbgeng_runtime_loaded()?;
+    let procedure = unsafe { GetProcAddress(module, PCSTR(c"DebugCreate".as_ptr().cast())) }
+        .context("the selected DbgEng runtime does not export DebugCreate")?;
+    // GetProcAddress returns an untyped module export. DebugCreate has the documented
+    // DbgEng ABI and the module is retained by ensure_dbgeng_runtime_loaded.
+    let debug_create: DebugCreateFn = unsafe { std::mem::transmute(procedure) };
+    let mut client = std::ptr::null_mut();
+    unsafe { debug_create(&IDebugClient5::IID, &mut client) }
+        .ok()
+        .context("DbgEng DebugCreate failed")?;
+    ensure!(
+        !client.is_null(),
+        "DbgEng DebugCreate succeeded without returning an IDebugClient5"
+    );
+    Ok(unsafe { IDebugClient5::from_raw(client) })
 }
 
 #[cfg(windows)]
@@ -1767,20 +1833,59 @@ fn encode_hex(bytes: &[u8]) -> String {
 }
 
 #[cfg(windows)]
+fn load_dbghelp_module() -> anyhow::Result<windows::Win32::Foundation::HMODULE> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
+    let executable_path = env::current_exe().ok();
+    if let Some(dbgeng) =
+        dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref())?
+    {
+        let runtime_dir = dbgeng
+            .parent()
+            .context("the selected DbgEng runtime DLL has no parent directory")?;
+        let dbghelp = runtime_dir.join("dbghelp.dll");
+        ensure!(
+            dbghelp.is_file(),
+            "the selected DbgEng runtime is missing required component {}",
+            dbghelp.display()
+        );
+        return load_library_from_path(&dbghelp, "DbgHelp runtime component");
+    }
+
+    let mut component_wide = "dbghelp.dll".encode_utf16().collect::<Vec<_>>();
+    component_wide.push(0);
+    unsafe {
+        LoadLibraryExW(
+            PCWSTR(component_wide.as_ptr()),
+            None,
+            LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+        )
+    }
+    .context("loading DbgHelp from the system runtime")
+}
+
+#[cfg(windows)]
 fn write_process_dump_file(
     process_id: u32,
     target: String,
     detached: bool,
     options: DumpWriteOptions,
 ) -> anyhow::Result<DumpWriteResult> {
+    use std::ffi::c_void;
     use std::fs::OpenOptions;
     use std::os::windows::io::AsRawHandle;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::core::{Error, PCSTR};
+    use windows::Win32::Foundation::{CloseHandle, BOOL, HANDLE};
     use windows::Win32::System::Diagnostics::Debug::{
         MiniDumpWithDataSegs, MiniDumpWithFullMemory, MiniDumpWithFullMemoryInfo,
         MiniDumpWithHandleData, MiniDumpWithProcessThreadData, MiniDumpWithThreadInfo,
-        MiniDumpWithUnloadedModules, MiniDumpWriteDump, MINIDUMP_TYPE,
+        MiniDumpWithUnloadedModules, MINIDUMP_TYPE,
     };
+    use windows::Win32::System::LibraryLoader::GetProcAddress;
     use windows::Win32::System::Threading::{
         OpenProcess, PROCESS_QUERY_INFORMATION, PROCESS_VM_READ,
     };
@@ -1817,23 +1922,41 @@ fn write_process_dump_file(
         }
     };
 
+    type MiniDumpWriteDumpFn = unsafe extern "system" fn(
+        HANDLE,
+        u32,
+        HANDLE,
+        MINIDUMP_TYPE,
+        *const c_void,
+        *const c_void,
+        *const c_void,
+    ) -> BOOL;
+
+    let dbghelp = load_dbghelp_module()?;
+    let procedure = unsafe { GetProcAddress(dbghelp, PCSTR(c"MiniDumpWriteDump".as_ptr().cast())) }
+        .context("the selected DbgHelp runtime does not export MiniDumpWriteDump")?;
+    // GetProcAddress returns an untyped module export. MiniDumpWriteDump has the documented
+    // DbgHelp ABI and the module remains loaded for the duration of this call.
+    let mini_dump_write_dump: MiniDumpWriteDumpFn = unsafe { std::mem::transmute(procedure) };
     let write_result = unsafe {
-        MiniDumpWriteDump(
+        mini_dump_write_dump(
             process,
             process_id,
             HANDLE(file.as_raw_handle()),
             dump_type,
-            None,
-            None,
-            None,
+            std::ptr::null(),
+            std::ptr::null(),
+            std::ptr::null(),
         )
     };
     unsafe {
         CloseHandle(process)?;
     }
-    if let Err(error) = write_result {
-        return Err(error).context("MiniDumpWriteDump failed");
-    }
+    ensure!(
+        write_result.as_bool(),
+        "MiniDumpWriteDump failed: {}",
+        Error::from_win32()
+    );
     drop(file);
     let metadata = std::fs::metadata(&options.path)
         .with_context(|| format!("dump file was not created: {}", options.path.display()))?;

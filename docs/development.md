@@ -69,9 +69,19 @@ $env:WINDBG_DBGENG_RUNTIME_DIR = (Resolve-Path target\runtime\amd64\dbgeng-runti
 target\debug\windbg-tool.exe live capabilities
 ```
 
-The live backend securely preloads `dbgeng.dll` from this directory (or from beside `windbg-tool.exe` in a package) so its dependent DLLs resolve from the matching runtime set. It does not alter global DLL-search or security policy.
+The live backend securely loads the version-matched `dbgcore.dll`, `dbghelp.dll`, `dbgmodel.dll`, and `dbgeng.dll` set from this directory (or from beside `windbg-tool.exe` in a package) before resolving DbgEng exports. This keeps the executable free of static DbgEng/DbgHelp imports and does not alter global DLL-search or security policy.
 
 For a direct managed breakpoint, the DAC bridge loads `mscordaccore.dll` only from the same directory as the CoreCLR module loaded by the target and requires exact file-version equality. It does not bundle a DAC or SOS. Enabling CLR module/code notifications requires `--allow-runtime-write`: the DAC requests a CLR-owned JIT-notification allocation through `ICLRDataTarget2`, and the bridge uses DbgEng's active process handle with `VirtualAllocEx` before writing CLR debugger-notification state. This is not process hollowing or code injection; run the intentionally target-mutating workflow only in an approved test VM.
+
+## Managed breakpoint fixture
+
+`crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture` is a source-only .NET 10 x64 test target for direct CoreCLR DAC breakpoints. It exercises public, private, and overloaded static methods while `MethodImplOptions.NoInlining` keeps each target observable to the JIT.
+
+```powershell
+dotnet build crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture\ManagedBreakpointFixture.csproj -c Release
+```
+
+Run the fixture's public/private/overload `live managed-break` commands from [cli.md](cli.md) only in an approved test VM. The overload invocation uses `--signature 00010E0E`, the raw ECMA-335 `MethodDef` signature for `string Overload(string)`. The current endpoint policy blocks further RDM live-debugging validation pending an approved, scoped debugger policy/exclusion for that VM and RDM build; do not change Sophos, HitmanPro.Alert, or RDM protections to work around that block.
 
 Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
 

@@ -130,7 +130,45 @@ target\debug\windbg-tool.exe --compact live managed-break `
   --end terminate
 ```
 
-The vertical slice resolves regular private methods as normal metadata. It requires a unique fully-qualified metadata name and currently rejects ambiguous overloads; C# signatures, generic instantiations, ReadyToRun indirection, tiered recompilation, re-JIT, and unload transitions remain explicit limits. The structured response keeps CoreCLR/module-load events, DAC runtime/token/entry resolution, CLR notification, code-breakpoint configuration, and final method-hit context distinct.
+The vertical slice resolves regular private methods as normal metadata. An unambiguous fully-qualified metadata name needs no additional selector. For overloads, pass `--signature` with the exact ECMA-335 `MethodDef` signature blob as hexadecimal byte pairs; whitespace, `-`, `_`, and `:` are accepted only as separators. This is not C# syntax. For example, a static `string Overload(string)` method has the blob `00010E0E` (`DEFAULT`, one parameter, `STRING` return, `STRING` parameter), while `string Overload()` is `00000E`. The response reports the selected `signature_hex`, every bounded name-matching candidate's token/signature, and whether candidate output was truncated. C# signatures, generic instantiations, ReadyToRun indirection, tiered recompilation, re-JIT, and unload transitions remain explicit limits.
+
+### Managed breakpoint fixture
+
+`crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture` is a source-only .NET 10 x64 fixture with deterministic no-inline public, private, and overload targets. Its generated `bin` and `obj` directories are ignored. Build it, then run one command per target in an approved test VM:
+
+```powershell
+$fixture = Resolve-Path crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture
+dotnet build "$fixture\ManagedBreakpointFixture.csproj" -c Release
+
+target\debug\windbg-tool.exe --compact live managed-break `
+  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
+  --managed-module ManagedBreakpointFixture.dll `
+  --method ManagedBreakpointFixture.ManagedTargets.PublicEntry `
+  --allow-runtime-write --end terminate
+
+target\debug\windbg-tool.exe --compact live managed-break `
+  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
+  --managed-module ManagedBreakpointFixture.dll `
+  --method ManagedBreakpointFixture.ManagedTargets.PrivateEntry `
+  --allow-runtime-write --end terminate
+
+target\debug\windbg-tool.exe --compact live managed-break `
+  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
+  --managed-module ManagedBreakpointFixture.dll `
+  --method ManagedBreakpointFixture.ManagedTargets.Overload `
+  --signature 00010E0E `
+  --allow-runtime-write --end terminate
+```
+
+The last command selects `Overload(string)` rather than `Overload()`. A valid result has `managed_breakpoint.hit: true`, a DbgEng breakpoint ID/current instruction pointer equal to `code_generation.representative_native_entry_address`, and `managed_resolution.method_after_code_generation.token`/`signature_hex` identifying the selected `MethodDef`.
+
+The .NET 10.0.9 x64 fixture was validated with the direct DAC bridge:
+
+| Target | Token | Signature | Hit evidence |
+| --- | --- | --- | --- |
+| `ManagedTargets.PublicEntry()` | `100663298` | `00000E` | `hit: true`; breakpoint ID `0` and IP matched its native entry |
+| private `ManagedTargets.PrivateEntry()` | `100663300` | `00000E` | `hit: true`; breakpoint ID `0` and IP matched its native entry |
+| `ManagedTargets.Overload(string)` | `100663302` | `00010E0E` | `hit: true`; breakpoint ID `0`, IP matched native entry, and the selected candidates were `0x06000005:00000E` and `0x06000006:00010E0E` |
 
 ### Verified RDM x64 test-VM run
 
@@ -151,6 +189,10 @@ $env:WINDBG_CORECLR_DAC_BRIDGE_DLL = "$root\tool\windbg_coreclr_dac_bridge.dll"
 That run reported `workflow: "live_managed_break_dac"`, a matching CoreCLR/DAC file version, `managed_resolution.method_after_code_generation.token: 100663305`, `representative_entry_address: 0x7FFC8ABDA8A0`, and `managed_breakpoint: { kind: "software_code", configured.id: 0, hit: true }`. The final context had `instruction_pointer: 0x7FFC8ABDA8A0` and `current_symbol: RemoteDesktopManager!Devolutions.RemoteDesktopManager.Program.Main(System.String[])`.
 
 The same command with `--method Devolutions.RemoteDesktopManager.Program.ApplyDpiAwarness` proved a private method without reflection or SOS: token `100663306`, native entry and final instruction pointer `0x7FFC8AC09920`, breakpoint ID `0`, and final symbol `RemoteDesktopManager!Devolutions.RemoteDesktopManager.Program.ApplyDpiAwarness()`.
+
+### RDM approval requirement
+
+The prior RDM evidence above was collected in an approved test VM. Do not run another RDM `live managed-break` session until the application owner and endpoint-security owner approve a scoped debugger policy/exclusion for the designated test VM and RDM build. That approval must permit DbgEng's normal code breakpoint and the explicitly requested CLR JIT-notification allocation/write enabled by `--allow-runtime-write`. Do not disable, weaken, bypass, or otherwise alter Sophos, HitmanPro.Alert, or RDM protections to obtain a hit.
 
 ## AI-oriented DbgEng target inspection
 
