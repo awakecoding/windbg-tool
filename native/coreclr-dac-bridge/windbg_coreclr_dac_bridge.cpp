@@ -1374,14 +1374,14 @@ extern "C" WindbgDacStatus windbg_dac_is_module_loaded(
     return WINDBG_DAC_OK;
 }
 
-extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
+WindbgDacStatus resolve_managed_method(
     WindbgDacBridge* bridge,
     const wchar_t* managed_module_path,
     const wchar_t* fully_qualified_method,
     const uint8_t* signature_blob,
     uint32_t signature_blob_length,
-    WindbgDacMethodInfo* method_info) {
-    g_last_error.clear();
+    WindbgDacMethodInfo* method_info,
+    bool request_code_notification) {
     if (bridge == nullptr || managed_module_path == nullptr || fully_qualified_method == nullptr ||
         method_info == nullptr) {
         return fail(
@@ -1512,6 +1512,9 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
         bridge->method_candidates.data(),
         method_info->candidates,
         sizeof(method_info->candidates));
+    if (!request_code_notification) {
+        return WINDBG_DAC_OK;
+    }
     result = bridge->method.get()->SetCodeNotification(method_info->code_notification_flags);
     if (FAILED(result)) {
         bridge->method.reset();
@@ -1527,6 +1530,42 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
     }
 
     return WINDBG_DAC_OK;
+}
+
+extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
+    WindbgDacBridge* bridge,
+    const wchar_t* managed_module_path,
+    const wchar_t* fully_qualified_method,
+    const uint8_t* signature_blob,
+    uint32_t signature_blob_length,
+    WindbgDacMethodInfo* method_info) {
+    g_last_error.clear();
+    return resolve_managed_method(
+        bridge,
+        managed_module_path,
+        fully_qualified_method,
+        signature_blob,
+        signature_blob_length,
+        method_info,
+        true);
+}
+
+extern "C" WindbgDacStatus windbg_dac_resolve_read_only(
+    WindbgDacBridge* bridge,
+    const wchar_t* managed_module_path,
+    const wchar_t* fully_qualified_method,
+    const uint8_t* signature_blob,
+    uint32_t signature_blob_length,
+    WindbgDacMethodInfo* method_info) {
+    g_last_error.clear();
+    return resolve_managed_method(
+        bridge,
+        managed_module_path,
+        fully_qualified_method,
+        signature_blob,
+        signature_blob_length,
+        method_info,
+        false);
 }
 
 extern "C" WindbgDacStatus windbg_dac_refresh_method_code(

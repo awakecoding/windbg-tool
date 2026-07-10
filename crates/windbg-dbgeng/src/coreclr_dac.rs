@@ -89,7 +89,7 @@ type IsModuleLoaded = unsafe extern "C" fn(
     managed_module_path: *const u16,
     loaded: *mut u8,
 ) -> u32;
-type ResolveAndNotify = unsafe extern "C" fn(
+type ResolveMethod = unsafe extern "C" fn(
     bridge: *mut c_void,
     managed_module_path: *const u16,
     fully_qualified_method: *const u16,
@@ -141,7 +141,8 @@ pub struct CoreClrDacBridge {
     enable_module_load_notifications: EnableModuleLoadNotifications,
     disable_module_load_notifications: DisableModuleLoadNotifications,
     is_module_loaded: IsModuleLoaded,
-    resolve_and_notify: ResolveAndNotify,
+    resolve_and_notify: ResolveMethod,
+    resolve_read_only: ResolveMethod,
     refresh_method_code: RefreshMethodCode,
     last_error: LastError,
     runtime_info: ManagedRuntimeInfo,
@@ -183,9 +184,10 @@ impl CoreClrDacBridge {
         };
         let is_module_loaded =
             unsafe { load_symbol::<IsModuleLoaded>(&library, b"windbg_dac_is_module_loaded\0")? };
-        let resolve_and_notify = unsafe {
-            load_symbol::<ResolveAndNotify>(&library, b"windbg_dac_resolve_and_notify\0")?
-        };
+        let resolve_and_notify =
+            unsafe { load_symbol::<ResolveMethod>(&library, b"windbg_dac_resolve_and_notify\0")? };
+        let resolve_read_only =
+            unsafe { load_symbol::<ResolveMethod>(&library, b"windbg_dac_resolve_read_only\0")? };
         let refresh_method_code = unsafe {
             load_symbol::<RefreshMethodCode>(&library, b"windbg_dac_refresh_method_code\0")?
         };
@@ -220,6 +222,7 @@ impl CoreClrDacBridge {
             disable_module_load_notifications,
             is_module_loaded,
             resolve_and_notify,
+            resolve_read_only,
             refresh_method_code,
             last_error,
             runtime_info: managed_runtime_info(&native_runtime)?,
@@ -277,6 +280,38 @@ impl CoreClrDacBridge {
         fully_qualified_method: &str,
         signature_blob: Option<&[u8]>,
     ) -> anyhow::Result<(ManagedMethodInfo, ManagedCodeAvailability)> {
+        self.resolve_method(
+            self.resolve_and_notify,
+            managed_module_path,
+            fully_qualified_method,
+            signature_blob,
+            "resolving the managed method",
+        )
+    }
+
+    pub fn resolve_read_only(
+        &mut self,
+        managed_module_path: &Path,
+        fully_qualified_method: &str,
+        signature_blob: Option<&[u8]>,
+    ) -> anyhow::Result<(ManagedMethodInfo, ManagedCodeAvailability)> {
+        self.resolve_method(
+            self.resolve_read_only,
+            managed_module_path,
+            fully_qualified_method,
+            signature_blob,
+            "resolving the managed method without CLR notification registration",
+        )
+    }
+
+    fn resolve_method(
+        &mut self,
+        resolve_method: ResolveMethod,
+        managed_module_path: &Path,
+        fully_qualified_method: &str,
+        signature_blob: Option<&[u8]>,
+        operation: &str,
+    ) -> anyhow::Result<(ManagedMethodInfo, ManagedCodeAvailability)> {
         let managed_module_path = to_wide(managed_module_path.as_os_str())?;
         let method = to_wide(OsStr::new(fully_qualified_method))?;
         let (signature_blob, signature_blob_length) = signature_blob
@@ -291,7 +326,7 @@ impl CoreClrDacBridge {
             .unwrap_or((std::ptr::null(), 0));
         let mut native_method = NativeMethodInfo::default();
         let status = unsafe {
-            (self.resolve_and_notify)(
+            resolve_method(
                 self.bridge.as_ptr(),
                 managed_module_path.as_ptr(),
                 method.as_ptr(),
@@ -300,7 +335,7 @@ impl CoreClrDacBridge {
                 &mut native_method,
             )
         };
-        self.handle_method_status(status, &native_method, "resolving the managed method")?;
+        self.handle_method_status(status, &native_method, operation)?;
         let availability = if native_method.code_available == 0 {
             ManagedCodeAvailability::PendingJit
         } else {

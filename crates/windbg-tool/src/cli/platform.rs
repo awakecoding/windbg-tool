@@ -78,10 +78,15 @@ pub(super) fn run_live_startup_break(
         .as_deref()
         .map(validate_module_load_filter)
         .transpose()?;
+    validate_startup_breakpoint_mode(args.hardware_execute, &breakpoint_spec)?;
     let session = launch_live_session(LiveLaunchSessionOptions {
         command_line: args.command_line.clone(),
         initial_break_timeout_ms: args.initial_break_timeout_ms,
-        initial_stop: LiveInitialStop::SoftwareBreakpoint,
+        initial_stop: if args.hardware_execute {
+            LiveInitialStop::CreateProcessEvent
+        } else {
+            LiveInitialStop::SoftwareBreakpoint
+        },
     })?;
 
     let result = (|| {
@@ -111,6 +116,10 @@ pub(super) fn run_live_startup_break(
             .transpose()?;
         let requested_breakpoint = match breakpoint_spec {
             StartupBreakpointSpec::InitialBreak => None,
+            _ if args.hardware_execute => Some(set_startup_hardware_execute_breakpoint(
+                &session,
+                &breakpoint_spec,
+            )?),
             _ => Some(set_startup_breakpoint(&session, &breakpoint_spec)?),
         };
         let continued_to_breakpoint = requested_breakpoint
@@ -122,6 +131,10 @@ pub(super) fn run_live_startup_break(
             .then(|| session.wait_for_event(args.wait_timeout_ms))
             .transpose()?
             .unwrap_or_else(|| session.execution_status());
+        let breakpoint_event = requested_breakpoint
+            .is_some()
+            .then(|| session.last_event())
+            .transpose()?;
         let registers = session.core_registers()?;
         let instruction_offset = registers.instruction_offset;
         let context = live_stop_context(&session, registers, args.max_frames)?;
@@ -139,13 +152,28 @@ pub(super) fn run_live_startup_break(
                     .map(|breakpoint| breakpoint.offset),
             )
             .is_some_and(|(instruction_offset, breakpoint_offset)| {
-                event.name.as_deref() == Some("break") && instruction_offset == breakpoint_offset
+                event.name.as_deref() == Some("break")
+                    && breakpoint_event
+                        .as_ref()
+                        .is_some_and(|event| event.event_name == "breakpoint")
+                    && breakpoint_event
+                        .as_ref()
+                        .and_then(|event| event.breakpoint_id)
+                        == configured_breakpoint
+                            .as_ref()
+                            .map(|breakpoint| breakpoint.id)
+                    && instruction_offset == breakpoint_offset
             });
 
         Ok(json!({
             "workflow": "live_startup_break",
             "command_line": args.command_line,
             "breakpoint_spec": breakpoint_spec,
+            "breakpoint_mode": if args.hardware_execute { "hardware_execute" } else { "software_code" },
+            "target_memory_writes": {
+                "requested": false,
+                "operations": []
+            },
             "initial_event": initial_event,
             "module_load": module_load,
             "continued_to_breakpoint": continued_to_breakpoint,
@@ -153,13 +181,14 @@ pub(super) fn run_live_startup_break(
             "breakpoint": {
                 "requested": requested_breakpoint,
                 "configured": configured_breakpoint,
+                "event": breakpoint_event,
                 "hit": breakpoint_hit,
                 "hit_evidence": if breakpoint_hit {
-                    "current instruction pointer equals the configured breakpoint offset"
+                    "DbgEng reported the configured breakpoint ID and the current instruction pointer equals its offset"
                 } else if matches!(breakpoint_spec, StartupBreakpointSpec::InitialBreak) {
                     "the initial DbgEng process break was intentionally captured without setting a code breakpoint"
                 } else {
-                    "DbgEng stopped, but its current instruction pointer did not match the configured breakpoint offset"
+                    "DbgEng did not report the configured breakpoint ID at its configured instruction pointer"
                 }
             },
             "context": context,
@@ -182,6 +211,10 @@ pub(super) fn run_live_managed_break(
     args: LiveManagedBreakArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
+    if args.hardware_execute {
+        return run_live_managed_hardware_break(args, output);
+    }
+
     const CORECLR_MODULE: &str = "coreclr.dll";
     const CLR_NOTIFICATION_EXCEPTION: u32 = 0xe044_4143;
     const CLR_NOTIFICATION_FILTER: &str = "clrn";
@@ -398,6 +431,241 @@ pub(super) fn run_live_managed_break(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
     }
+}
+
+fn run_live_managed_hardware_break(
+    args: LiveManagedBreakArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    const CORECLR_MODULE: &str = "coreclr.dll";
+
+    ensure!(
+        !args.allow_runtime_write,
+        "--hardware-execute cannot be combined with --allow-runtime-write"
+    );
+    let end = parse_live_launch_end(&args.end)?;
+    let managed_module = validate_managed_module(&args.managed_module)?;
+    let method = validate_managed_breakpoint_token(&args.method, "--method")?;
+    let signature = parse_managed_method_signature(args.signature.as_deref())?;
+    let session = launch_live_session(LiveLaunchSessionOptions {
+        command_line: args.command_line.clone(),
+        initial_break_timeout_ms: args.initial_break_timeout_ms,
+        initial_stop: LiveInitialStop::CreateProcessEvent,
+    })?;
+
+    let result = (|| {
+        let initial_event = session.summary();
+        session
+            .execute_command(&format!("sxe ld:{CORECLR_MODULE}"))
+            .context("configuring the non-invasive CoreCLR module-load stop")?;
+        let coreclr_wait = continue_to_dbgeng_module_load(
+            &session,
+            args.wait_timeout_ms,
+            "CoreCLR module-load event",
+        )?;
+        let modules_after_coreclr_load = session.modules()?;
+        let coreclr_module = find_loaded_module(&modules_after_coreclr_load, CORECLR_MODULE)?;
+        let coreclr_path = module_image_path(coreclr_module, "CoreCLR")?;
+        let mut dac = session
+            .open_coreclr_dac_bridge(&coreclr_path, false)
+            .context("initializing the exact-version read-only CoreCLR DAC bridge")?;
+
+        session
+            .execute_command(&format!("sxe ld:{managed_module}"))
+            .with_context(|| {
+                format!("configuring the managed-module load stop for {managed_module}")
+            })?;
+        let managed_module_load = continue_to_dbgeng_module_load(
+            &session,
+            args.wait_timeout_ms,
+            "managed module-load event",
+        )?;
+        let modules_after_managed_load = session.modules()?;
+        let loaded_managed_module =
+            find_loaded_module(&modules_after_managed_load, &managed_module)?;
+        let managed_module_path = module_image_path(loaded_managed_module, "managed assembly")?;
+        let module_available = dac.is_module_loaded(&managed_module_path)?;
+
+        let (
+            resolved_method,
+            availability,
+            configured_breakpoint,
+            breakpoint_stop,
+            hit,
+            binding_state,
+        ) = if !module_available {
+            (
+                None,
+                None,
+                None,
+                None,
+                false,
+                "module_not_observable_without_runtime_write",
+            )
+        } else {
+            let (resolved_method, availability) = dac
+                    .resolve_read_only(&managed_module_path, &method, signature.as_deref())
+                    .with_context(|| {
+                        format!(
+                            "resolving {method} in the selected managed module {managed_module} through the read-only DAC"
+                        )
+                    })?;
+            match availability {
+                ManagedCodeAvailability::PendingJit => (
+                    Some(resolved_method),
+                    Some("pending_jit"),
+                    None,
+                    None,
+                    false,
+                    "pending_jit_unobservable_without_runtime_write",
+                ),
+                ManagedCodeAvailability::Available => {
+                    let native_entry_address =
+                        resolved_method.representative_entry_address.context(
+                            "the selected managed method has no generated native entry address",
+                        )?;
+                    let breakpoint =
+                        session.add_hardware_execute_breakpoint(native_entry_address)?;
+                    let (stop, hit) = wait_for_managed_hardware_execute_breakpoint(
+                        &session,
+                        &breakpoint,
+                        native_entry_address,
+                        args.wait_timeout_ms,
+                    )?;
+                    (
+                        Some(resolved_method),
+                        Some("available"),
+                        Some(breakpoint),
+                        Some(stop),
+                        hit,
+                        if hit {
+                            "hardware_execute_hit"
+                        } else {
+                            "hardware_execute_not_hit"
+                        },
+                    )
+                }
+            }
+        };
+
+        let registers = session.core_registers()?;
+        let context = live_stop_context(&session, registers, args.max_frames)?;
+        Ok(json!({
+            "workflow": "live_managed_break_dac_hardware_execute",
+            "command_line": args.command_line,
+            "initial_event": initial_event,
+            "target_memory_writes": {
+                "requested": false,
+                "dac_notification_registration": false,
+                "software_code_breakpoint": false,
+                "operations": []
+            },
+            "coreclr_module_load": {
+                "module": CORECLR_MODULE,
+                "load": coreclr_wait,
+                "loaded_module": coreclr_module,
+                "runtime": dac.runtime_info()
+            },
+            "managed_module_load": {
+                "managed_module": managed_module,
+                "load": managed_module_load,
+                "loaded_module": loaded_managed_module,
+                "module_available_to_read_only_dac": module_available
+            },
+            "managed_resolution": {
+                "method_request": method,
+                "signature_request_hex": signature.as_deref().map(format_managed_method_signature),
+                "resolved_method": resolved_method,
+                "code_availability": availability,
+                "exact_overload_signature_selection": signature.is_some(),
+                "private_methods_resolve_as_metadata": true
+            },
+            "managed_breakpoint": {
+                "kind": "hardware_execute",
+                "configured": configured_breakpoint,
+                "stop": breakpoint_stop,
+                "hit": hit,
+                "binding_state": binding_state,
+                "hit_evidence": if hit {
+                    "DbgEng reported the configured processor breakpoint ID and the current instruction pointer both match the DAC-mapped native entry for the selected MethodDef"
+                } else {
+                    "No managed hit is claimed: a hardware breakpoint can be set only for native code already visible to the read-only DAC at the managed module-load stop"
+                }
+            },
+            "limitations": [
+                "Without CLR code notifications, a method first JIT-compiled after this module-load event is not observable and cannot be bound.",
+                "Tiered recompilation, ReadyToRun indirection, re-JIT, generic instantiations, and unload transitions can replace or invalidate a native entry.",
+                "x64 processor breakpoints use a constrained per-thread debug-register resource; no thread restriction is configured by this command."
+            ],
+            "context": context,
+            "end": end
+        }))
+    })();
+
+    let cleanup = match end {
+        LiveLaunchEnd::Detach => session.detach(),
+        LiveLaunchEnd::Terminate => session.terminate(),
+    };
+    match (result, cleanup) {
+        (Ok(result), Ok(())) => print_value(result, output),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
+    }
+}
+
+fn continue_to_dbgeng_module_load(
+    session: &DebuggerSession,
+    wait_timeout_ms: u32,
+    description: &str,
+) -> anyhow::Result<Value> {
+    let continued = session.continue_execution()?;
+    let wait = session
+        .wait_for_event(wait_timeout_ms)
+        .with_context(|| format!("waiting for the {description}"))?;
+    let event = session
+        .last_event()
+        .with_context(|| format!("reading the {description}"))?;
+    ensure!(
+        wait.name.as_deref() == Some("break")
+            && event.event_name == "load_module"
+            && event.module_base.is_some(),
+        "DbgEng did not stop on the requested {description}: wait={wait:?}, event={event:?}"
+    );
+    Ok(json!({
+        "continued": continued,
+        "wait": wait,
+        "event": event
+    }))
+}
+
+fn wait_for_managed_hardware_execute_breakpoint(
+    session: &DebuggerSession,
+    breakpoint: &BreakpointInfo,
+    native_entry_address: u64,
+    wait_timeout_ms: u32,
+) -> anyhow::Result<(Value, bool)> {
+    let continued = session.continue_execution()?;
+    let wait = session
+        .wait_for_event(wait_timeout_ms)
+        .context("waiting for the managed processor execute breakpoint")?;
+    let event = (wait.name.as_deref() == Some("break"))
+        .then(|| session.last_event())
+        .transpose()?;
+    let registers = session.core_registers()?;
+    let hit = event.as_ref().is_some_and(|event| {
+        event.event_name == "breakpoint"
+            && event.breakpoint_id == Some(breakpoint.id)
+            && registers.instruction_offset == Some(native_entry_address)
+    });
+    Ok((
+        json!({
+            "continued": continued,
+            "wait": wait,
+            "event": event,
+            "instruction_pointer": registers.instruction_offset
+        }),
+        hit,
+    ))
 }
 
 fn continue_after_clr_notification(
@@ -789,6 +1057,17 @@ fn startup_breakpoint_spec(args: &LiveStartupBreakArgs) -> anyhow::Result<Startu
     })
 }
 
+fn validate_startup_breakpoint_mode(
+    hardware_execute: bool,
+    spec: &StartupBreakpointSpec,
+) -> anyhow::Result<()> {
+    ensure!(
+        !hardware_execute || !matches!(spec, StartupBreakpointSpec::InitialBreak),
+        "--hardware-execute requires --address, --module with --module-offset, or --symbol"
+    );
+    Ok(())
+}
+
 fn set_startup_breakpoint(
     session: &DebuggerSession,
     spec: &StartupBreakpointSpec,
@@ -809,6 +1088,51 @@ fn set_startup_breakpoint(
         }
         StartupBreakpointSpec::Symbol { expression } => {
             session.add_code_breakpoint_expression(expression)
+        }
+    }
+}
+
+fn set_startup_hardware_execute_breakpoint(
+    session: &DebuggerSession,
+    spec: &StartupBreakpointSpec,
+) -> anyhow::Result<BreakpointInfo> {
+    let address = startup_breakpoint_address(session, spec)?;
+    session.add_hardware_execute_breakpoint(address)
+}
+
+fn startup_breakpoint_address(
+    session: &DebuggerSession,
+    spec: &StartupBreakpointSpec,
+) -> anyhow::Result<u64> {
+    match spec {
+        StartupBreakpointSpec::InitialBreak => {
+            bail!("initial-break capture does not identify a processor execute breakpoint address")
+        }
+        StartupBreakpointSpec::Address { address } => Ok(*address),
+        StartupBreakpointSpec::ModuleOffset { module, offset } => {
+            let modules = session.modules()?;
+            let module = find_loaded_module(&modules, module)?;
+            module
+                .base_address
+                .checked_add(*offset)
+                .context("module base plus breakpoint offset overflowed")
+        }
+        StartupBreakpointSpec::Symbol { expression } => {
+            let evaluation = session
+                .evaluate(expression)
+                .with_context(|| format!("evaluating hardware breakpoint symbol '{expression}'"))?;
+            evaluation
+                .unsigned_value
+                .or_else(|| {
+                    evaluation
+                        .signed_value
+                        .and_then(|address| u64::try_from(address).ok())
+                })
+                .with_context(|| {
+                    format!(
+                        "DbgEng did not resolve hardware breakpoint symbol '{expression}' to an unsigned address"
+                    )
+                })
         }
     }
 }
@@ -2117,6 +2441,7 @@ mod tests {
         let args = LiveStartupBreakArgs {
             command_line: "target.exe".to_string(),
             initial_break: false,
+            hardware_execute: false,
             address: Some("0x140001000".to_string()),
             module: Some("target.exe".to_string()),
             module_offset: Some("0x1000".to_string()),
@@ -2153,6 +2478,16 @@ mod tests {
             startup_breakpoint_spec(&initial_break_args).unwrap(),
             StartupBreakpointSpec::InitialBreak
         );
+        assert!(
+            validate_startup_breakpoint_mode(true, &StartupBreakpointSpec::InitialBreak).is_err()
+        );
+        assert!(validate_startup_breakpoint_mode(
+            true,
+            &StartupBreakpointSpec::Address {
+                address: 0x140001000
+            }
+        )
+        .is_ok());
     }
 
     #[test]

@@ -680,6 +680,11 @@ struct LiveStartupBreakArgs {
         help = "Capture the initial DbgEng break without setting a code breakpoint"
     )]
     initial_break: bool,
+    #[arg(
+        long,
+        help = "Use a one-byte DbgEng processor execute breakpoint instead of a software code breakpoint; uses a create-process initial stop and cannot be combined with --initial-break"
+    )]
+    hardware_execute: bool,
     #[arg(long, help = "Absolute code address for the breakpoint")]
     address: Option<String>,
     #[arg(
@@ -740,6 +745,12 @@ struct LiveManagedBreakArgs {
         help = "Allow the matching DAC to write CLR debugger-notification state; use only in an approved test VM"
     )]
     allow_runtime_write: bool,
+    #[arg(
+        long,
+        conflicts_with = "allow_runtime_write",
+        help = "Use only read-only DAC queries and a DbgEng processor execute breakpoint; does not register CLR notifications or use a software breakpoint"
+    )]
+    hardware_execute: bool,
     #[arg(long, default_value_t = 30000)]
     initial_break_timeout_ms: u32,
     #[arg(long, default_value_t = 60000)]

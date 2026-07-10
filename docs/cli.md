@@ -90,7 +90,7 @@ sudo config --enable disableInput
 
 ## Live startup breakpoints
 
-`live startup-break` is a one-shot native DbgEng workflow: it launches at the initial debug break, configures one code breakpoint, continues the target once, waits for a bounded event, captures JSON context, and then ends the debug session. It does not shell out to CDB or WinDbg.
+`live startup-break` is a one-shot native DbgEng workflow: by default it launches at the initial debug break, configures one software code breakpoint, continues the target once, waits for a bounded event, captures JSON context, and then ends the debug session. It does not shell out to CDB or WinDbg.
 
 For a development build with DbgEng staged outside the executable directory, set `WINDBG_DBGENG_RUNTIME_DIR` to the matching `dbgeng-runtime` directory. Packaged builds load the matching DbgEng runtime copied beside `windbg-tool.exe`; both paths use a process-local, dependency-safe loader.
 
@@ -111,6 +111,26 @@ Use `--initial-break` when no reliable code breakpoint is available or the host 
 
 `--end terminate` is the default for disposable startup probes. Use `--end detach` only when the debuggee should continue after the captured event.
 
+### Non-invasive processor execute breakpoint
+
+`--hardware-execute` switches `live startup-break` to a DbgEng processor breakpoint. It starts from a create-process event (not a software initial break), waits for the requested native module-load event, then creates `DEBUG_BREAKPOINT_DATA` with `DEBUG_BREAK_EXECUTE` and byte size `1`. It does not open the DAC, request CLR notifications, or place a software breakpoint byte in target memory.
+
+The .NET 10.0.9 x64 fixture verified this path against CoreCLR's `coreclr_execute_assembly` export (RVA `0x2F690` for that runtime):
+
+```powershell
+$fixture = Resolve-Path crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture
+target\debug\windbg-tool.exe --compact live startup-break `
+  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
+  --wait-for-module coreclr.dll `
+  --module coreclr.dll --module-offset 0x2F690 `
+  --hardware-execute --initial-break-timeout-ms 30000 --wait-timeout-ms 30000 `
+  --end terminate
+```
+
+Use `symbols exports <coreclr.dll> --filter coreclr_execute_assembly` to obtain the RVA for a different CoreCLR version. The validated response had `breakpoint_mode: "hardware_execute"`, `configured.break_type: 1`, `configured.data_access_type: 4`, `configured.data_size: 1`, `configured.match_thread: null`, `configured.id: 0`, and `hit: true`. DbgEng then reported breakpoint ID `0` at `coreclr!coreclr_execute_assembly` with the current instruction pointer equal to the configured address. This is a verified **native** processor-breakpoint hit, not a managed-method hit.
+
+Processor breakpoints are a constrained CPU resource. [Microsoft's processor-breakpoint documentation](https://learn.microsoft.com/windows-hardware/drivers/debugger/processor-breakpoints---ba-breakpoints-) distinguishes them from software breakpoints and permits execute access on code. On x64, DR0 through DR3 provide only four address-register slots per thread context; existing debugger or target users can reduce usable capacity. DbgEng supports an engine-thread filter through [`IDebugBreakpoint2::SetMatchThreadId`](https://learn.microsoft.com/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugbreakpoint2-setmatchthreadid), but this one-shot command deliberately leaves it unset (`match_thread: null`), so any target thread may trigger the breakpoint. A thread filter would not create additional hardware-register capacity.
+
 ## Managed CoreCLR DAC breakpoints
 
 `live managed-break` does not load SOS or execute `!bpmd`. It starts with a DbgEng create-process event, stops on CoreCLR and the requested managed module load, dynamically loads the exact x64 `mscordaccore.dll` that is a sibling of the target's loaded `coreclr.dll`, resolves the selected `MethodDef` through the DAC, requests CLR code-generation notification, then creates a DbgEng **code** breakpoint at the DAC-mapped native entry. `managed_breakpoint.hit` is true only when both the DbgEng breakpoint ID and current instruction pointer match that DAC-mapped address.
@@ -120,6 +140,28 @@ Build and stage `windbg_coreclr_dac_bridge.dll` with `cargo xtask native-build`;
 CLR's notification mechanism writes debugger-notification state into the target. The DAC first requests a small JIT-notification table through `ICLRDataTarget2::AllocVirtual`; the bridge obtains the active target process handle from DbgEng and calls `VirtualAllocEx` only for that CLR-owned allocation. DbgEng then applies its normal code-breakpoint byte at the resolved entry. Therefore `--allow-runtime-write` is explicit and should be used only in an approved test VM. Without it the command fails clearly before any target allocation or write; it does not disable endpoint protection, hollow the process, or silently fall back to SOS.
 
 The bridge resolves metadata through `IXCLRDataMethodDefinition`, then uses the matching `IXCLRDataMethodInstance` after CLR code-generation notification. A definition's representative address is IL, not executable code; the code breakpoint always uses the instance's JIT-native entry address.
+
+### Read-only managed hardware mode
+
+`live managed-break --hardware-execute` is a separate, deliberately restricted path. It is mutually exclusive with `--allow-runtime-write` and performs only a read-only DAC query plus a DbgEng processor execute breakpoint when a native method instance is already available. It does not request module/code notifications, allocate CLR notification state, use `WriteVirtual` or `VirtualAllocEx`, create a software code breakpoint, use SOS, inject code, or force JIT compilation.
+
+The command starts from create-process and native module-load events. It resolves exact private/overload metadata only if CoreCLR has already registered the requested module with the DAC at the native image-load stop. If the selected method already has a native instance, it uses a one-byte `DEBUG_BREAK_EXECUTE` breakpoint at that exact DAC-native address and reports a hit only when DbgEng's breakpoint ID and current instruction pointer both match.
+
+The safe .NET 10.0.9 x64 fixture established that the native `ManagedBreakpointFixture.dll` load event occurs before the module is visible to the read-only DAC. This invocation therefore correctly returned `managed_breakpoint.binding_state: "module_not_observable_without_runtime_write"` and `hit: false`:
+
+```powershell
+$env:WINDBG_CORECLR_DAC_BRIDGE_DLL = `
+  (Resolve-Path target\native\coreclr-dac-bridge\bin\Release\windbg_coreclr_dac_bridge.dll)
+$fixture = Resolve-Path crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture
+target\debug\windbg-tool.exe --compact live managed-break `
+  --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
+  --managed-module ManagedBreakpointFixture.dll `
+  --method ManagedBreakpointFixture.ManagedTargets.PrivateEntry `
+  --hardware-execute --initial-break-timeout-ms 30000 --wait-timeout-ms 30000 `
+  --end terminate
+```
+
+This is an intentional non-hit, not a fallback failure: the tool leaves the process at the module-load stop, then ends the session according to `--end`, rather than continuing to wait for JIT or mutating CLR state. Consequently, the current non-invasive mode cannot prove a private managed-method hit. A later JIT event, tiered recompilation, ReadyToRun indirection, re-JIT, generic instantiation, or unload can create or replace the native entry, and the read-only path has no supported event that tracks those transitions. The verified native `coreclr!coreclr_execute_assembly` hit above does not establish managed-method semantics.
 
 ```powershell
 target\debug\windbg-tool.exe --compact live managed-break `
@@ -192,7 +234,7 @@ The same command with `--method Devolutions.RemoteDesktopManager.Program.ApplyDp
 
 ### RDM approval requirement
 
-The prior RDM evidence above was collected in an approved test VM. Do not run another RDM `live managed-break` session until the application owner and endpoint-security owner approve a scoped debugger policy/exclusion for the designated test VM and RDM build. That approval must permit DbgEng's normal code breakpoint and the explicitly requested CLR JIT-notification allocation/write enabled by `--allow-runtime-write`. Do not disable, weaken, bypass, or otherwise alter Sophos, HitmanPro.Alert, or RDM protections to obtain a hit.
+The prior RDM evidence above was collected in an approved test VM. RDM continuation is currently blocked: do not launch, resume, or attach RDM under either software or hardware breakpoints, and do not seek an exclusion or workaround. Any future RDM proof requires a new explicit direction plus written approval from the application owner and endpoint-security owner for the designated test VM and RDM build. That approval must state the allowed debugger operations; it does not authorize disabling, weakening, bypassing, or otherwise altering Sophos, HitmanPro.Alert, or RDM protections.
 
 ## AI-oriented DbgEng target inspection
 

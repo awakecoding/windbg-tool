@@ -89,6 +89,16 @@ WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_resolve_and_notify(
     uint32_t signature_blob_length,
     WindbgDacMethodInfo* method_info);
 
+// Resolves metadata and any already-generated native method instance without
+// registering CLR notifications or invoking any target-write callback.
+WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_resolve_read_only(
+    WindbgDacBridge* bridge,
+    const wchar_t* managed_module_path,
+    const wchar_t* fully_qualified_method,
+    const uint8_t* signature_blob,
+    uint32_t signature_blob_length,
+    WindbgDacMethodInfo* method_info);
+
 WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_refresh_method_code(
     WindbgDacBridge* bridge,
     WindbgDacMethodInfo* method_info);

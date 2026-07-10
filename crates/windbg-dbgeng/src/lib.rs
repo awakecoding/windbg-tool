@@ -1172,6 +1172,28 @@ impl DebuggerSession {
         self.breakpoint_info(&breakpoint)
     }
 
+    pub fn add_hardware_execute_breakpoint(&self, address: u64) -> anyhow::Result<BreakpointInfo> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_BREAKPOINT_DATA, DEBUG_BREAKPOINT_ENABLED, DEBUG_BREAK_EXECUTE,
+        };
+
+        let breakpoint = self
+            .add_compatible_breakpoint(DEBUG_BREAKPOINT_DATA)
+            .context("DbgEng could not create a processor execute breakpoint")?;
+        unsafe {
+            breakpoint.SetOffset(address).with_context(|| {
+                format!("DbgEng could not set processor execute breakpoint offset 0x{address:X}")
+            })?;
+            breakpoint
+                .SetDataParameters(1, DEBUG_BREAK_EXECUTE)
+                .context("DbgEng could not configure a one-byte processor execute breakpoint")?;
+            breakpoint
+                .AddFlags(DEBUG_BREAKPOINT_ENABLED)
+                .context("DbgEng could not enable the processor execute breakpoint")?;
+        }
+        self.breakpoint_info(&breakpoint)
+    }
+
     pub fn remove_breakpoint(&self, breakpoint_id: u32) -> anyhow::Result<()> {
         let breakpoint = unsafe { self.control.GetBreakpointById2(breakpoint_id)? };
         unsafe {
