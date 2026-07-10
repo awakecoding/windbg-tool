@@ -2,13 +2,14 @@ use anyhow::{bail, ensure, Context};
 use serde_json::{json, Value};
 use std::env;
 use std::ffi::OsString;
+use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use windbg_dbgeng::{
     launch_live_session, live_launch_initial_break, open_dump_session, start_process_server,
     write_process_dump, BreakpointInfo, DebuggerSession, DumpKind, DumpOpenOptions,
@@ -29,8 +30,8 @@ use windows::Win32::System::Threading::{
 use super::output::{print_value, OutputOptions};
 use super::{
     CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
-    LiveStartupBreakArgs, TraceRecordArgs, TraceRecordProfile, TraceReplayCpuSupport,
-    WindbgCommand,
+    LiveManagedBreakArgs, LiveStartupBreakArgs, TraceRecordArgs, TraceRecordProfile,
+    TraceReplayCpuSupport, WindbgCommand,
 };
 
 pub(super) fn run_dbgeng_server(
@@ -95,27 +96,7 @@ pub(super) fn run_live_startup_break(
             .unwrap_or_else(|| session.execution_status());
         let registers = session.core_registers()?;
         let instruction_offset = registers.instruction_offset;
-        let current_module = instruction_offset
-            .map(|address| session.module_by_offset(address))
-            .transpose()?
-            .flatten();
-        let current_symbol = instruction_offset
-            .map(|address| session.symbol_by_offset(address))
-            .transpose()?
-            .flatten();
-        let stack = match session.stack_trace(args.max_frames) {
-            Ok(frames) => json!({
-                "status": "ok",
-                "frames": frames,
-                "frame_limit": args.max_frames
-            }),
-            Err(error) => json!({
-                "status": "error",
-                "error": error.to_string(),
-                "frames": [],
-                "frame_limit": args.max_frames
-            }),
-        };
+        let context = live_stop_context(&session, registers, args.max_frames)?;
         let configured_breakpoint = match requested_breakpoint.as_ref() {
             Some(requested) => session
                 .list_breakpoints()?
@@ -152,14 +133,7 @@ pub(super) fn run_live_startup_break(
                     "DbgEng stopped, but its current instruction pointer did not match the configured breakpoint offset"
                 }
             },
-            "context": {
-                "target": session.summary(),
-                "registers": registers,
-                "instruction_pointer": instruction_offset,
-                "current_module": current_module,
-                "current_symbol": current_symbol,
-                "stack": stack
-            },
+            "context": context,
             "end": end
         }))
     })();
@@ -173,6 +147,249 @@ pub(super) fn run_live_startup_break(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
     }
+}
+
+pub(super) fn run_live_managed_break(
+    args: LiveManagedBreakArgs,
+    output: &OutputOptions,
+) -> anyhow::Result<()> {
+    const RUNTIME_ENTRY_SYMBOL: &str = "coreclr!coreclr_execute_assembly";
+
+    let end = parse_live_launch_end(&args.end)?;
+    let managed_module =
+        validate_managed_breakpoint_token(&args.managed_module, "--managed-module")?;
+    let method = validate_managed_breakpoint_token(&args.method, "--method")?;
+    let sos_path = args
+        .sos
+        .canonicalize()
+        .with_context(|| format!("resolving SOS extension {}", args.sos.display()))?;
+    ensure!(sos_path.is_file(), "--sos must identify a file");
+    let sos_command_path = dbgeng_command_path(&sos_path)?;
+    let session = launch_live_session(LiveLaunchSessionOptions {
+        command_line: args.command_line.clone(),
+        initial_break_timeout_ms: args.initial_break_timeout_ms,
+    })?;
+
+    let result = (|| {
+        let initial_event = session.summary();
+        let runtime_entry_breakpoint =
+            session.add_code_breakpoint_expression(RUNTIME_ENTRY_SYMBOL)?;
+        let continued_to_runtime = session.continue_execution()?;
+        let runtime_wait = session
+            .wait_for_event(args.wait_timeout_ms)
+            .context("waiting for the CoreCLR runtime-entry breakpoint")?;
+        let runtime_event = session
+            .last_event()
+            .context("reading the CoreCLR runtime-entry event")?;
+        let runtime_hit = runtime_wait.name.as_deref() == Some("break")
+            && runtime_event.event_name == "breakpoint"
+            && runtime_event.breakpoint_id == Some(runtime_entry_breakpoint.id);
+        ensure!(
+            runtime_hit,
+            "DbgEng did not stop at the CoreCLR runtime-entry breakpoint before configuring SOS"
+        );
+
+        let load_sos_command = format!(r#".load "{sos_command_path}""#);
+        let set_managed_breakpoint_command = format!("!bpmd {managed_module} {method}");
+        let sos_output = execute_sos_breakpoint_commands(
+            &session,
+            &load_sos_command,
+            &set_managed_breakpoint_command,
+        )?;
+        let sos_output_excerpt = sos_output["text"]
+            .as_str()
+            .unwrap_or_default()
+            .chars()
+            .take(2048)
+            .collect::<String>();
+
+        let continued_to_managed = session.continue_execution()?;
+        let managed_wait = session
+            .wait_for_event(args.wait_timeout_ms)
+            .with_context(|| {
+                format!("waiting for the SOS managed breakpoint; SOS output: {sos_output_excerpt}")
+            })?;
+        let managed_event = session
+            .last_event()
+            .context("reading the SOS managed-breakpoint event")?;
+        let managed_hit = managed_wait.name.as_deref() == Some("break")
+            && managed_event.event_name == "breakpoint"
+            && managed_event.breakpoint_id != Some(runtime_entry_breakpoint.id);
+        ensure!(
+            managed_hit,
+            "SOS bpmd did not produce a distinct managed breakpoint event for {managed_module}!{method}"
+        );
+
+        let registers = session.core_registers()?;
+        let context = live_stop_context(&session, registers, args.max_frames)?;
+        Ok(json!({
+            "workflow": "live_managed_break",
+            "command_line": args.command_line,
+            "initial_event": initial_event,
+            "runtime_entry_breakpoint": {
+                "expression": RUNTIME_ENTRY_SYMBOL,
+                "configured": runtime_entry_breakpoint,
+                "continued": continued_to_runtime,
+                "wait": runtime_wait,
+                "event": runtime_event,
+                "hit": runtime_hit,
+                "hit_evidence": "DbgEng breakpoint event ID matches the CoreCLR runtime-entry breakpoint"
+            },
+            "managed_breakpoint": {
+                "kind": "sos_bpmd",
+                "sos_path": sos_path,
+                "managed_module": managed_module,
+                "method": method,
+                "load_command": load_sos_command,
+                "set_command": set_managed_breakpoint_command,
+                "output": sos_output,
+                "continued": continued_to_managed,
+                "wait": managed_wait,
+                "event": managed_event,
+                "hit": managed_hit,
+                "hit_evidence": "SOS bpmd was configured after CoreCLR loaded and DbgEng reported a distinct breakpoint event"
+            },
+            "context": context,
+            "end": end
+        }))
+    })();
+
+    let cleanup = match end {
+        LiveLaunchEnd::Detach => session.detach(),
+        LiveLaunchEnd::Terminate => session.terminate(),
+    };
+    match (result, cleanup) {
+        (Ok(result), Ok(())) => print_value(result, output),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
+    }
+}
+
+fn live_stop_context(
+    session: &DebuggerSession,
+    registers: windbg_dbgeng::CoreRegisterState,
+    max_frames: u32,
+) -> anyhow::Result<Value> {
+    let instruction_offset = registers.instruction_offset;
+    let current_module = instruction_offset
+        .map(|address| session.module_by_offset(address))
+        .transpose()?
+        .flatten();
+    let current_symbol = instruction_offset
+        .map(|address| session.symbol_by_offset(address))
+        .transpose()?
+        .flatten();
+    let stack = match session.stack_trace(max_frames) {
+        Ok(frames) => json!({
+            "status": "ok",
+            "frames": frames,
+            "frame_limit": max_frames
+        }),
+        Err(error) => json!({
+            "status": "error",
+            "error": error.to_string(),
+            "frames": [],
+            "frame_limit": max_frames
+        }),
+    };
+    Ok(json!({
+        "target": session.summary(),
+        "registers": registers,
+        "instruction_pointer": instruction_offset,
+        "current_module": current_module,
+        "current_symbol": current_symbol,
+        "stack": stack
+    }))
+}
+
+fn validate_managed_breakpoint_token(value: &str, argument: &str) -> anyhow::Result<String> {
+    let value = value.trim();
+    ensure!(!value.is_empty(), "{argument} must not be empty");
+    ensure!(
+        value.chars().all(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '.' | '_' | '+' | '$' | '`')
+        }),
+        "{argument} contains unsupported characters"
+    );
+    Ok(value.to_string())
+}
+
+fn dbgeng_command_path(path: &Path) -> anyhow::Result<String> {
+    let path = path.to_string_lossy();
+    let path = path
+        .strip_prefix(r"\\?\UNC\")
+        .map(|value| format!(r"\\{value}"))
+        .or_else(|| path.strip_prefix(r"\\?\").map(str::to_string))
+        .unwrap_or_else(|| path.into_owned());
+    let path = path.replace('\\', "/");
+    ensure!(
+        !path.contains('"'),
+        "DbgEng command paths cannot contain quotes"
+    );
+    Ok(path)
+}
+
+fn execute_sos_breakpoint_commands(
+    session: &DebuggerSession,
+    load_sos_command: &str,
+    set_managed_breakpoint_command: &str,
+) -> anyhow::Result<Value> {
+    const MAX_SOS_OUTPUT_BYTES: usize = 16 * 1024;
+
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("reading the system clock for the SOS output log")?
+        .as_nanos();
+    let log_path = env::temp_dir().join(format!(
+        "windbg-tool-sos-{}-{timestamp}.log",
+        std::process::id()
+    ));
+    let open_log_command = format!(r#".logopen "{}""#, log_path.display());
+    session
+        .execute_command(&open_log_command)
+        .context("opening the bounded SOS command-output log")?;
+
+    let command_result = (|| {
+        session
+            .execute_command(load_sos_command)
+            .context("loading the SOS debugger extension")?;
+        session
+            .execute_command(set_managed_breakpoint_command)
+            .context("configuring the SOS managed breakpoint")
+    })();
+    let close_result = session
+        .execute_command(".logclose")
+        .context("closing the SOS command-output log");
+    let output_result = fs::read(&log_path)
+        .with_context(|| format!("reading SOS command output {}", log_path.display()));
+    let remove_result = fs::remove_file(&log_path)
+        .with_context(|| format!("removing SOS command output {}", log_path.display()));
+
+    if let Err(command_error) = command_result {
+        let cleanup_failures = [close_result.err(), output_result.err(), remove_result.err()]
+            .into_iter()
+            .flatten()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>();
+        if cleanup_failures.is_empty() {
+            return Err(command_error);
+        }
+        return Err(command_error).context(format!(
+            "SOS command cleanup also failed: {}",
+            cleanup_failures.join("; ")
+        ));
+    }
+    close_result?;
+    let output = output_result?;
+    remove_result?;
+    let truncated = output.len() > MAX_SOS_OUTPUT_BYTES;
+    let output =
+        String::from_utf8_lossy(&output[..output.len().min(MAX_SOS_OUTPUT_BYTES)]).into_owned();
+    Ok(json!({
+        "text": output,
+        "byte_limit": MAX_SOS_OUTPUT_BYTES,
+        "truncated": truncated
+    }))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -1578,6 +1795,36 @@ mod tests {
         assert_eq!(
             startup_breakpoint_spec(&initial_break_args).unwrap(),
             StartupBreakpointSpec::InitialBreak
+        );
+    }
+
+    #[test]
+    fn validates_managed_breakpoint_metadata_tokens() {
+        assert_eq!(
+            validate_managed_breakpoint_token(
+                "Devolutions.RemoteDesktopManager.Program.Main",
+                "--method"
+            )
+            .unwrap(),
+            "Devolutions.RemoteDesktopManager.Program.Main"
+        );
+        assert_eq!(
+            validate_managed_breakpoint_token("Outer+Inner.Method`1", "--method").unwrap(),
+            "Outer+Inner.Method`1"
+        );
+        assert!(validate_managed_breakpoint_token("Program.Main;qd", "--method").is_err());
+        assert!(validate_managed_breakpoint_token(r#"Program.Main""#, "--method").is_err());
+    }
+
+    #[test]
+    fn normalizes_verbatim_paths_for_dbgeng_commands() {
+        assert_eq!(
+            dbgeng_command_path(Path::new(r"\\?\C:\tools\sos.dll")).unwrap(),
+            "C:/tools/sos.dll"
+        );
+        assert_eq!(
+            dbgeng_command_path(Path::new(r"\\?\UNC\server\share\sos.dll")).unwrap(),
+            "//server/share/sos.dll"
         );
     }
 }

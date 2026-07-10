@@ -92,6 +92,8 @@ sudo config --enable disableInput
 
 `live startup-break` is a one-shot native DbgEng workflow: it launches at the initial debug break, configures one code breakpoint, continues the target once, waits for a bounded event, captures JSON context, and then ends the debug session. It does not shell out to CDB or WinDbg.
 
+For a development build with DbgEng staged outside the executable directory, set `WINDBG_DBGENG_RUNTIME_DIR` to the matching `dbgeng-runtime` directory. Packaged builds load the matching DbgEng runtime copied beside `windbg-tool.exe`; both paths use a process-local, dependency-safe loader.
+
 Use a module basename and RVA when the executable is present at the initial break:
 
 ```powershell
@@ -108,6 +110,23 @@ Alternatively specify an absolute `--address`, or a deferred DbgEng `--symbol 'm
 Use `--initial-break` when no reliable code breakpoint is available or the host policy rejects breakpoint creation. It captures the initial DbgEng process break without continuing the target and labels that evidence explicitly; it does not claim a code-breakpoint hit.
 
 `--end terminate` is the default for disposable startup probes. Use `--end detach` only when the debuggee should continue after the captured event.
+
+## Managed SOS breakpoints
+
+`live managed-break` uses DbgEng and the supported SOS `bpmd` command to stop on a managed method. It first stops at the native `coreclr!coreclr_execute_assembly` export so CoreCLR is loaded, loads the explicit x64 SOS extension, configures `!bpmd`, then requires a distinct DbgEng breakpoint event before reporting `managed_breakpoint.hit: true`. The response keeps the initial event, the native CoreCLR setup breakpoint, and the managed event separate.
+
+Install the current Microsoft debugger extension with `dotnet tool install --global dotnet-debugger-extensions`, then `dotnet-debugger-extensions install --architecture X64`, or provide an equivalent compatible x64 `sos.dll`:
+
+```powershell
+target\debug\windbg-tool.exe --compact live managed-break `
+  --command-line '"C:\apps\RemoteDesktopManager_x64.exe" /AutoCloseAfter:10' `
+  --sos "$env:USERPROFILE\.dotnet\sos\sos.dll" `
+  --managed-module RemoteDesktopManager `
+  --method Devolutions.RemoteDesktopManager.Program.Main `
+  --end terminate
+```
+
+The managed assembly and method inputs are intentionally limited to managed metadata-name characters; this prevents a generated SOS command from accepting additional debugger commands.
 
 ## AI-oriented DbgEng target inspection
 

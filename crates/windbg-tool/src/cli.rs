@@ -277,6 +277,10 @@ enum LiveCommand {
         about = "Launch under DbgEng, set an address/module-RVA/symbol breakpoint, and emit bounded stop context"
     )]
     StartupBreak(LiveStartupBreakArgs),
+    #[command(
+        about = "Launch .NET under DbgEng, use SOS bpmd for a managed method, and emit bounded hit evidence"
+    )]
+    ManagedBreak(LiveManagedBreakArgs),
     #[command(about = "Launch a process under DbgEng and keep it as a daemon-owned live target")]
     Start(LiveSessionStartArgs),
     #[command(about = "Attach DbgEng to a process and keep it as a daemon-owned live target")]
@@ -697,6 +701,36 @@ struct LiveStartupBreakArgs {
     #[arg(long, default_value_t = 5000)]
     initial_break_timeout_ms: u32,
     #[arg(long, default_value_t = 10000)]
+    wait_timeout_ms: u32,
+    #[arg(long, default_value_t = 16)]
+    max_frames: u32,
+    #[arg(long, default_value = "terminate", value_parser = ["detach", "terminate"])]
+    end: String,
+}
+
+#[derive(Debug, Args)]
+struct LiveManagedBreakArgs {
+    #[arg(long, help = "Full command line to launch under DbgEng")]
+    command_line: String,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Path to the x64 SOS debugger extension DLL"
+    )]
+    sos: PathBuf,
+    #[arg(
+        long,
+        help = "Managed assembly name without the .dll extension, for example RemoteDesktopManager"
+    )]
+    managed_module: String,
+    #[arg(
+        long,
+        help = "Fully qualified managed method name, for example Namespace.Type.Method"
+    )]
+    method: String,
+    #[arg(long, default_value_t = 30000)]
+    initial_break_timeout_ms: u32,
+    #[arg(long, default_value_t = 60000)]
     wait_timeout_ms: u32,
     #[arg(long, default_value_t = 16)]
     max_frames: u32,

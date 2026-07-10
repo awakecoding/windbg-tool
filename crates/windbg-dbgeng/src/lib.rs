@@ -1,15 +1,21 @@
 use anyhow::{bail, ensure, Context};
 use serde::Serialize;
+#[cfg(windows)]
+use std::os::windows::ffi::OsStrExt;
 use std::{
     env,
     path::{Path, PathBuf},
+    sync::OnceLock,
 };
 
 pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
 pub const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
 pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
 pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
+pub const DBGENG_RUNTIME_DIR_ENV: &str = "WINDBG_DBGENG_RUNTIME_DIR";
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
+const DBGENG_DLL_NAME: &str = "dbgeng.dll";
+const DBGENG_WAIT_TIMEOUT_HRESULT: i32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandardSymbolEnvironment {
@@ -86,6 +92,111 @@ fn env_path(name: &str) -> Option<String> {
         let value = value.to_string_lossy().trim().to_string();
         (!value.is_empty()).then_some(value)
     })
+}
+
+#[cfg(windows)]
+fn dbgeng_runtime_dll(
+    explicit_runtime_dir: Option<&Path>,
+    executable_path: Option<&Path>,
+) -> anyhow::Result<Option<PathBuf>> {
+    if let Some(runtime_dir) = explicit_runtime_dir {
+        let dll = runtime_dir.join(DBGENG_DLL_NAME);
+        ensure!(
+            dll.is_file(),
+            "{DBGENG_RUNTIME_DIR_ENV} must name a directory containing {}",
+            dll.display()
+        );
+        return Ok(Some(dll));
+    }
+
+    Ok(executable_path
+        .and_then(Path::parent)
+        .map(|directory| directory.join(DBGENG_DLL_NAME))
+        .filter(|dll| dll.is_file()))
+}
+
+#[cfg(windows)]
+fn ensure_dbgeng_runtime_loaded() -> anyhow::Result<()> {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::LibraryLoader::{
+        LoadLibraryExW, LOAD_LIBRARY_SEARCH_DEFAULT_DIRS, LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR,
+    };
+
+    static LOAD_RESULT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    let result = LOAD_RESULT.get_or_init(|| {
+        let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
+        let executable_path = env::current_exe().ok();
+        let dll =
+            match dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref()) {
+                Ok(dll) => dll,
+                Err(error) => return Err(error.to_string()),
+            };
+        let Some(dll) = dll else {
+            return Ok(());
+        };
+        let mut dll_wide = dll.as_os_str().encode_wide().collect::<Vec<_>>();
+        dll_wide.push(0);
+
+        // Keep the explicitly loaded module alive so DbgEng resolves all of its runtime dependencies
+        // from its own directory before DebugCreate is invoked.
+        unsafe {
+            LoadLibraryExW(
+                PCWSTR(dll_wide.as_ptr()),
+                None,
+                LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+            )
+        }
+        .with_context(|| format!("loading DbgEng runtime {}", dll.display()))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    });
+
+    if let Err(error) = result {
+        bail!("{error}");
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn create_debug_client(
+) -> anyhow::Result<windows::Win32::System::Diagnostics::Debug::Extensions::IDebugClient5> {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::DebugCreate;
+
+    ensure_dbgeng_runtime_loaded()?;
+    unsafe { DebugCreate() }.context("DbgEng DebugCreate failed")
+}
+
+#[cfg(windows)]
+fn enable_initial_break(
+    control: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+) -> anyhow::Result<()> {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_ENGOPT_INITIAL_BREAK;
+
+    unsafe { control.AddEngineOptions(DEBUG_ENGOPT_INITIAL_BREAK) }
+        .context("enabling the DbgEng initial-break engine option")?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_initial_event(
+    control: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl5,
+    timeout_ms: u32,
+    operation: &str,
+) -> anyhow::Result<()> {
+    use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT;
+
+    match unsafe { control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) } {
+        Ok(()) => Ok(()),
+        Err(error) if is_dbgeng_wait_timeout_hresult(error.code().0) => {
+            bail!("DbgEng {operation} initial WaitForEvent timed out after {timeout_ms} ms")
+        }
+        Err(error) => Err(error).context(format!("DbgEng {operation} initial WaitForEvent failed")),
+    }
+}
+
+fn is_dbgeng_wait_timeout_hresult(hresult: i32) -> bool {
+    hresult == DBGENG_WAIT_TIMEOUT_HRESULT
 }
 
 #[derive(Debug, Clone)]
@@ -409,11 +520,16 @@ impl DebuggerSession {
         };
 
         let wait = unsafe { self.control.WaitForEvent(DEBUG_WAIT_DEFAULT, timeout_ms) };
-        let status = self.execution_status();
         match wait {
-            Ok(()) => Ok(status),
-            Err(_) if status.raw == Some(DEBUG_STATUS_TIMEOUT) => Ok(status),
-            Err(error) => Err(error.into()),
+            Ok(()) => Ok(self.execution_status()),
+            // DbgEng documents S_FALSE as its bounded wait timeout result.
+            Err(error) if is_dbgeng_wait_timeout_hresult(error.code().0) => {
+                Ok(DebuggerExecutionStatus {
+                    raw: Some(DEBUG_STATUS_TIMEOUT),
+                    name: Some(status_name(DEBUG_STATUS_TIMEOUT)),
+                })
+            }
+            Err(error) => Err(error).context("DbgEng WaitForEvent failed"),
         }
     }
 
@@ -902,6 +1018,25 @@ impl DebuggerSession {
         self.breakpoint_info(&breakpoint)
     }
 
+    pub fn execute_command(&self, command: &str) -> anyhow::Result<()> {
+        use windows::core::PCWSTR;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_EXECUTE_DEFAULT, DEBUG_OUTCTL_THIS_CLIENT,
+        };
+
+        let mut command_wide = command.encode_utf16().collect::<Vec<_>>();
+        command_wide.push(0);
+        unsafe {
+            self.control.ExecuteWide(
+                DEBUG_OUTCTL_THIS_CLIENT,
+                PCWSTR(command_wide.as_ptr()),
+                DEBUG_EXECUTE_DEFAULT,
+            )
+        }
+        .with_context(|| format!("executing DbgEng command '{command}'"))?;
+        Ok(())
+    }
+
     pub fn add_data_breakpoint(
         &self,
         address: u64,
@@ -1292,14 +1427,14 @@ fn status_name(status: u32) -> String {
 fn start_process_server_impl(options: ProcessServerOptions) -> anyhow::Result<ProcessServerResult> {
     use windows::core::PCWSTR;
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, DEBUG_CLASS_USER_WINDOWS,
+        IDebugClient5, DEBUG_CLASS_USER_WINDOWS,
     };
     use windows::Win32::System::Threading::INFINITE;
 
     let mut transport = options.transport.encode_utf16().collect::<Vec<_>>();
     transport.push(0);
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
+    let client: IDebugClient5 = create_debug_client()?;
     unsafe {
         client.StartProcessServerWide(
             DEBUG_CLASS_USER_WINDOWS,
@@ -1343,20 +1478,22 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
 fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result<DebuggerSession> {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
-        IDebugSymbols5, IDebugSystemObjects, DEBUG_PROCESS_ONLY_THIS_PROCESS,
+        IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters, IDebugSymbols5,
+        IDebugSystemObjects, DEBUG_PROCESS_ONLY_THIS_PROCESS,
     };
 
     let mut command_line = options.command_line.encode_utf16().collect::<Vec<_>>();
     command_line.push(0);
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
-    let control: IDebugControl5 = client.cast()?;
-    let data_spaces: IDebugDataSpaces4 = client.cast()?;
-    let registers: IDebugRegisters = client.cast()?;
-    let symbols: IDebugSymbols5 = client.cast()?;
-    let system_objects: IDebugSystemObjects = client.cast()?;
+    let client: IDebugClient5 = create_debug_client()?;
+    let control: IDebugControl5 = client.cast().context("querying IDebugControl5")?;
+    let data_spaces: IDebugDataSpaces4 = client.cast().context("querying IDebugDataSpaces4")?;
+    let registers: IDebugRegisters = client.cast().context("querying IDebugRegisters")?;
+    let symbols: IDebugSymbols5 = client.cast().context("querying IDebugSymbols5")?;
+    let system_objects: IDebugSystemObjects =
+        client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
+    enable_initial_break(&control)?;
     unsafe {
         // DbgEng can mutate the command buffer; command_line is owned and remains live for the call.
         client
@@ -1366,11 +1503,8 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
                 DEBUG_PROCESS_ONLY_THIS_PROCESS,
             )
             .context("DbgEng CreateProcessWide failed")?;
-        control.WaitForEvent(
-            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_WAIT_DEFAULT,
-            options.initial_break_timeout_ms,
-        )?;
     }
+    wait_for_initial_event(&control, options.initial_break_timeout_ms, "launch")?;
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Live,
@@ -1391,21 +1525,23 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
 fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<DebuggerSession> {
     use windows::core::Interface;
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
-        IDebugSymbols5, IDebugSystemObjects, DEBUG_ATTACH_DEFAULT, DEBUG_WAIT_DEFAULT,
+        IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters, IDebugSymbols5,
+        IDebugSystemObjects, DEBUG_ATTACH_DEFAULT,
     };
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
-    let control: IDebugControl5 = client.cast()?;
-    let data_spaces: IDebugDataSpaces4 = client.cast()?;
-    let registers: IDebugRegisters = client.cast()?;
-    let symbols: IDebugSymbols5 = client.cast()?;
-    let system_objects: IDebugSystemObjects = client.cast()?;
+    let client: IDebugClient5 = create_debug_client()?;
+    let control: IDebugControl5 = client.cast().context("querying IDebugControl5")?;
+    let data_spaces: IDebugDataSpaces4 = client.cast().context("querying IDebugDataSpaces4")?;
+    let registers: IDebugRegisters = client.cast().context("querying IDebugRegisters")?;
+    let symbols: IDebugSymbols5 = client.cast().context("querying IDebugSymbols5")?;
+    let system_objects: IDebugSystemObjects =
+        client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
+    enable_initial_break(&control)?;
     unsafe {
         client.AttachProcess(0, options.process_id, DEBUG_ATTACH_DEFAULT)?;
-        control.WaitForEvent(DEBUG_WAIT_DEFAULT, options.initial_break_timeout_ms)?;
     }
+    wait_for_initial_event(&control, options.initial_break_timeout_ms, "attach")?;
 
     Ok(DebuggerSession {
         kind: DebuggerSessionKind::Live,
@@ -1426,24 +1562,27 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
 fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSession> {
     use windows::core::{Interface, PCWSTR};
     use windows::Win32::System::Diagnostics::Debug::Extensions::{
-        DebugCreate, IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters,
-        IDebugSymbols5, IDebugSystemObjects, DEBUG_WAIT_DEFAULT,
+        IDebugClient5, IDebugControl5, IDebugDataSpaces4, IDebugRegisters, IDebugSymbols5,
+        IDebugSystemObjects, DEBUG_WAIT_DEFAULT,
     };
 
     let path_string = options.path.to_string_lossy().to_string();
     let mut path = path_string.encode_utf16().collect::<Vec<_>>();
     path.push(0);
 
-    let client: IDebugClient5 = unsafe { DebugCreate()? };
-    let control: IDebugControl5 = client.cast()?;
-    let data_spaces: IDebugDataSpaces4 = client.cast()?;
-    let registers: IDebugRegisters = client.cast()?;
-    let symbols: IDebugSymbols5 = client.cast()?;
-    let system_objects: IDebugSystemObjects = client.cast()?;
+    let client: IDebugClient5 = create_debug_client()?;
+    let control: IDebugControl5 = client.cast().context("querying IDebugControl5")?;
+    let data_spaces: IDebugDataSpaces4 = client.cast().context("querying IDebugDataSpaces4")?;
+    let registers: IDebugRegisters = client.cast().context("querying IDebugRegisters")?;
+    let symbols: IDebugSymbols5 = client.cast().context("querying IDebugSymbols5")?;
+    let system_objects: IDebugSystemObjects =
+        client.cast().context("querying IDebugSystemObjects")?;
     let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
-        control.WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)?;
+        control
+            .WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)
+            .context("DbgEng dump WaitForEvent failed")?;
     }
 
     Ok(DebuggerSession {
@@ -1765,5 +1904,33 @@ mod tests {
         assert_eq!(event_type_name(2), "exception");
         assert_eq!(event_type_name(64), "load_module");
         assert_eq!(event_type_name(0xFFFF), "unknown");
+    }
+
+    #[test]
+    fn recognizes_dbgeng_s_false_as_wait_timeout() {
+        assert!(is_dbgeng_wait_timeout_hresult(1));
+        assert!(!is_dbgeng_wait_timeout_hresult(0));
+        assert!(!is_dbgeng_wait_timeout_hresult(-1));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn explicit_dbgeng_runtime_overrides_an_adjacent_runtime() {
+        use std::fs;
+
+        let root =
+            env::temp_dir().join(format!("windbg-dbgeng-runtime-test-{}", std::process::id()));
+        let explicit_runtime = root.join("explicit");
+        let executable = root.join("bin").join("windbg-tool.exe");
+        let adjacent_runtime = executable.parent().unwrap().join(DBGENG_DLL_NAME);
+        fs::create_dir_all(&explicit_runtime).unwrap();
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(explicit_runtime.join(DBGENG_DLL_NAME), []).unwrap();
+        fs::write(&adjacent_runtime, []).unwrap();
+
+        let resolved = dbgeng_runtime_dll(Some(&explicit_runtime), Some(&executable)).unwrap();
+
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(resolved, Some(explicit_runtime.join(DBGENG_DLL_NAME)));
     }
 }

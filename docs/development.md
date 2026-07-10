@@ -61,6 +61,15 @@ Use `--arch arm64` with `--target aarch64-pc-windows-msvc` for the Windows ARM64
 
 Release packages statically link the MSVC C runtime into Rust code with `RUSTFLAGS=-C target-feature=+crt-static` and into the native bridge with `cargo xtask native-build --static-crt`. WinDbg, DbgEng, symbol, and TTD replay runtime DLLs remain dynamic dependencies and are copied into the package directory.
 
+For a development build that uses architecture-specific staged DbgEng DLLs, set the process-local runtime directory before using a live DbgEng command:
+
+```powershell
+$env:WINDBG_DBGENG_RUNTIME_DIR = (Resolve-Path target\runtime\amd64\dbgeng-runtime)
+target\debug\windbg-tool.exe live capabilities
+```
+
+The live backend securely preloads `dbgeng.dll` from this directory (or from beside `windbg-tool.exe` in a package) so its dependent DLLs resolve from the matching runtime set. It does not alter global DLL-search or security policy.
+
 Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
 
 ### Publishing a GitHub Release
