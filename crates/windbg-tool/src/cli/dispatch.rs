@@ -48,6 +48,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             LiveCommand::StartupBreak(args) => platform::run_live_startup_break(args, &output),
             LiveCommand::StartupProfile(args) => platform::run_live_startup_profile(args, &output),
             LiveCommand::StartupCompare(args) => platform::run_live_startup_compare(args, &output),
+            LiveCommand::StartupReport(args) => platform::run_live_startup_report(args, &output),
             LiveCommand::ManagedBreak(args) => platform::run_live_managed_break(args, &output),
             LiveCommand::Start(args) => live_start_and_print(pipe, args, &output).await,
             LiveCommand::Attach(args) => live_attach_and_print(pipe, args, &output).await,

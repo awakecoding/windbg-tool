@@ -286,6 +286,10 @@ enum LiveCommand {
     )]
     StartupCompare(LiveStartupProfileCompareArgs),
     #[command(
+        about = "Render a bounded offline module timeline from a live startup-profile JSON artifact"
+    )]
+    StartupReport(LiveStartupProfileReportArgs),
+    #[command(
         about = "Launch .NET under DbgEng, bind the matching CoreCLR DAC, and emit a managed method hit"
     )]
     ManagedBreak(LiveManagedBreakArgs),
@@ -951,6 +955,84 @@ struct LiveStartupProfileCompareArgs {
         help = "Maximum retained lifecycle events compared per matched run"
     )]
     max_sequence_events: u32,
+}
+
+#[derive(Debug, Args)]
+struct LiveStartupProfileReportArgs {
+    #[arg(
+        value_name = "ARTIFACT",
+        help = "Existing live startup-profile JSON artifact to read offline"
+    )]
+    artifact: PathBuf,
+    #[arg(
+        long,
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..=10),
+        help = "Recorded run number to render; launch-relative timestamps are never combined across runs"
+    )]
+    run: u32,
+    #[arg(
+        long,
+        value_name = "SUBSTRING",
+        help = "Case-insensitive substring filter for module basename, normalized path, or DbgEng module name"
+    )]
+    module: Option<String>,
+    #[arg(
+        long,
+        conflicts_with = "rdm_only",
+        help = "Keep only modules classified from their observed identity as runtime/loader modules"
+    )]
+    runtime_only: bool,
+    #[arg(
+        long,
+        conflicts_with = "runtime_only",
+        help = "Keep only modules whose normalized observed image path contains /RemoteDesktopManager/"
+    )]
+    rdm_only: bool,
+    #[arg(
+        long,
+        value_name = "MILLISECONDS",
+        help = "Keep only first-observed modules at or after this target-resumed host wall-time timestamp"
+    )]
+    min_resumed_ms: Option<u64>,
+    #[arg(
+        long,
+        default_value_t = 64,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        help = "Maximum filtered module rows returned; the JSON report states whether this bound truncated rows"
+    )]
+    max_rows: u32,
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = StartupProfileReportFormat::Table,
+        help = "Terminal output format; JSON preserves unclipped normalized paths and structured enrichment"
+    )]
+    format: StartupProfileReportFormat,
+    #[arg(
+        long,
+        default_value_t = 56,
+        value_parser = clap::value_parser!(u32).range(24..=256),
+        help = "Maximum normalized-path width in table output; JSON always includes the full normalized path"
+    )]
+    path_width: u32,
+    #[arg(
+        long,
+        help = "Omit the concise milestones and largest-observed-gaps tables from terminal table output"
+    )]
+    no_summary: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Write the complete structured report JSON to a new file without modifying the source artifact"
+    )]
+    output: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
+enum StartupProfileReportFormat {
+    Table,
+    Json,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, PartialEq, Eq)]
@@ -4767,6 +4849,7 @@ fn inferred_command_metadata(command: &Command, path: &[String]) -> Value {
             | "live launch"
             | "live startup-break"
             | "live startup-profile"
+            | "live startup-report"
             | "breakpoint capabilities"
             | "datamodel capabilities"
     );
@@ -4840,6 +4923,7 @@ fn discover_manifest() -> Value {
                 "live launch --command-line <cmd> --end detach|terminate",
                 "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>] [--completion-module <basename> [--settle-ms <milliseconds>]]",
                 "live startup-compare --baseline <path> --candidate <path>",
+                "live startup-report <artifact> [--run <number>] [--format table|json]",
                 "live start --command-line <cmd> [--create-process-stop]",
                 "live attach --process-id <pid>"
             ],
@@ -5526,6 +5610,15 @@ fn command_metadata() -> Value {
             "cost": "bounded_local_json_comparison",
             "safety": "read_only_host_artifact",
             "bounds": ["artifacts <= 16 MiB", "--max-sequence-events 1..256"]
+        },
+        {
+            "command": "live startup-report",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_local_json_report",
+            "safety": "read_only_host_artifact",
+            "bounds": ["artifact <= 16 MiB", "--run 1..10", "--max-rows 1..128", "--path-width 24..256"]
         },
         {
             "command": "live start",

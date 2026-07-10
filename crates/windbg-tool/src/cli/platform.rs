@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::env;
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::fs;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::process::CommandExt;
@@ -34,8 +35,9 @@ use super::output::{print_value, OutputOptions};
 use super::{
     CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
     LiveManagedBreakArgs, LiveStartupBreakArgs, LiveStartupProfileArgs,
-    LiveStartupProfileCompareArgs, StartupProfileContextEvent, TraceRecordArgs, TraceRecordProfile,
-    TraceReplayCpuSupport, WindbgCommand,
+    LiveStartupProfileCompareArgs, LiveStartupProfileReportArgs, StartupProfileContextEvent,
+    StartupProfileReportFormat, TraceRecordArgs, TraceRecordProfile, TraceReplayCpuSupport,
+    WindbgCommand,
 };
 use crate::pe_symbols::bounded_pe_file_metadata;
 
@@ -440,7 +442,7 @@ pub(super) fn run_live_startup_profile(
     print_value(result, output_options)
 }
 
-const STARTUP_PROFILE_COMPARE_MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+const STARTUP_PROFILE_ARTIFACT_MAX_BYTES: u64 = 16 * 1024 * 1024;
 
 pub(super) fn run_live_startup_compare(
     args: LiveStartupProfileCompareArgs,
@@ -488,6 +490,78 @@ pub(super) fn run_live_startup_compare(
     )
 }
 
+#[derive(Debug, Clone)]
+struct StartupProfileReportFilters {
+    run: u32,
+    module_substring: Option<String>,
+    runtime_only: bool,
+    rdm_only: bool,
+    min_resumed_ms: Option<u64>,
+    max_rows: usize,
+}
+
+pub(super) fn run_live_startup_report(
+    args: LiveStartupProfileReportArgs,
+    output_options: &OutputOptions,
+) -> anyhow::Result<()> {
+    if matches!(args.format, StartupProfileReportFormat::Table) {
+        ensure!(
+            output_options.field.is_none() && !output_options.raw && !output_options.envelope,
+            "--field, --raw, and --envelope require --format json for live startup-report"
+        );
+    }
+    if let Some(path) = args.output.as_deref() {
+        ensure!(
+            !path.exists(),
+            "refusing to overwrite startup-report artifact {}",
+            path.display()
+        );
+        let parent = path
+            .parent()
+            .context("startup-report artifact path must have a parent directory")?;
+        ensure!(
+            parent.is_dir(),
+            "startup-report artifact directory does not exist: {}",
+            parent.display()
+        );
+    }
+
+    let artifact = read_startup_profile_artifact(&args.artifact, "report source")?;
+    let filters = StartupProfileReportFilters {
+        run: args.run,
+        module_substring: args.module,
+        runtime_only: args.runtime_only,
+        rdm_only: args.rdm_only,
+        min_resumed_ms: args.min_resumed_ms,
+        max_rows: args.max_rows as usize,
+    };
+    let mut report = startup_profile_module_report(&artifact, &filters)?;
+    if let Some(path) = args.output {
+        fs::write(&path, serde_json::to_vec_pretty(&report)?)
+            .with_context(|| format!("writing startup-report artifact {}", path.display()))?;
+        report["report_artifact"] = json!({
+            "path": path,
+            "format": "pretty_json",
+            "written": true
+        });
+    }
+
+    match args.format {
+        StartupProfileReportFormat::Json => print_value(report, output_options),
+        StartupProfileReportFormat::Table => {
+            print!(
+                "{}",
+                startup_profile_module_report_table(
+                    &report,
+                    args.path_width as usize,
+                    !args.no_summary
+                )
+            );
+            Ok(())
+        }
+    }
+}
+
 struct StartupProfileArtifact {
     value: Value,
     summary: Value,
@@ -505,10 +579,10 @@ fn read_startup_profile_artifact(
         path.display()
     );
     ensure!(
-        metadata.len() <= STARTUP_PROFILE_COMPARE_MAX_ARTIFACT_BYTES,
-        "{role} startup-profile artifact is {} bytes, exceeding the {}-byte comparison limit",
+        metadata.len() <= STARTUP_PROFILE_ARTIFACT_MAX_BYTES,
+        "{role} startup-profile artifact is {} bytes, exceeding the {}-byte artifact limit",
         metadata.len(),
-        STARTUP_PROFILE_COMPARE_MAX_ARTIFACT_BYTES
+        STARTUP_PROFILE_ARTIFACT_MAX_BYTES
     );
     let contents = fs::read_to_string(path)
         .with_context(|| format!("reading {role} startup-profile artifact {}", path.display()))?;
@@ -533,6 +607,508 @@ fn read_startup_profile_artifact(
         }),
         value,
     })
+}
+
+fn startup_profile_module_report(
+    artifact: &StartupProfileArtifact,
+    filters: &StartupProfileReportFilters,
+) -> anyhow::Result<Value> {
+    let runs = artifact.value["runs"]
+        .as_array()
+        .context("startup-profile artifact has no runs array")?;
+    let run = runs
+        .iter()
+        .find(|candidate| candidate["run"].as_u64() == Some(u64::from(filters.run)))
+        .with_context(|| {
+            format!(
+                "startup-profile artifact does not contain recorded run {}",
+                filters.run
+            )
+        })?;
+    let timeline = run["timeline"]
+        .as_array()
+        .with_context(|| format!("startup-profile run {} has no timeline array", filters.run))?;
+    let module_parameters = startup_profile_report_module_parameters(run);
+    let provenance = startup_profile_report_module_provenance(run);
+    let phase_module = run["coverage"]["phase_module"].as_str();
+    let mut first_seen = BTreeSet::new();
+    let mut prior_first_module_resumed_ms = None;
+    let mut all_rows = Vec::new();
+    let mut module_load_events_without_module_identity = 0usize;
+
+    for event in timeline
+        .iter()
+        .filter(|event| event["kind"].as_str() == Some("load_module"))
+    {
+        let Some(module) = event["module"].as_object() else {
+            module_load_events_without_module_identity += 1;
+            continue;
+        };
+        let Some(identity) = startup_profile_report_module_identity(module) else {
+            module_load_events_without_module_identity += 1;
+            continue;
+        };
+        if !first_seen.insert(identity.to_ascii_lowercase()) {
+            continue;
+        }
+
+        let resumed_wall_elapsed_ms = event["resumed_wall_elapsed_ms"].as_u64();
+        let delta_from_prior_first_module_load_resumed_wall_ms =
+            match (prior_first_module_resumed_ms, resumed_wall_elapsed_ms) {
+                (Some(prior), Some(current)) => current.checked_sub(prior),
+                _ => None,
+            };
+        prior_first_module_resumed_ms = resumed_wall_elapsed_ms;
+
+        let base_address = module
+            .get("base_address")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let module_parameters_record = base_address
+            .as_deref()
+            .and_then(|address| module_parameters.get(&address.to_ascii_lowercase()))
+            .cloned();
+        let image_path = module
+            .get("image_path")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        let provenance_record = image_path
+            .as_deref()
+            .and_then(|path| {
+                provenance
+                    .records_by_normalized_path
+                    .get(&path.to_ascii_lowercase())
+            })
+            .cloned();
+        let classifications = startup_profile_report_module_classifications(module, phase_module);
+        let parameters = module_parameters_record
+            .as_ref()
+            .and_then(|record| record.get("parameters"))
+            .cloned();
+        let symbol_type_name = parameters
+            .as_ref()
+            .and_then(|parameters| parameters.get("symbol_type_name"))
+            .cloned();
+
+        all_rows.push(json!({
+            "ordinal": all_rows.len() + 1,
+            "event_index": event["index"],
+            "observed_elapsed_ms": event["observed_elapsed_ms"],
+            "resumed_wall_elapsed_ms": resumed_wall_elapsed_ms,
+            "delta_from_prior_first_module_load_resumed_wall_ms":
+                delta_from_prior_first_module_load_resumed_wall_ms,
+            "classification": classifications,
+            "module": Value::Object(module.clone()),
+            "base_address": base_address,
+            "image_size_bytes": parameters
+                .as_ref()
+                .and_then(|parameters| parameters.get("image_size"))
+                .cloned(),
+            "symbol_readiness": {
+                "source": run["dbgeng_module_parameters"]["source"],
+                "status": if parameters.is_some() {
+                    Value::String("captured".to_string())
+                } else {
+                    run["dbgeng_module_parameters"]["status"].clone()
+                },
+                "symbol_type_name": symbol_type_name
+            },
+            "module_parameters": parameters,
+            "provenance": provenance_record.unwrap_or_else(|| json!({
+                "source": run["module_provenance"]["source"],
+                "status": run["module_provenance"]["status"],
+                "detail": run["module_provenance"]["detail"]
+            }))
+        }));
+    }
+
+    let matching_rows = all_rows
+        .iter()
+        .filter(|row| startup_profile_report_row_matches(row, filters))
+        .cloned()
+        .collect::<Vec<_>>();
+    let matching_row_count = matching_rows.len();
+    let rows_truncated = matching_row_count > filters.max_rows;
+    let rows = matching_rows
+        .into_iter()
+        .take(filters.max_rows)
+        .collect::<Vec<_>>();
+    let process_exit = timeline
+        .iter()
+        .find(|event| event["kind"].as_str() == Some("exit_process"))
+        .map(|event| {
+            json!({
+                "index": event["index"],
+                "observed_elapsed_ms": event["observed_elapsed_ms"],
+                "resumed_wall_elapsed_ms": event["resumed_wall_elapsed_ms"],
+                "exit_code": event["event"]["exit_code"]
+            })
+        });
+
+    Ok(json!({
+        "workflow": "live_startup_profile_report",
+        "offline": {
+            "status": "offline_artifact_processing",
+            "target_or_debugger_interaction": false,
+            "detail": "This report reads only the explicitly supplied bounded startup-profile JSON artifact. It does not launch, attach, query, or modify a target or debugger, and it does not read observed module paths from the host."
+        },
+        "source_of_truth": {
+            "artifact": artifact.summary,
+            "detail": "The input live_startup_profile JSON remains the source of truth. This report is a bounded presentation and filter layer over its retained lifecycle events and enrichment records."
+        },
+        "run": {
+            "number": filters.run,
+            "status": run["status"],
+            "finish_reason": run["finish_reason"],
+            "completion": run["completion"],
+            "process_exit": process_exit,
+            "coverage": {
+                "timeline_events_returned": run["coverage"]["timeline_events_returned"],
+                "timeline_event_limit": run["coverage"]["timeline_event_limit"],
+                "timeline_truncated": run["coverage"]["timeline_truncated"],
+                "event_limit_reached": run["coverage"]["event_limit_reached"],
+                "truncation_behavior": run["coverage"]["truncation_behavior"],
+                "module_load_events": run["counts"]["module_load_events"],
+                "module_load_events_without_module_identity": module_load_events_without_module_identity
+            }
+        },
+        "filters": {
+            "module_substring": filters.module_substring,
+            "runtime_only": filters.runtime_only,
+            "rdm_only": filters.rdm_only,
+            "min_resumed_ms": filters.min_resumed_ms,
+            "max_rows": filters.max_rows
+        },
+        "module_classification": {
+            "runtime_loader": "The observed basename, DbgEng module name, or normalized image path matches coreclr.dll, hostfxr.dll, hostpolicy.dll, clrjit.dll, or mscoree.dll.",
+            "rdm_application_path": "The normalized DbgEng-observed image path contains /RemoteDesktopManager/. This is a path label, not a managed assembly, CPU, or ownership claim.",
+            "selected_phase_module": "The observed module identity matches the profile's requested phase module.",
+            "other_module": "No runtime, RDM-path, or selected-phase classification matched."
+        },
+        "module_timeline": {
+            "first_observed_module_load_count": all_rows.len(),
+            "matching_row_count": matching_row_count,
+            "rows_returned": rows.len(),
+            "truncated_by_max_rows": rows_truncated,
+            "delta_semantics": "delta_from_prior_first_module_load_resumed_wall_ms is target-resumed host wall time between retained first-observed module-load events before report filtering. It is not CPU, file-I/O, loader-internal, JIT, or managed-method duration.",
+            "rows": rows
+        },
+        "summary": {
+            "first_coreclr_load": run["lifecycle_summary"]["modules"]["first_coreclr_load"],
+            "first_selected_phase_module_load": run["lifecycle_summary"]["modules"]["first_selected_phase_module_load"],
+            "largest_observed_gaps": run["largest_observed_gaps"],
+            "detail": "Milestones and ranked gaps are copied from the artifact's existing lifecycle summary and gap ranking. They remain DbgEng host-observed wall-time evidence only."
+        },
+        "measurement_semantics": artifact.value["measurement_semantics"],
+        "limitations": [
+            "Module timestamps are host-observed when DbgEng returned lifecycle control to windbg-tool; they are not target instruction timestamps.",
+            "Observed or resumed wall-time values and module-to-module deltas are not CPU time, file-I/O duration, JIT duration, managed method timing, UI readiness, or causal attribution.",
+            "Image size and symbol readiness appear only when the source profile requested bounded DbgEng module-parameter enrichment. Provenance appears only when it requested bounded host metadata for DbgEng-observed absolute paths.",
+            "A truncated source timeline can omit lifecycle events. The report preserves source coverage rather than filling or inferring missing module loads."
+        ]
+    }))
+}
+
+struct StartupProfileReportProvenance {
+    records_by_normalized_path: BTreeMap<String, Value>,
+}
+
+fn startup_profile_report_module_parameters(run: &Value) -> BTreeMap<String, Value> {
+    run["dbgeng_module_parameters"]["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|record| {
+            let base = record["base_address"].as_str()?;
+            Some((base.to_ascii_lowercase(), record.clone()))
+        })
+        .collect()
+}
+
+fn startup_profile_report_module_provenance(run: &Value) -> StartupProfileReportProvenance {
+    let records_by_normalized_path = run["module_provenance"]["records"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|record| {
+            let path = record["observed_image_path"].as_str()?;
+            Some((
+                normalize_startup_profile_path(path).to_ascii_lowercase(),
+                record.clone(),
+            ))
+        })
+        .collect();
+    StartupProfileReportProvenance {
+        records_by_normalized_path,
+    }
+}
+
+fn startup_profile_report_module_identity(
+    module: &serde_json::Map<String, Value>,
+) -> Option<String> {
+    ["basename", "module_name", "image_path"]
+        .into_iter()
+        .find_map(|field| {
+            module
+                .get(field)
+                .and_then(Value::as_str)
+                .map(ToOwned::to_owned)
+        })
+}
+
+fn startup_profile_report_module_classifications(
+    module: &serde_json::Map<String, Value>,
+    phase_module: Option<&str>,
+) -> Vec<&'static str> {
+    let candidates = ["basename", "module_name", "image_path"]
+        .into_iter()
+        .filter_map(|field| module.get(field).and_then(Value::as_str))
+        .collect::<Vec<_>>();
+    let mut classifications = Vec::with_capacity(3);
+    if startup_profile_is_runtime_loader_module(&candidates) {
+        classifications.push("runtime_loader");
+    }
+    if module
+        .get("image_path")
+        .and_then(Value::as_str)
+        .is_some_and(|path| {
+            normalize_startup_profile_path(path)
+                .to_ascii_lowercase()
+                .contains("/remotedesktopmanager/")
+        })
+    {
+        classifications.push("rdm_application_path");
+    }
+    if phase_module.is_some_and(|phase_module| {
+        candidates
+            .iter()
+            .any(|candidate| startup_profile_module_name_matches(candidate, phase_module))
+    }) {
+        classifications.push("selected_phase_module");
+    }
+    if classifications.is_empty() {
+        classifications.push("other_module");
+    }
+    classifications
+}
+
+fn startup_profile_report_row_matches(row: &Value, filters: &StartupProfileReportFilters) -> bool {
+    let classifications = row["classification"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if filters.runtime_only && !classifications.contains(&"runtime_loader") {
+        return false;
+    }
+    if filters.rdm_only && !classifications.contains(&"rdm_application_path") {
+        return false;
+    }
+    if let Some(minimum) = filters.min_resumed_ms {
+        match row["resumed_wall_elapsed_ms"].as_u64() {
+            Some(elapsed_ms) if elapsed_ms >= minimum => {}
+            _ => return false,
+        }
+    }
+    let Some(filter) = filters.module_substring.as_deref() else {
+        return true;
+    };
+    let filter = filter.to_ascii_lowercase();
+    ["basename", "module_name", "image_path"]
+        .into_iter()
+        .filter_map(|field| row["module"][field].as_str())
+        .any(|candidate| candidate.to_ascii_lowercase().contains(&filter))
+}
+
+fn startup_profile_module_report_table(
+    report: &Value,
+    path_width: usize,
+    include_summary: bool,
+) -> String {
+    let mut table = String::new();
+    let source = &report["source_of_truth"]["artifact"];
+    let run = &report["run"];
+    let coverage = &run["coverage"];
+    let completion = &run["completion"];
+    let _ = writeln!(table, "Startup module timeline (offline artifact report)");
+    let _ = writeln!(
+        table,
+        "Source: {} ({} bytes)",
+        report_table_cell(&source["path"], 120),
+        report_table_cell(&source["artifact_bytes"], 20)
+    );
+    let _ = writeln!(
+        table,
+        "Run: {} | status: {} | finish: {} | completion: {}",
+        report_table_cell(&run["number"], 8),
+        report_table_cell(&run["status"], 20),
+        report_table_cell(&run["finish_reason"], 32),
+        report_table_cell(&completion["status"], 32)
+    );
+    let _ = writeln!(
+        table,
+        "Coverage: events {}/{} | source timeline truncated: {} | event limit reached: {}",
+        report_table_cell(&coverage["timeline_events_returned"], 12),
+        report_table_cell(&coverage["timeline_event_limit"], 12),
+        report_table_cell(&coverage["timeline_truncated"], 8),
+        report_table_cell(&coverage["event_limit_reached"], 8)
+    );
+    let process_exit = &run["process_exit"];
+    if process_exit.is_object() {
+        let _ = writeln!(
+            table,
+            "Process exit: code {} at observed/resumed {} / {} ms",
+            report_table_cell(&process_exit["exit_code"], 12),
+            report_table_cell(&process_exit["observed_elapsed_ms"], 12),
+            report_table_cell(&process_exit["resumed_wall_elapsed_ms"], 12)
+        );
+    } else {
+        let _ = writeln!(table, "Process exit: not retained or not observed");
+    }
+    let _ = writeln!(
+        table,
+        "Time semantics: DbgEng host-observed lifecycle times; not CPU, file-I/O, JIT, managed-method, or UI-ready duration."
+    );
+    let _ = writeln!(
+        table,
+        "\n  # | OBS/RES ms     | +FIRST ms | CATEGORY                 | MODULE                           | BASE               | IMAGE BYTES | SYMBOLS      | NORMALIZED PATH"
+    );
+    let _ = writeln!(
+        table,
+        "----+----------------+-----------+--------------------------+----------------------------------+--------------------+-------------+--------------+{}",
+        "-".repeat(path_width.saturating_add(1))
+    );
+    for row in report["module_timeline"]["rows"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let classifications = row["classification"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join(",");
+        let observed_resumed = format!(
+            "{}/{}",
+            report_table_cell(&row["observed_elapsed_ms"], 10),
+            report_table_cell(&row["resumed_wall_elapsed_ms"], 10)
+        );
+        let symbol = row["symbol_readiness"]["symbol_type_name"]
+            .as_str()
+            .or_else(|| row["symbol_readiness"]["status"].as_str())
+            .unwrap_or("-");
+        let _ = writeln!(
+            table,
+            "{:>3} | {:<14} | {:>9} | {:<24} | {:<32} | {:<18} | {:>11} | {:<12} | {}",
+            report_table_cell(&row["ordinal"], 3),
+            report_table_cell_string(&observed_resumed, 14),
+            report_table_cell(
+                &row["delta_from_prior_first_module_load_resumed_wall_ms"],
+                9
+            ),
+            report_table_cell_string(&classifications, 24),
+            report_table_cell(&row["module"]["basename"], 32),
+            report_table_cell(&row["base_address"], 18),
+            report_table_cell(&row["image_size_bytes"], 11),
+            report_table_cell_string(symbol, 12),
+            report_table_cell(&row["module"]["image_path"], path_width)
+        );
+    }
+    let _ = writeln!(
+        table,
+        "Rows: {} returned, {} matching before row bound, truncated by --max-rows: {}",
+        report_table_cell(&report["module_timeline"]["rows_returned"], 12),
+        report_table_cell(&report["module_timeline"]["matching_row_count"], 12),
+        report_table_cell(&report["module_timeline"]["truncated_by_max_rows"], 8)
+    );
+
+    if include_summary {
+        let summary = &report["summary"];
+        let _ = writeln!(table, "\nMilestones copied from source artifact");
+        let _ = writeln!(
+            table,
+            "  first coreclr: {}",
+            report_table_event(&summary["first_coreclr_load"])
+        );
+        let _ = writeln!(
+            table,
+            "  first selected phase module: {}",
+            report_table_event(&summary["first_selected_phase_module_load"])
+        );
+        let _ = writeln!(
+            table,
+            "\nLargest retained observed lifecycle gaps (source ranking)"
+        );
+        let _ = writeln!(table, " RANK | WALL ms | FROM -> TO");
+        let _ = writeln!(
+            table,
+            "------+---------+----------------------------------------------------------"
+        );
+        for gap in summary["largest_observed_gaps"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            let _ = writeln!(
+                table,
+                " {:>4} | {:>7} | {} -> {}",
+                report_table_cell(&gap["rank"], 4),
+                report_table_cell(&gap["elapsed_ms"], 7),
+                report_table_event(&gap["start"]),
+                report_table_event(&gap["end"])
+            );
+        }
+    }
+    table
+}
+
+fn report_table_event(event: &Value) -> String {
+    if event.is_null() {
+        return "-".to_string();
+    }
+    let label = event["module"]["basename"]
+        .as_str()
+        .or_else(|| event["kind"].as_str())
+        .unwrap_or("-");
+    format!(
+        "{} @ {} ms",
+        report_table_cell_string(label, 36),
+        report_table_cell(&event["resumed_wall_elapsed_ms"], 12)
+    )
+}
+
+fn report_table_cell(value: &Value, width: usize) -> String {
+    match value {
+        Value::Null => "-".to_string(),
+        Value::String(text) => report_table_cell_string(text, width),
+        Value::Number(number) => report_table_cell_string(&number.to_string(), width),
+        Value::Bool(value) => report_table_cell_string(&value.to_string(), width),
+        _ => "-".to_string(),
+    }
+}
+
+fn report_table_cell_string(value: &str, width: usize) -> String {
+    let sanitized = value
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    if sanitized.chars().count() <= width {
+        return sanitized;
+    }
+    let prefix_length = width.saturating_sub(3);
+    format!(
+        "{}...",
+        sanitized.chars().take(prefix_length).collect::<String>()
+    )
 }
 
 fn startup_profile_completed_artifact_runs(artifact: &Value) -> Vec<&Value> {
@@ -1922,8 +2498,25 @@ fn startup_profile_module_classification(
         module.basename.as_deref(),
         module.module_name.as_deref(),
         module.image_path.as_deref(),
-    ];
-    if [
+    ]
+    .into_iter()
+    .flatten()
+    .collect::<Vec<_>>();
+    if startup_profile_is_runtime_loader_module(&candidates) {
+        "runtime_loader"
+    } else if phase_module.is_some_and(|phase_module| {
+        candidates
+            .into_iter()
+            .any(|candidate| startup_profile_module_name_matches(candidate, phase_module))
+    }) {
+        "selected_phase_module"
+    } else {
+        "other_module"
+    }
+}
+
+fn startup_profile_is_runtime_loader_module(candidates: &[&str]) -> bool {
+    [
         "coreclr.dll",
         "hostfxr.dll",
         "hostpolicy.dll",
@@ -1933,21 +2526,9 @@ fn startup_profile_module_classification(
     .iter()
     .any(|runtime_module| {
         candidates
-            .into_iter()
-            .flatten()
+            .iter()
             .any(|candidate| startup_profile_module_name_matches(candidate, runtime_module))
-    }) {
-        "runtime_loader"
-    } else if phase_module.is_some_and(|phase_module| {
-        candidates
-            .into_iter()
-            .flatten()
-            .any(|candidate| startup_profile_module_name_matches(candidate, phase_module))
-    }) {
-        "selected_phase_module"
-    } else {
-        "other_module"
-    }
+    })
 }
 
 fn rank_startup_profile_observed_gaps(
@@ -3979,6 +4560,7 @@ pub(super) fn live_capabilities() -> Value {
             "live launch --command-line <cmd> --end detach|terminate",
             "live startup-break --command-line <cmd> --initial-break|--address <addr>|--module <name> --module-offset <rva>|--symbol <expr>",
             "live startup-profile --command-line <cmd> [--runs <count>] [--phase-module <basename>] [--completion-module <basename> [--settle-ms <milliseconds>]]",
+            "live startup-report <artifact> [--run <number>] [--format table|json]",
             "live start --command-line <cmd>",
             "live attach --process-id <pid>",
             "dump create --process-id <pid> --output <path>",
@@ -4002,6 +4584,11 @@ pub(super) fn live_capabilities() -> Value {
                 "feature": "startup profile workflow",
                 "status": "non_invasive_bounded_lifecycle_collection",
                 "notes": "Launches at a create-process event, configures DbgEng lifecycle event filters only, and reports host-monotonic wall-time observations. A requested completion module can stop at an observed image load or after a bounded observed lifecycle-quiet interval. It sets no software/hardware breakpoint, opens no DAC, and performs no target-memory operation."
+            },
+            {
+                "feature": "startup profile artifact report",
+                "status": "offline_bounded_module_timeline",
+                "notes": "Reads one explicit live startup-profile JSON artifact up to 16 MiB and renders a bounded table or structured report. It does not launch, attach, query, or modify DbgEng or a target."
             },
             {
                 "feature": "managed method breakpoint workflow",
@@ -4981,6 +5568,206 @@ mod tests {
             sequence["pairs"][0]["first_divergence"]["candidate"]["module_basename"],
             "hostfxr.dll"
         );
+    }
+
+    #[test]
+    fn startup_profile_report_preserves_first_seen_module_timing_and_enrichment() {
+        let artifact = StartupProfileArtifact {
+            summary: json!({
+                "role": "test",
+                "path": "C:/reports/fixture.json",
+                "artifact_bytes": 1024
+            }),
+            value: json!({
+                "workflow": "live_startup_profile",
+                "measurement_semantics": {
+                    "clock": "host_monotonic_instant"
+                },
+                "runs": [{
+                    "run": 1,
+                    "status": "completed",
+                    "finish_reason": "exit_process",
+                    "completion": {
+                        "status": "not_requested"
+                    },
+                    "coverage": {
+                        "phase_module": "RemoteDesktopManager.dll",
+                        "timeline_events_returned": 6,
+                        "timeline_event_limit": 16,
+                        "timeline_truncated": false,
+                        "event_limit_reached": false,
+                        "truncation_behavior": "test"
+                    },
+                    "counts": {
+                        "module_load_events": 4
+                    },
+                    "timeline": [
+                        {
+                            "index": 0,
+                            "kind": "create_process",
+                            "observed_elapsed_ms": 10,
+                            "resumed_wall_elapsed_ms": 0,
+                            "event": { "exit_code": null }
+                        },
+                        {
+                            "index": 1,
+                            "kind": "load_module",
+                            "observed_elapsed_ms": 15,
+                            "resumed_wall_elapsed_ms": 5,
+                            "module": {
+                                "basename": "ntdll.dll",
+                                "module_name": "ntdll",
+                                "image_path": "ntdll.dll",
+                                "base_address": "0x100"
+                            }
+                        },
+                        {
+                            "index": 2,
+                            "kind": "load_module",
+                            "observed_elapsed_ms": 48,
+                            "resumed_wall_elapsed_ms": 38,
+                            "module": {
+                                "basename": "coreclr.dll",
+                                "module_name": "coreclr",
+                                "image_path": "C:/dotnet/coreclr.dll",
+                                "base_address": "0x200"
+                            }
+                        },
+                        {
+                            "index": 3,
+                            "kind": "load_module",
+                            "observed_elapsed_ms": 51,
+                            "resumed_wall_elapsed_ms": 41,
+                            "module": {
+                                "basename": "coreclr.dll",
+                                "module_name": "coreclr",
+                                "image_path": "C:/dotnet/coreclr.dll",
+                                "base_address": "0x200"
+                            }
+                        },
+                        {
+                            "index": 4,
+                            "kind": "load_module",
+                            "observed_elapsed_ms": 90,
+                            "resumed_wall_elapsed_ms": 80,
+                            "module": {
+                                "basename": "RemoteDesktopManager.dll",
+                                "module_name": "RemoteDesktopManager",
+                                "image_path": "D:/RDM/RemoteDesktopManager/Program/RemoteDesktopManager.dll",
+                                "base_address": "0x300"
+                            }
+                        },
+                        {
+                            "index": 5,
+                            "kind": "exit_process",
+                            "observed_elapsed_ms": 100,
+                            "resumed_wall_elapsed_ms": 90,
+                            "event": { "exit_code": 0 }
+                        }
+                    ],
+                    "dbgeng_module_parameters": {
+                        "source": "dbgeng_idebugsymbols5_getmoduleparameters",
+                        "status": "captured",
+                        "records": [{
+                            "base_address": "0x200",
+                            "parameters": {
+                                "image_size": 4096,
+                                "symbol_type_name": "pdb"
+                            }
+                        }]
+                    },
+                    "module_provenance": {
+                        "source": "host_file_metadata",
+                        "status": "captured",
+                        "records": [{
+                            "observed_image_path": "D:/RDM/RemoteDesktopManager/Program/RemoteDesktopManager.dll",
+                            "status": "captured",
+                            "metadata": { "file_size": 1024 }
+                        }]
+                    },
+                    "lifecycle_summary": {
+                        "modules": {
+                            "first_coreclr_load": {
+                                "kind": "load_module",
+                                "resumed_wall_elapsed_ms": 38,
+                                "module": { "basename": "coreclr.dll" }
+                            },
+                            "first_selected_phase_module_load": {
+                                "kind": "load_module",
+                                "resumed_wall_elapsed_ms": 80,
+                                "module": { "basename": "RemoteDesktopManager.dll" }
+                            }
+                        }
+                    },
+                    "largest_observed_gaps": [{
+                        "rank": 1,
+                        "elapsed_ms": 42,
+                        "start": {
+                            "kind": "load_module",
+                            "resumed_wall_elapsed_ms": 38,
+                            "module": { "basename": "coreclr.dll" }
+                        },
+                        "end": {
+                            "kind": "load_module",
+                            "resumed_wall_elapsed_ms": 80,
+                            "module": { "basename": "RemoteDesktopManager.dll" }
+                        }
+                    }]
+                }]
+            }),
+        };
+        let all_modules = startup_profile_module_report(
+            &artifact,
+            &StartupProfileReportFilters {
+                run: 1,
+                module_substring: None,
+                runtime_only: false,
+                rdm_only: false,
+                min_resumed_ms: None,
+                max_rows: 8,
+            },
+        )
+        .unwrap();
+
+        let rows = all_modules["module_timeline"]["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["module"]["basename"], "coreclr.dll");
+        assert_eq!(
+            rows[1]["delta_from_prior_first_module_load_resumed_wall_ms"],
+            33
+        );
+        assert_eq!(rows[1]["image_size_bytes"], 4096);
+        assert_eq!(rows[1]["symbol_readiness"]["symbol_type_name"], "pdb");
+        assert_eq!(
+            rows[2]["delta_from_prior_first_module_load_resumed_wall_ms"],
+            42
+        );
+        assert_eq!(
+            rows[2]["classification"],
+            json!(["rdm_application_path", "selected_phase_module"])
+        );
+        assert_eq!(rows[2]["provenance"]["metadata"]["file_size"], 1024);
+        assert_eq!(all_modules["run"]["process_exit"]["exit_code"], 0);
+
+        let rdm_modules = startup_profile_module_report(
+            &artifact,
+            &StartupProfileReportFilters {
+                run: 1,
+                module_substring: None,
+                runtime_only: false,
+                rdm_only: true,
+                min_resumed_ms: Some(50),
+                max_rows: 1,
+            },
+        )
+        .unwrap();
+        assert_eq!(rdm_modules["module_timeline"]["matching_row_count"], 1);
+        assert_eq!(rdm_modules["module_timeline"]["rows"][0]["ordinal"], 3);
+
+        let table = startup_profile_module_report_table(&all_modules, 32, true);
+        assert!(table.contains("Startup module timeline (offline artifact report)"));
+        assert!(table.contains("coreclr.dll"));
+        assert!(table.contains("Largest retained observed lifecycle gaps"));
     }
 
     #[test]

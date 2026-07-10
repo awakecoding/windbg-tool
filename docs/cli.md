@@ -326,6 +326,37 @@ target\debug\windbg-tool.exe --compact live startup-compare `
 
 The comparator accepts only `live_startup_profile` JSON artifacts up to 16 MiB. It compares observed phase and one-largest-gap wall-time distributions plus bounded lifecycle event/module/exception sequence prefixes. It reports profile and comparison truncation, omits unstable thread IDs, and never labels a difference as a CPU regression or causal explanation.
 
+### Offline startup module timeline
+
+`live startup-report <artifact>` reads one existing `live_startup_profile` JSON artifact and renders its first-observed module loads as a deterministic terminal table. It is strictly offline: it reads only the explicitly supplied regular JSON artifact (up to 16 MiB), does not read the observed module paths, and never launches, attaches, queries, or modifies a target or DbgEng session. The profile artifact remains the source of truth.
+
+```powershell
+$artifact = Join-Path $env:TEMP 'windbg-tool-rdm-thread-accounting.json'
+target\debug\windbg-tool.exe live startup-report $artifact --run 1
+```
+
+Each row represents the first retained DbgEng `load_module` event for one module identity in the selected launch. `OBS/RES ms` contains the launch-relative host-observed and target-resumed host-wall timestamps. `+FIRST ms` is the target-resumed host wall-time delta from the prior first-observed module load before report filters are applied. Neither is CPU, file-I/O, JIT, managed-method, or UI-ready duration.
+
+Use bounded local filters without reopening the artifact in a debugger:
+
+```powershell
+# A first-party RDM application-directory view after the runtime has started.
+target\debug\windbg-tool.exe live startup-report $artifact `
+  --rdm-only --min-resumed-ms 500 --max-rows 32
+
+# Runtime-loader images, retaining the normal terminal summary.
+target\debug\windbg-tool.exe live startup-report $artifact --runtime-only
+
+# Full structured rows, including unclipped normalized paths and any captured enrichment.
+$report = Join-Path $env:TEMP 'windbg-tool-rdm-module-report.json'
+target\debug\windbg-tool.exe --compact live startup-report $artifact `
+  --format json --output $report --max-rows 128
+```
+
+`--module <substring>` matches a module basename, normalized observed image path, or DbgEng module name case-insensitively. `--runtime-only` selects the transparent runtime/loader name set (`coreclr.dll`, `hostfxr.dll`, `hostpolicy.dll`, `clrjit.dll`, `mscoree.dll`); `--rdm-only` selects normalized observed image paths containing `/RemoteDesktopManager/`. They are labels over observed module identities, not ownership, managed-assembly, CPU, or execution claims. `--run` defaults to run 1 so timestamps from repeated launches are never combined; `--max-rows` defaults to 64 and reports truncation explicitly.
+
+The JSON form includes the table rows, full paths, source artifact/run coverage, completion and process-exit status, copied first-CoreCLR/selected-module milestones, and the artifact's existing ranked gaps. A row includes image size and symbol readiness only when the source profile captured bounded DbgEng module parameters, and host-file provenance only when that source profile captured it. There is no separate MCP tool because this is a local, explicit-file CLI report; agents can use `--format json` or `--output` for the same stable structured data without a target session.
+
 For a daemon-owned stopped target, `target thread-accounting --target <id> --max-threads 32` and MCP `target_thread_accounting` return the same bounded read-only per-thread accounting. `target module-parameters --target <id> --module-base <address>` / MCP `target_module_parameters` accept only 1 through 128 distinct supplied module bases. `target symbol-entry-range --target <id> --address <address>` / MCP `target_symbol_entry_range` return a bounded DbgEng symbol-entry region record for one existing native address. The module and symbol queries are not target writes, but their configured symbol path can produce host-side symbol-resolution I/O.
 
 For a future RDM observation, use the bounded no-breakpoint form only after the fixture command has completed with the expected no-write report:
@@ -544,7 +575,7 @@ The schema includes curated metadata where available and inferred metadata for o
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
 | Symbol and source triage | `symbols doctor`, `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `live startup-profile`, `dump create`, `dump open`, `dump inspect`, `target event`, `target thread`, `target dump`, `windbg status` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `live startup-profile`, `live startup-report`, `dump create`, `dump open`, `dump inspect`, `target event`, `target thread`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 
