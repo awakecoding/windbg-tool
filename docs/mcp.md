@@ -82,7 +82,15 @@ Then create a cursor:
 }
 ```
 
-If `symbol_paths` is empty, the server can fall back to `_NT_SYMBOL_PATH`. If the resulting path does not already include the Microsoft public symbol server, it appends the usual public symbol server form automatically.
+Symbol settings use this precedence:
+
+1. Explicit `symbols.symbol_paths` from the request.
+2. `_NT_SYMBOL_PATH`, then `_NT_ALT_SYMBOL_PATH`, when no explicit paths are supplied.
+3. The module directory, as provided by the Windows symbol handler.
+
+`symbols.symcache_dir` overrides `_NT_SYMCACHE_PATH`; otherwise `_NT_SYMCACHE_PATH` supplies the cache directory. If the resulting path does not already include the Microsoft public symbol server, the server appends `srv*<cache>*https://msdl.microsoft.com/download/symbols`.
+
+The same environment resolution is applied to DbgEng live-launch, live-attach, and dump sessions. Their active resolved path is included in the target session summary as `symbol_path`.
 
 ## Example prompts
 

@@ -84,13 +84,13 @@ Runtime replay still depends on `TTDReplay.dll` and `TTDReplayCPU.dll` from the 
 
 ## Symbols
 
-The default symbol path is equivalent to:
+When neither `_NT_SYMBOL_PATH` nor `_NT_ALT_SYMBOL_PATH` is set, the TTD replay default symbol path is equivalent to:
 
 ```text
 srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
 ```
 
-The project keeps symbol/runtime setup repo-local and process-local. It does not need to write debugger registry keys or machine-wide `_NT_SYMBOL_PATH` values as part of normal operation.
+The project keeps symbol/runtime setup repo-local and process-local. It does not write debugger registry keys or machine-wide symbol environment values. For TTD and DbgEng sessions, explicit paths take precedence over `_NT_SYMBOL_PATH`; `_NT_SYMBOL_PATH` is searched before `_NT_ALT_SYMBOL_PATH`; and explicit cache settings take precedence over `_NT_SYMCACHE_PATH`. If none sets a cache, TTD uses `.ttd-symbol-cache` and DbgEng uses `.windbg-symbol-cache`.
 
 ## Sample trace fixture
 

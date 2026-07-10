@@ -1,6 +1,92 @@
 use anyhow::{bail, Context};
 use serde::Serialize;
-use std::path::PathBuf;
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
+
+pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
+pub const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
+pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
+pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
+const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StandardSymbolEnvironment {
+    pub symbol_path: Option<String>,
+    pub symcache_dir: Option<PathBuf>,
+}
+
+impl StandardSymbolEnvironment {
+    pub fn from_process() -> Self {
+        Self::from_values(
+            env_path(NT_SYMBOL_PATH_ENV),
+            env_path(NT_ALT_SYMBOL_PATH_ENV),
+            env::var_os(NT_SYMCACHE_PATH_ENV).map(PathBuf::from),
+        )
+    }
+
+    pub fn from_values(
+        symbol_path: Option<String>,
+        alternate_symbol_path: Option<String>,
+        symcache_dir: Option<PathBuf>,
+    ) -> Self {
+        let symbol_path = [symbol_path, alternate_symbol_path]
+            .into_iter()
+            .flatten()
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>()
+            .join(";");
+        Self {
+            symbol_path: (!symbol_path.is_empty()).then_some(symbol_path),
+            symcache_dir: symcache_dir.filter(|path| !path.as_os_str().is_empty()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDbgEngSymbolPath {
+    pub symbol_path: String,
+    pub symbol_cache_dir: PathBuf,
+}
+
+pub fn resolve_dbgeng_symbol_path() -> ResolvedDbgEngSymbolPath {
+    resolve_dbgeng_symbol_path_with_environment(
+        StandardSymbolEnvironment::from_process(),
+        Path::new(DEFAULT_DBGENG_SYMBOL_CACHE),
+    )
+}
+
+pub fn resolve_dbgeng_symbol_path_with_environment(
+    environment: StandardSymbolEnvironment,
+    default_cache_dir: &Path,
+) -> ResolvedDbgEngSymbolPath {
+    let symbol_cache_dir = environment
+        .symcache_dir
+        .unwrap_or_else(|| default_cache_dir.to_path_buf());
+    let mut paths = environment.symbol_path.into_iter().collect::<Vec<_>>();
+    if !paths
+        .iter()
+        .any(|path| path.contains(MICROSOFT_SYMBOL_SERVER))
+    {
+        paths.push(format!(
+            "srv*{}*{}",
+            symbol_cache_dir.to_string_lossy(),
+            MICROSOFT_SYMBOL_SERVER
+        ));
+    }
+    ResolvedDbgEngSymbolPath {
+        symbol_path: paths.join(";"),
+        symbol_cache_dir,
+    }
+}
+
+fn env_path(name: &str) -> Option<String> {
+    env::var_os(name).and_then(|value| {
+        let value = value.to_string_lossy().trim().to_string();
+        (!value.is_empty()).then_some(value)
+    })
+}
 
 #[derive(Debug, Clone)]
 pub struct ProcessServerOptions {
@@ -79,6 +165,7 @@ pub struct LiveLaunchResult {
     pub wait_succeeded: bool,
     pub execution_status: Option<u32>,
     pub execution_status_name: Option<String>,
+    pub symbol_path: String,
     pub end: LiveLaunchEnd,
 }
 
@@ -109,6 +196,7 @@ pub struct DebuggerSessionSummary {
     pub processor_type: Option<u32>,
     pub processor_name: Option<String>,
     pub execution_status: DebuggerExecutionStatus,
+    pub symbol_path: String,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -245,6 +333,7 @@ pub struct DebuggerSession {
     registers: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugRegisters,
     symbols: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
     system_objects: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
+    symbol_path: String,
 }
 
 #[cfg(windows)]
@@ -264,6 +353,7 @@ impl DebuggerSession {
             processor_type: self.processor_type().ok(),
             processor_name: self.processor_name().ok(),
             execution_status: self.execution_status(),
+            symbol_path: self.symbol_path.clone(),
         }
     }
 
@@ -714,6 +804,7 @@ impl DebuggerSession {
                 raw: None,
                 name: None,
             },
+            symbol_path: resolve_dbgeng_symbol_path().symbol_path,
         }
     }
 
@@ -877,6 +968,7 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
         initial_break_timeout_ms: options.initial_break_timeout_ms,
     })?;
     let execution_status = session.execution_status();
+    let symbol_path = session.symbol_path.clone();
     match options.end {
         LiveLaunchEnd::Detach => session.detach()?,
         LiveLaunchEnd::Terminate => session.terminate()?,
@@ -888,6 +980,7 @@ fn live_launch_initial_break_impl(options: LiveLaunchOptions) -> anyhow::Result<
         wait_succeeded: true,
         execution_status: execution_status.raw,
         execution_status_name: execution_status.name,
+        symbol_path,
         end: options.end,
     })
 }
@@ -909,6 +1002,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
     let registers: IDebugRegisters = client.cast()?;
     let symbols: IDebugSymbols5 = client.cast()?;
     let system_objects: IDebugSystemObjects = client.cast()?;
+    let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.CreateProcessWide(
             0,
@@ -932,6 +1026,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
         registers,
         symbols,
         system_objects,
+        symbol_path,
     })
 }
 
@@ -949,6 +1044,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
     let registers: IDebugRegisters = client.cast()?;
     let symbols: IDebugSymbols5 = client.cast()?;
     let system_objects: IDebugSystemObjects = client.cast()?;
+    let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.AttachProcess(0, options.process_id, DEBUG_ATTACH_DEFAULT)?;
         control.WaitForEvent(DEBUG_WAIT_DEFAULT, options.initial_break_timeout_ms)?;
@@ -965,6 +1061,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
         registers,
         symbols,
         system_objects,
+        symbol_path,
     })
 }
 
@@ -986,6 +1083,7 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
     let registers: IDebugRegisters = client.cast()?;
     let symbols: IDebugSymbols5 = client.cast()?;
     let system_objects: IDebugSystemObjects = client.cast()?;
+    let symbol_path = configure_dbgeng_symbol_path(&symbols)?;
     unsafe {
         client.OpenDumpFileWide(PCWSTR(path.as_ptr()), 0)?;
         control.WaitForEvent(DEBUG_WAIT_DEFAULT, 5000)?;
@@ -1002,7 +1100,25 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
         registers,
         symbols,
         system_objects,
+        symbol_path,
     })
+}
+
+#[cfg(windows)]
+fn configure_dbgeng_symbol_path(
+    symbols: &windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
+) -> anyhow::Result<String> {
+    use windows::core::PCWSTR;
+
+    let symbol_config = resolve_dbgeng_symbol_path();
+    let mut symbol_path = symbol_config.symbol_path.encode_utf16().collect::<Vec<_>>();
+    symbol_path.push(0);
+    unsafe {
+        symbols
+            .SetSymbolPathWide(PCWSTR(symbol_path.as_ptr()))
+            .context("setting the DbgEng symbol path")?;
+    }
+    Ok(symbol_config.symbol_path)
 }
 
 #[cfg(windows)]
@@ -1228,5 +1344,61 @@ mod tests {
     fn uses_no_overwrite_by_default() {
         assert_eq!(dump_format_flags(false), 0x8000_0000);
         assert_eq!(dump_format_flags(true), 0);
+    }
+
+    #[test]
+    fn standard_symbol_environment_preserves_windows_search_order() {
+        let environment = StandardSymbolEnvironment::from_values(
+            Some("srv*C:\\primary*https://symbols.example.test".to_string()),
+            Some("C:\\alternate-symbols".to_string()),
+            Some(PathBuf::from("C:\\symbol-cache")),
+        );
+
+        assert_eq!(
+            environment.symbol_path.as_deref(),
+            Some("srv*C:\\primary*https://symbols.example.test;C:\\alternate-symbols")
+        );
+        assert_eq!(
+            environment.symcache_dir,
+            Some(PathBuf::from("C:\\symbol-cache"))
+        );
+    }
+
+    #[test]
+    fn dbgeng_symbol_path_appends_public_server_using_environment_cache() {
+        let resolved = resolve_dbgeng_symbol_path_with_environment(
+            StandardSymbolEnvironment::from_values(
+                Some("C:\\private-symbols".to_string()),
+                Some("C:\\alternate-symbols".to_string()),
+                Some(PathBuf::from("C:\\symbol-cache")),
+            ),
+            Path::new("unused-cache"),
+        );
+
+        assert_eq!(
+            resolved.symbol_path,
+            "C:\\private-symbols;C:\\alternate-symbols;srv*C:\\symbol-cache*https://msdl.microsoft.com/download/symbols"
+        );
+        assert_eq!(resolved.symbol_cache_dir, PathBuf::from("C:\\symbol-cache"));
+    }
+
+    #[test]
+    fn dbgeng_symbol_path_does_not_duplicate_public_server() {
+        let resolved = resolve_dbgeng_symbol_path_with_environment(
+            StandardSymbolEnvironment::from_values(
+                Some(format!("srv*C:\\cache*{MICROSOFT_SYMBOL_SERVER}")),
+                None,
+                Some(PathBuf::from("C:\\unused-cache")),
+            ),
+            Path::new("unused-cache"),
+        );
+
+        assert_eq!(
+            resolved
+                .symbol_path
+                .matches(MICROSOFT_SYMBOL_SERVER)
+                .count(),
+            1
+        );
     }
 }

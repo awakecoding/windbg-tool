@@ -168,6 +168,12 @@ target\debug\windbg-tool.exe --compact --envelope sessions
 
 In envelope mode, successful commands return `{ "schema_version": 1, "ok": true, "data": ... }`. `--field` selects from `data`, so `--envelope --field session_id --raw open ...` still prints the raw session id. Failures return `{ "schema_version": 1, "ok": false, "error": ... }` and ignore `--field`/`--raw` so agents always receive the full error reason.
 
+## Symbol path environment
+
+TTD replay and every DbgEng live-launch, live-attach, and dump session honor the standard Windows symbol environment. Explicit TTD `--symbol-path` values take precedence; otherwise `_NT_SYMBOL_PATH` is searched first, then `_NT_ALT_SYMBOL_PATH`. TTD `--symcache-dir` takes precedence over `_NT_SYMCACHE_PATH`.
+
+If no selected path includes the Microsoft public symbol server, windbg-tool appends `srv*<cache>*https://msdl.microsoft.com/download/symbols`. The default cache directories are `.ttd-symbol-cache` for TTD and `.windbg-symbol-cache` for DbgEng. DbgEng target summaries and `live launch` results expose the final `symbol_path`.
+
 Structured error codes use stable exit codes:
 
 | Code | Exit | Retryable |
