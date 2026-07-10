@@ -159,6 +159,7 @@ mod windows {
     use tokio::sync::{oneshot, Mutex};
 
     const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+    const MAX_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
     const CONNECT_ATTEMPTS: usize = 40;
     const CONNECT_RETRY_DELAY: Duration = Duration::from_millis(50);
 
@@ -355,11 +356,40 @@ mod windows {
         }
         pipe.flush().await.context("flushing daemon request")?;
 
-        let mut response = Vec::new();
-        pipe.read_to_end(&mut response)
-            .await
-            .context("reading daemon response")?;
+        let response = read_response(&mut pipe).await?;
         parse_http_response(&response)
+    }
+
+    async fn read_response(
+        pipe: &mut tokio::net::windows::named_pipe::NamedPipeClient,
+    ) -> anyhow::Result<Vec<u8>> {
+        let mut response = Vec::new();
+        let mut buffer = vec![0_u8; 4096];
+
+        loop {
+            let bytes_read = pipe
+                .read(&mut buffer)
+                .await
+                .context("reading daemon response")?;
+            if bytes_read == 0 {
+                return Ok(response);
+            }
+
+            response.extend_from_slice(&buffer[..bytes_read]);
+            if response.len() > MAX_RESPONSE_BYTES {
+                bail!("daemon response exceeds {MAX_RESPONSE_BYTES} bytes");
+            }
+
+            if let Some(response_end) = response_body_end(&response)? {
+                if response_end > MAX_RESPONSE_BYTES {
+                    bail!("daemon response exceeds {MAX_RESPONSE_BYTES} bytes");
+                }
+                if response.len() >= response_end {
+                    response.truncate(response_end);
+                    return Ok(response);
+                }
+            }
+        }
     }
 
     async fn open_client(
@@ -401,23 +431,7 @@ mod windows {
             .parse::<u16>()
             .context("daemon response status code was invalid")?;
 
-        let mut content_length = None;
-        for line in lines {
-            if let Some((name, value)) = line.split_once(':') {
-                if name.eq_ignore_ascii_case("content-length") {
-                    content_length = Some(
-                        value
-                            .trim()
-                            .parse::<usize>()
-                            .context("daemon response content-length was invalid")?,
-                    );
-                }
-            }
-        }
-
-        let body_end = content_length
-            .map(|length| header_end + length)
-            .unwrap_or(bytes.len());
+        let body_end = response_body_end(bytes)?.unwrap_or(bytes.len());
         if body_end > bytes.len() {
             bail!("daemon response ended before the declared content-length");
         }
@@ -430,5 +444,61 @@ mod windows {
             bail!("daemon HTTP {status}: {message}")
         }
         Ok(value)
+    }
+
+    fn response_body_end(bytes: &[u8]) -> anyhow::Result<Option<usize>> {
+        let Some(header_end) = bytes
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .map(|index| index + 4)
+        else {
+            return Ok(None);
+        };
+
+        let headers = std::str::from_utf8(&bytes[..header_end])
+            .context("daemon response headers were not UTF-8")?;
+        let content_length = headers
+            .split("\r\n")
+            .filter_map(|line| line.split_once(':'))
+            .find_map(|(name, value)| {
+                name.eq_ignore_ascii_case("content-length")
+                    .then_some(value.trim())
+            })
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .context("daemon response content-length was invalid")
+            })
+            .transpose()?;
+
+        content_length
+            .map(|length| {
+                header_end
+                    .checked_add(length)
+                    .context("daemon response content-length overflowed")
+            })
+            .transpose()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn response_body_end_waits_for_complete_headers() {
+            assert_eq!(response_body_end(b"HTTP/1.1 200 OK\r\n").unwrap(), None);
+        }
+
+        #[test]
+        fn response_body_end_uses_content_length() {
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}ignored";
+            assert_eq!(response_body_end(response).unwrap(), Some(40));
+        }
+
+        #[test]
+        fn parse_http_response_ignores_bytes_after_content_length() {
+            let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}ignored";
+            assert_eq!(parse_http_response(response).unwrap(), json!({}));
+        }
     }
 }
