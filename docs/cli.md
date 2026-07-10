@@ -113,11 +113,13 @@ Use `--initial-break` when no reliable code breakpoint is available or the host 
 
 ## Managed CoreCLR DAC breakpoints
 
-`live managed-break` does not load SOS or execute `!bpmd`. It starts with a DbgEng create-process event, stops on CoreCLR and the requested managed module load, dynamically loads the exact x64 `mscordaccore.dll` that is a sibling of the target's loaded `coreclr.dll`, resolves the selected `MethodDef` through the DAC, requests CLR code-generation notification, then creates a DbgEng **hardware execute** breakpoint at the DAC-mapped native entry. `managed_breakpoint.hit` is true only when both the DbgEng breakpoint ID and current instruction pointer match that DAC-mapped address.
+`live managed-break` does not load SOS or execute `!bpmd`. It starts with a DbgEng create-process event, stops on CoreCLR and the requested managed module load, dynamically loads the exact x64 `mscordaccore.dll` that is a sibling of the target's loaded `coreclr.dll`, resolves the selected `MethodDef` through the DAC, requests CLR code-generation notification, then creates a DbgEng **code** breakpoint at the DAC-mapped native entry. `managed_breakpoint.hit` is true only when both the DbgEng breakpoint ID and current instruction pointer match that DAC-mapped address.
 
 Build and stage `windbg_coreclr_dac_bridge.dll` with `cargo xtask native-build`; `cargo xtask package` places it beside `windbg-tool.exe`. A development build can set `WINDBG_CORECLR_DAC_BRIDGE_DLL` to the bridge DLL. The target DAC is never bundled: it must exactly match the target CoreCLR architecture and file version.
 
-CLR's notification mechanism writes debugger-notification state into the target. Therefore `--allow-runtime-write` is explicit and should be used only in an approved test VM. Without it the command fails clearly before any target write; it does not disable endpoint protection or silently fall back to SOS.
+CLR's notification mechanism writes debugger-notification state into the target. The DAC first requests a small JIT-notification table through `ICLRDataTarget2::AllocVirtual`; the bridge obtains the active target process handle from DbgEng and calls `VirtualAllocEx` only for that CLR-owned allocation. DbgEng then applies its normal code-breakpoint byte at the resolved entry. Therefore `--allow-runtime-write` is explicit and should be used only in an approved test VM. Without it the command fails clearly before any target allocation or write; it does not disable endpoint protection, hollow the process, or silently fall back to SOS.
+
+The bridge resolves metadata through `IXCLRDataMethodDefinition`, then uses the matching `IXCLRDataMethodInstance` after CLR code-generation notification. A definition's representative address is IL, not executable code; the code breakpoint always uses the instance's JIT-native entry address.
 
 ```powershell
 target\debug\windbg-tool.exe --compact live managed-break `
@@ -128,7 +130,27 @@ target\debug\windbg-tool.exe --compact live managed-break `
   --end terminate
 ```
 
-The vertical slice resolves regular private methods as normal metadata. It requires a unique fully-qualified metadata name and currently rejects ambiguous overloads; C# signatures, generic instantiations, ReadyToRun indirection, tiered recompilation, re-JIT, and unload transitions remain explicit limits. The structured response keeps CoreCLR/module-load events, DAC runtime/token/entry resolution, CLR notification, hardware breakpoint, and final method-hit context distinct.
+The vertical slice resolves regular private methods as normal metadata. It requires a unique fully-qualified metadata name and currently rejects ambiguous overloads; C# signatures, generic instantiations, ReadyToRun indirection, tiered recompilation, re-JIT, and unload transitions remain explicit limits. The structured response keeps CoreCLR/module-load events, DAC runtime/token/entry resolution, CLR notification, code-breakpoint configuration, and final method-hit context distinct.
+
+### Verified RDM x64 test-VM run
+
+The approved .NET 10.0.9 x64 test VM used this direct, no-SOS invocation:
+
+```powershell
+$root = 'C:\Users\Public\windbg-tool-rdm-dac-24dd653'
+$env:WINDBG_DBGENG_RUNTIME_DIR = "$root\tool"
+$env:WINDBG_CORECLR_DAC_BRIDGE_DLL = "$root\tool\windbg_coreclr_dac_bridge.dll"
+
+& "$root\tool\windbg-tool.exe" --compact live managed-break `
+  --command-line "`"$root\rdm\RemoteDesktopManager_x64.exe`" /AutoCloseAfter:60" `
+  --managed-module RemoteDesktopManager.dll `
+  --method Devolutions.RemoteDesktopManager.Program.Main `
+  --allow-runtime-write --initial-break-timeout-ms 30000 --wait-timeout-ms 120000 --end terminate
+```
+
+That run reported `workflow: "live_managed_break_dac"`, a matching CoreCLR/DAC file version, `managed_resolution.method_after_code_generation.token: 100663305`, `representative_entry_address: 0x7FFC8ABDA8A0`, and `managed_breakpoint: { kind: "software_code", configured.id: 0, hit: true }`. The final context had `instruction_pointer: 0x7FFC8ABDA8A0` and `current_symbol: RemoteDesktopManager!Devolutions.RemoteDesktopManager.Program.Main(System.String[])`.
+
+The same command with `--method Devolutions.RemoteDesktopManager.Program.ApplyDpiAwarness` proved a private method without reflection or SOS: token `100663306`, native entry and final instruction pointer `0x7FFC8AC09920`, breakpoint ID `0`, and final symbol `RemoteDesktopManager!Devolutions.RemoteDesktopManager.Program.ApplyDpiAwarness()`.
 
 ## AI-oriented DbgEng target inspection
 

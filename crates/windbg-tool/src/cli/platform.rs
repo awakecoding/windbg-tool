@@ -215,7 +215,7 @@ pub(super) fn run_live_managed_break(
             coreclr_wait.name.as_deref() == Some("break")
                 && coreclr_event.event_name == "load_module"
                 && coreclr_event.module_base.is_some(),
-            "DbgEng did not stop on the requested CoreCLR module-load event"
+            "DbgEng did not stop on the requested CoreCLR module-load event: wait={coreclr_wait:?}, event={coreclr_event:?}"
         );
 
         let modules_after_coreclr_load = session.modules()?;
@@ -232,30 +232,39 @@ pub(super) fn run_live_managed_break(
             .with_context(|| {
                 format!("configuring the managed-module load stop for {managed_module}")
             })?;
-        let continued_to_managed_module = session.continue_execution()?;
-        let managed_module_wait = session
-            .wait_for_event(args.wait_timeout_ms)
-            .with_context(|| format!("waiting for managed module {managed_module} to load"))?;
-        let managed_module_event = session
-            .last_event()
-            .context("reading the managed module-load event")?;
-        ensure!(
-            managed_module_wait.name.as_deref() == Some("break")
-                && managed_module_event.event_name == "load_module"
-                && managed_module_event.module_base.is_some(),
-            "DbgEng did not stop on the requested managed module-load event"
-        );
+        let managed_module_load = wait_for_dbgeng_managed_module_load(
+            &session,
+            args.wait_timeout_ms,
+            CLR_NOTIFICATION_EXCEPTION,
+        )?;
         let modules_after_managed_load = session.modules()?;
         let loaded_managed_module =
             find_loaded_module(&modules_after_managed_load, &managed_module)?;
         let managed_module_path = module_image_path(loaded_managed_module, "managed assembly")?;
-        let managed_module_observation = wait_for_managed_module_in_dac(
-            &session,
-            &dac,
-            &managed_module_path,
-            args.wait_timeout_ms,
-            CLR_NOTIFICATION_EXCEPTION,
-        )?;
+        let (managed_module_observation, managed_module_notification_pending) =
+            if dac.is_module_loaded(&managed_module_path)? {
+                (
+                    json!({
+                        "module_available": true,
+                        "source": "immediately_after_dbgeng_load_event",
+                        "notifications": []
+                    }),
+                    false,
+                )
+            } else {
+                (
+                    wait_for_managed_module_in_dac(
+                        &session,
+                        &dac,
+                        &managed_module_path,
+                        args.wait_timeout_ms,
+                        CLR_NOTIFICATION_EXCEPTION,
+                    )?,
+                    true,
+                )
+            };
+        dac.disable_module_load_notifications()
+            .context("disabling CLR managed-module load notifications after module discovery")?;
         let (resolved_method, availability) = dac
             .resolve_and_notify(&managed_module_path, &method)
             .with_context(|| {
@@ -264,10 +273,15 @@ pub(super) fn run_live_managed_break(
                 )
             })?;
 
-        let (code_notification, generated_method) = match availability {
-            ManagedCodeAvailability::Available => (None, resolved_method.clone()),
+        let (code_notification, generated_method, clr_notification_pending) = match availability {
+            ManagedCodeAvailability::Available => (
+                None,
+                resolved_method.clone(),
+                managed_module_notification_pending,
+            ),
             ManagedCodeAvailability::PendingJit => {
-                let continued = session.continue_execution()?;
+                let continued =
+                    continue_after_clr_notification(&session, managed_module_notification_pending)?;
                 let wait = session
                     .wait_for_event(args.wait_timeout_ms)
                     .context("waiting for the requested CLR code-generation notification")?;
@@ -299,6 +313,7 @@ pub(super) fn run_live_managed_break(
                         "selected_method_code_available": true
                     })),
                     generated,
+                    true,
                 )
             }
         };
@@ -309,27 +324,16 @@ pub(super) fn run_live_managed_break(
         let native_entry_address = generated_method
             .representative_entry_address
             .context("the selected managed method has no generated native entry address")?;
-        let hardware_breakpoint = session.add_data_breakpoint(
+        let code_breakpoint = session.add_code_breakpoint(native_entry_address)?;
+        let (breakpoint_stop, code_breakpoint_hit) = wait_for_managed_code_breakpoint(
+            &session,
+            &code_breakpoint,
             native_entry_address,
-            1,
-            windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_BREAK_EXECUTE,
+            args.wait_timeout_ms,
+            CLR_NOTIFICATION_EXCEPTION,
+            clr_notification_pending,
         )?;
-        let continued_to_hardware_breakpoint = if code_notification.is_some() {
-            session.continue_execution_handled()?
-        } else {
-            session.continue_execution()?
-        };
-        let hardware_wait = session
-            .wait_for_event(args.wait_timeout_ms)
-            .context("waiting for the managed hardware execute breakpoint")?;
-        let hardware_event = session
-            .last_event()
-            .context("reading the managed hardware execute-breakpoint event")?;
         let registers = session.core_registers()?;
-        let hardware_breakpoint_hit = hardware_wait.name.as_deref() == Some("break")
-            && hardware_event.event_name == "breakpoint"
-            && hardware_event.breakpoint_id == Some(hardware_breakpoint.id)
-            && registers.instruction_offset == Some(native_entry_address);
         let context = live_stop_context(&session, registers, args.max_frames)?;
         Ok(json!({
             "workflow": "live_managed_break_dac",
@@ -345,10 +349,9 @@ pub(super) fn run_live_managed_break(
             },
             "managed_module_load": {
                 "managed_module": managed_module,
-                "continued_to_dbgeng_load_event": continued_to_managed_module,
-                "dbgeng_load_wait": managed_module_wait,
-                "dbgeng_load_event": managed_module_event,
+                "dbgeng_load": managed_module_load,
                 "observation": managed_module_observation,
+                "notifications_disabled_after_observation": true,
                 "loaded_module": loaded_managed_module
             },
             "managed_resolution": {
@@ -365,16 +368,14 @@ pub(super) fn run_live_managed_break(
                 "representative_native_entry_address": format!("0x{native_entry_address:X}")
             },
             "managed_breakpoint": {
-                "kind": "hardware_execute",
-                "configured": hardware_breakpoint,
-                "continued": continued_to_hardware_breakpoint,
-                "wait": hardware_wait,
-                "event": hardware_event,
-                "hit": hardware_breakpoint_hit,
-                "hit_evidence": if hardware_breakpoint_hit {
-                    "the DbgEng hardware breakpoint event ID and current instruction pointer both match the DAC-mapped native entry for the selected MethodDef"
+                "kind": "software_code",
+                "configured": code_breakpoint,
+                "stop": breakpoint_stop,
+                "hit": code_breakpoint_hit,
+                "hit_evidence": if code_breakpoint_hit {
+                    "the DbgEng code breakpoint event ID and current instruction pointer both match the DAC-mapped native entry for the selected MethodDef"
                 } else {
-                    "the selected MethodDef was resolved by the DAC, but DbgEng did not report a matching hardware execute breakpoint hit"
+                    "the selected MethodDef was resolved by the DAC, but DbgEng did not report a matching code breakpoint hit"
                 }
             },
             "context": context,
@@ -395,6 +396,85 @@ pub(super) fn run_live_managed_break(
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error).context("failed to end the live debug session"),
     }
+}
+
+fn continue_after_clr_notification(
+    session: &DebuggerSession,
+    clr_notification_pending: bool,
+) -> anyhow::Result<windbg_dbgeng::DebuggerExecutionStatus> {
+    if clr_notification_pending {
+        session.continue_execution_handled()
+    } else {
+        session.continue_execution()
+    }
+}
+
+fn wait_for_managed_code_breakpoint(
+    session: &DebuggerSession,
+    breakpoint: &BreakpointInfo,
+    native_entry_address: u64,
+    wait_timeout_ms: u32,
+    clr_notification_exception: u32,
+    mut clr_notification_pending: bool,
+) -> anyhow::Result<(Value, bool)> {
+    const MAX_PRELIMINARY_NOTIFICATIONS: usize = 64;
+
+    let deadline = Instant::now() + Duration::from_millis(u64::from(wait_timeout_ms));
+    let mut preliminary_notifications = Vec::new();
+    for attempt in 1..=MAX_PRELIMINARY_NOTIFICATIONS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "timed out waiting for the managed code breakpoint"
+        );
+        let remaining_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        let continued = continue_after_clr_notification(session, clr_notification_pending)?;
+        let wait = session
+            .wait_for_event(remaining_ms)
+            .context("waiting for the managed code breakpoint")?;
+        let event = session
+            .last_event()
+            .context("reading the managed code breakpoint event")?;
+        let registers = session.core_registers()?;
+        let code_breakpoint_hit = wait.name.as_deref() == Some("break")
+            && event.event_name == "breakpoint"
+            && event.breakpoint_id == Some(breakpoint.id)
+            && registers.instruction_offset == Some(native_entry_address);
+        if code_breakpoint_hit {
+            return Ok((
+                json!({
+                    "continued": continued,
+                    "wait": wait,
+                    "event": event,
+                    "preliminary_clr_notifications": preliminary_notifications
+                }),
+                true,
+            ));
+        }
+
+        let is_clr_notification = wait.name.as_deref() == Some("break")
+            && event.event_name == "exception"
+            && event
+                .exception
+                .as_ref()
+                .is_some_and(|exception| exception.code == clr_notification_exception);
+        ensure!(
+            is_clr_notification,
+            "DbgEng stopped before the managed code breakpoint: wait={wait:?}, event={event:?}, instruction_pointer={:?}",
+            registers.instruction_offset
+        );
+        preliminary_notifications.push(json!({
+            "attempt": attempt,
+            "continued": continued,
+            "wait": wait,
+            "event": event
+        }));
+        clr_notification_pending = true;
+    }
+
+    bail!(
+        "the CLR emitted {MAX_PRELIMINARY_NOTIFICATIONS} notifications before the managed code breakpoint"
+    )
 }
 
 fn validate_module_load_filter(value: &str) -> anyhow::Result<String> {
@@ -485,6 +565,70 @@ fn module_image_path(module: &ModuleInfo, role: &str) -> anyhow::Result<PathBuf>
     .with_context(|| {
         format!("DbgEng did not report an accessible {role} image path for the selected module")
     })
+}
+
+fn wait_for_dbgeng_managed_module_load(
+    session: &DebuggerSession,
+    wait_timeout_ms: u32,
+    clr_notification_exception: u32,
+) -> anyhow::Result<Value> {
+    const MAX_PRELIMINARY_NOTIFICATIONS: usize = 64;
+
+    let deadline = Instant::now() + Duration::from_millis(u64::from(wait_timeout_ms));
+    let mut preliminary_notifications = Vec::new();
+    let mut continue_as_handled = false;
+    for attempt in 1..=MAX_PRELIMINARY_NOTIFICATIONS {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        ensure!(
+            !remaining.is_zero(),
+            "timed out waiting for DbgEng's managed module-load event"
+        );
+        let remaining_ms = remaining.as_millis().clamp(1, u128::from(u32::MAX)) as u32;
+        let continued = if continue_as_handled {
+            session.continue_execution_handled()?
+        } else {
+            session.continue_execution()?
+        };
+        let wait = session
+            .wait_for_event(remaining_ms)
+            .context("waiting for the managed module-load event")?;
+        let event = session
+            .last_event()
+            .context("reading the managed module-load event")?;
+        if wait.name.as_deref() == Some("break")
+            && event.event_name == "load_module"
+            && event.module_base.is_some()
+        {
+            return Ok(json!({
+                "continued": continued,
+                "wait": wait,
+                "event": event,
+                "preliminary_clr_notifications": preliminary_notifications
+            }));
+        }
+
+        let is_clr_notification = wait.name.as_deref() == Some("break")
+            && event.event_name == "exception"
+            && event
+                .exception
+                .as_ref()
+                .is_some_and(|exception| exception.code == clr_notification_exception);
+        ensure!(
+            is_clr_notification,
+            "DbgEng stopped before the requested managed module-load event: wait={wait:?}, event={event:?}"
+        );
+        preliminary_notifications.push(json!({
+            "attempt": attempt,
+            "continued": continued,
+            "wait": wait,
+            "event": event
+        }));
+        continue_as_handled = true;
+    }
+
+    bail!(
+        "the CLR emitted {MAX_PRELIMINARY_NOTIFICATIONS} notifications before DbgEng reported the managed module-load event"
+    )
 }
 
 fn wait_for_managed_module_in_dac(

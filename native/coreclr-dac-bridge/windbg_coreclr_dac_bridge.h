@@ -56,6 +56,9 @@ WINDBG_DAC_EXPORT void windbg_dac_destroy(WindbgDacBridge* bridge);
 WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_enable_module_load_notifications(
     WindbgDacBridge* bridge);
 
+WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_disable_module_load_notifications(
+    WindbgDacBridge* bridge);
+
 WINDBG_DAC_EXPORT WindbgDacStatus windbg_dac_is_module_loaded(
     WindbgDacBridge* bridge,
     const wchar_t* managed_module_path,

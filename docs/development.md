@@ -71,7 +71,7 @@ target\debug\windbg-tool.exe live capabilities
 
 The live backend securely preloads `dbgeng.dll` from this directory (or from beside `windbg-tool.exe` in a package) so its dependent DLLs resolve from the matching runtime set. It does not alter global DLL-search or security policy.
 
-For a direct managed breakpoint, the DAC bridge loads `mscordaccore.dll` only from the same directory as the CoreCLR module loaded by the target and requires exact file-version equality. It does not bundle a DAC or SOS. Enabling CLR module/code notifications requires `--allow-runtime-write`, which causes the DAC to write CLR debugger-notification state through DbgEng; run that workflow only in an approved test VM.
+For a direct managed breakpoint, the DAC bridge loads `mscordaccore.dll` only from the same directory as the CoreCLR module loaded by the target and requires exact file-version equality. It does not bundle a DAC or SOS. Enabling CLR module/code notifications requires `--allow-runtime-write`: the DAC requests a CLR-owned JIT-notification allocation through `ICLRDataTarget2`, and the bridge uses DbgEng's active process handle with `VirtualAllocEx` before writing CLR debugger-notification state. This is not process hollowing or code injection; run the intentionally target-mutating workflow only in an approved test VM.
 
 Cross-compiling the ARM64 package from an x64 machine requires the Visual Studio ARM64 MSVC toolset and an `x64_arm64` developer environment for the native bridge and Rust crates that compile C/C++ code.
 

@@ -67,6 +67,7 @@ type CreateBridge = unsafe extern "C" fn(
 ) -> u32;
 type DestroyBridge = unsafe extern "C" fn(bridge: *mut c_void);
 type EnableModuleLoadNotifications = unsafe extern "C" fn(bridge: *mut c_void) -> u32;
+type DisableModuleLoadNotifications = unsafe extern "C" fn(bridge: *mut c_void) -> u32;
 type IsModuleLoaded = unsafe extern "C" fn(
     bridge: *mut c_void,
     managed_module_path: *const u16,
@@ -110,6 +111,7 @@ pub struct CoreClrDacBridge {
     bridge: NonNull<c_void>,
     destroy: DestroyBridge,
     enable_module_load_notifications: EnableModuleLoadNotifications,
+    disable_module_load_notifications: DisableModuleLoadNotifications,
     is_module_loaded: IsModuleLoaded,
     resolve_and_notify: ResolveAndNotify,
     refresh_method_code: RefreshMethodCode,
@@ -143,6 +145,12 @@ impl CoreClrDacBridge {
             load_symbol::<EnableModuleLoadNotifications>(
                 &library,
                 b"windbg_dac_enable_module_load_notifications\0",
+            )?
+        };
+        let disable_module_load_notifications = unsafe {
+            load_symbol::<DisableModuleLoadNotifications>(
+                &library,
+                b"windbg_dac_disable_module_load_notifications\0",
             )?
         };
         let is_module_loaded =
@@ -181,6 +189,7 @@ impl CoreClrDacBridge {
             bridge,
             destroy,
             enable_module_load_notifications,
+            disable_module_load_notifications,
             is_module_loaded,
             resolve_and_notify,
             refresh_method_code,
@@ -198,6 +207,17 @@ impl CoreClrDacBridge {
         if status != WINDBG_DAC_OK {
             bail!(
                 "requesting CLR managed-module load notifications failed: {}",
+                bridge_error(self.last_error)
+            );
+        }
+        Ok(())
+    }
+
+    pub fn disable_module_load_notifications(&self) -> anyhow::Result<()> {
+        let status = unsafe { (self.disable_module_load_notifications)(self.bridge.as_ptr()) };
+        if status != WINDBG_DAC_OK {
+            bail!(
+                "disabling CLR managed-module load notifications failed: {}",
                 bridge_error(self.last_error)
             );
         }

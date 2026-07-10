@@ -18,6 +18,11 @@ using CLRDATA_ADDRESS = ULONG64;
 using CLRDATA_ENUM = ULONG64;
 using mdMethodDef = ULONG32;
 
+struct CLRDATA_ADDRESS_RANGE {
+    CLRDATA_ADDRESS start_address;
+    CLRDATA_ADDRESS end_address;
+};
+
 struct IXCLRDataProcess;
 struct IXCLRDataModule;
 struct IXCLRDataMethodDefinition;
@@ -37,6 +42,8 @@ static constexpr ULONG32 CLRDATA_NOTIFY_ON_MODULE_LOAD = 0x00000001;
 
 static const IID IID_ICLRDataTarget =
     {0x3e11ccee, 0xd08b, 0x43e5, {0xaf, 0x01, 0x32, 0x71, 0x7a, 0x64, 0xda, 0x03}};
+static const IID IID_ICLRDataTarget2 =
+    {0x6d05fae3, 0x189c, 0x4630, {0xa6, 0xdc, 0x1c, 0x25, 0x1e, 0x1c, 0x01, 0xab}};
 static const IID IID_IXCLRDataProcess =
     {0x5c552ab6, 0xfc09, 0x4cb3, {0x8e, 0x36, 0x22, 0xfa, 0x03, 0xc7, 0x98, 0xb7}};
 
@@ -72,6 +79,19 @@ struct ICLRDataTarget : IUnknown {
         BYTE* input,
         ULONG32 output_size,
         BYTE* output) = 0;
+};
+
+struct ICLRDataTarget2 : ICLRDataTarget {
+    virtual HRESULT STDMETHODCALLTYPE AllocVirtual(
+        CLRDATA_ADDRESS address,
+        ULONG32 size,
+        ULONG32 type_flags,
+        ULONG32 protect_flags,
+        CLRDATA_ADDRESS* allocation) = 0;
+    virtual HRESULT STDMETHODCALLTYPE FreeVirtual(
+        CLRDATA_ADDRESS address,
+        ULONG32 size,
+        ULONG32 type_flags) = 0;
 };
 
 // Only the prefix used by this bridge is declared. Method ordering is the ABI.
@@ -215,6 +235,50 @@ struct IXCLRDataMethodDefinition : IUnknown {
     virtual HRESULT STDMETHODCALLTYPE GetRepresentativeEntryAddress(CLRDATA_ADDRESS* address) = 0;
 };
 
+struct IXCLRDataMethodInstance : IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE GetTypeInstance(IXCLRDataTypeInstance** type) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetDefinition(IXCLRDataMethodDefinition** method) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetTokenAndScope(mdMethodDef* token, IXCLRDataModule** module) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetName(
+        ULONG32 flags,
+        ULONG32 buffer_length,
+        ULONG32* name_length,
+        WCHAR* name) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetFlags(ULONG32* flags) = 0;
+    virtual HRESULT STDMETHODCALLTYPE IsSameObject(IXCLRDataMethodInstance* method) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetEnCVersion(ULONG32* version) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetNumTypeArguments(ULONG32* argument_count) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetTypeArgumentByIndex(
+        ULONG32 index,
+        IXCLRDataTypeInstance** type) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetILOffsetsByAddress(
+        CLRDATA_ADDRESS address,
+        ULONG32 offset_count,
+        ULONG32* offsets_needed,
+        ULONG32* offsets) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetAddressRangesByILOffset(
+        ULONG32 il_offset,
+        ULONG32 range_count,
+        ULONG32* ranges_needed,
+        CLRDATA_ADDRESS_RANGE* ranges) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetILAddressMap(
+        ULONG32 map_count,
+        ULONG32* maps_needed,
+        void* maps) = 0;
+    virtual HRESULT STDMETHODCALLTYPE StartEnumExtents(CLRDATA_ENUM* handle) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EnumExtent(
+        CLRDATA_ENUM* handle,
+        CLRDATA_ADDRESS_RANGE* extent) = 0;
+    virtual HRESULT STDMETHODCALLTYPE EndEnumExtents(CLRDATA_ENUM handle) = 0;
+    virtual HRESULT STDMETHODCALLTYPE Request(
+        ULONG32 request_code,
+        ULONG32 input_size,
+        BYTE* input,
+        ULONG32 output_size,
+        BYTE* output) = 0;
+    virtual HRESULT STDMETHODCALLTYPE GetRepresentativeEntryAddress(CLRDATA_ADDRESS* address) = 0;
+};
+
 using CLRDataCreateInstanceFn =
     HRESULT(STDAPICALLTYPE*)(REFIID iid, ICLRDataTarget* target, void** interface_pointer);
 
@@ -309,7 +373,7 @@ std::wstring sibling_dac_path(const wchar_t* coreclr_path) {
     return path;
 }
 
-class DbgEngDataTarget final : public ICLRDataTarget {
+class DbgEngDataTarget final : public ICLRDataTarget2 {
 public:
     DbgEngDataTarget(IDebugClient5* client, bool allow_target_writes)
         : client_(client), allow_target_writes_(allow_target_writes) {
@@ -345,6 +409,11 @@ public:
         *object = nullptr;
         if (iid == IID_IUnknown || iid == IID_ICLRDataTarget) {
             *object = static_cast<ICLRDataTarget*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (iid == IID_ICLRDataTarget2) {
+            *object = static_cast<ICLRDataTarget2*>(this);
             AddRef();
             return S_OK;
         }
@@ -544,7 +613,115 @@ public:
         return E_NOTIMPL;
     }
 
+    HRESULT STDMETHODCALLTYPE AllocVirtual(
+        CLRDATA_ADDRESS address,
+        ULONG32 size,
+        ULONG32 type_flags,
+        ULONG32 protect_flags,
+        CLRDATA_ADDRESS* allocation) override {
+        if (allocation == nullptr) {
+            diagnostic_ = L"ICLRDataTarget2::AllocVirtual received a null allocation output pointer.";
+            return E_POINTER;
+        }
+        if (!allow_target_writes_) {
+            diagnostic_ =
+                L"ICLRDataTarget2::AllocVirtual was rejected because runtime writes were not explicitly enabled.";
+            return E_ACCESSDENIED;
+        }
+
+        HANDLE process_handle = nullptr;
+        HRESULT result = current_process_handle(&process_handle);
+        if (FAILED(result)) {
+            return result;
+        }
+        void* const allocated =
+            VirtualAllocEx(process_handle, reinterpret_cast<void*>(address), size, type_flags, protect_flags);
+        if (allocated == nullptr) {
+            const DWORD error = GetLastError();
+            result = HRESULT_FROM_WIN32(error);
+            wchar_t message[320]{};
+            swprintf_s(
+                message,
+                L"ICLRDataTarget2::AllocVirtual(0x%llX, %u, 0x%X, 0x%X) failed with Win32 error %lu.",
+                static_cast<unsigned long long>(address),
+                size,
+                type_flags,
+                protect_flags,
+                error);
+            diagnostic_ = message;
+            return result;
+        }
+        *allocation = reinterpret_cast<CLRDATA_ADDRESS>(allocated);
+        wchar_t message[320]{};
+        swprintf_s(
+            message,
+            L"ICLRDataTarget2::AllocVirtual(0x%llX, %u, 0x%X, 0x%X) allocated 0x%llX.",
+            static_cast<unsigned long long>(address),
+            size,
+            type_flags,
+            protect_flags,
+            static_cast<unsigned long long>(*allocation));
+        diagnostic_ = message;
+        return S_OK;
+    }
+
+    HRESULT STDMETHODCALLTYPE FreeVirtual(
+        CLRDATA_ADDRESS address,
+        ULONG32 size,
+        ULONG32 type_flags) override {
+        if (!allow_target_writes_) {
+            diagnostic_ =
+                L"ICLRDataTarget2::FreeVirtual was rejected because runtime writes were not explicitly enabled.";
+            return E_ACCESSDENIED;
+        }
+
+        HANDLE process_handle = nullptr;
+        HRESULT result = current_process_handle(&process_handle);
+        if (FAILED(result)) {
+            return result;
+        }
+        if (!VirtualFreeEx(process_handle, reinterpret_cast<void*>(address), size, type_flags)) {
+            const DWORD error = GetLastError();
+            result = HRESULT_FROM_WIN32(error);
+            wchar_t message[256]{};
+            swprintf_s(
+                message,
+                L"ICLRDataTarget2::FreeVirtual(0x%llX, %u, 0x%X) failed with Win32 error %lu.",
+                static_cast<unsigned long long>(address),
+                size,
+                type_flags,
+                error);
+            diagnostic_ = message;
+            return result;
+        }
+        wchar_t message[256]{};
+        swprintf_s(
+            message,
+            L"ICLRDataTarget2::FreeVirtual(0x%llX, %u, 0x%X) succeeded.",
+            static_cast<unsigned long long>(address),
+            size,
+            type_flags);
+        diagnostic_ = message;
+        return S_OK;
+    }
+
 private:
+    HRESULT current_process_handle(HANDLE* process_handle) {
+        if (process_handle == nullptr || system_objects_.get() == nullptr) {
+            diagnostic_ =
+                L"ICLRDataTarget2 requires an output process handle and IDebugSystemObjects4.";
+            return E_POINTER;
+        }
+        ULONG64 raw_process_handle = 0;
+        const HRESULT result = system_objects_.get()->GetCurrentProcessHandle(&raw_process_handle);
+        if (FAILED(result)) {
+            diagnostic_ = format_hresult(L"IDebugSystemObjects4::GetCurrentProcessHandle", result);
+            return result;
+        }
+        *process_handle = reinterpret_cast<HANDLE>(raw_process_handle);
+        return S_OK;
+    }
+
     ~DbgEngDataTarget() = default;
 
     LONG references_ = 1;
@@ -562,6 +739,7 @@ struct WindbgDacBridge {
         : target(new DbgEngDataTarget(client, allow_target_writes)) {}
 
     ~WindbgDacBridge() {
+        method_instance.reset();
         method.reset();
         process.reset();
         target->Release();
@@ -573,11 +751,40 @@ struct WindbgDacBridge {
     DbgEngDataTarget* target;
     ComReference<IXCLRDataProcess> process;
     ComReference<IXCLRDataMethodDefinition> method;
+    ComReference<IXCLRDataMethodInstance> method_instance;
     HMODULE dac_module = nullptr;
     std::wstring dac_path;
+    std::wstring managed_module_path;
+    mdMethodDef method_token = 0;
 };
 
-void populate_method_info(IXCLRDataMethodDefinition* method, WindbgDacMethodInfo* info) {
+HRESULT find_method_instance(
+    IXCLRDataMethodDefinition* method,
+    ComReference<IXCLRDataMethodInstance>* instance) {
+    instance->reset();
+    CLRDATA_ENUM enumeration = 0;
+    HRESULT result = method->StartEnumInstances(nullptr, &enumeration);
+    if (result == S_FALSE || FAILED(result)) {
+        return result;
+    }
+
+    ComReference<IXCLRDataMethodInstance> selected;
+    result = method->EnumInstance(&enumeration, selected.put());
+    const HRESULT end_result = method->EndEnumInstances(enumeration);
+    if (FAILED(result) || result == S_FALSE) {
+        return result;
+    }
+    if (FAILED(end_result)) {
+        return end_result;
+    }
+    instance->reset(selected.detach());
+    return S_OK;
+}
+
+HRESULT populate_method_info(
+    IXCLRDataMethodDefinition* method,
+    ComReference<IXCLRDataMethodInstance>* method_instance,
+    WindbgDacMethodInfo* info) {
     memset(info, 0, sizeof(*info));
 
     std::array<wchar_t, 1024> name{};
@@ -590,11 +797,30 @@ void populate_method_info(IXCLRDataMethodDefinition* method, WindbgDacMethodInfo
     method->GetTokenAndScope(&info->method_token, scope.put());
     info->code_notification_flags = CLRDATA_METHNOTIFY_GENERATED | CLRDATA_METHNOTIFY_DISCARDED;
 
+    // Method definitions expose IL extents; only a method instance exposes JIT-native code.
+    const HRESULT instance_result = find_method_instance(method, method_instance);
+    if (instance_result == S_FALSE) {
+        return S_OK;
+    }
+    if (FAILED(instance_result)) {
+        return instance_result;
+    }
+
     CLRDATA_ADDRESS entry_address = 0;
-    if (SUCCEEDED(method->GetRepresentativeEntryAddress(&entry_address)) && entry_address != 0) {
+    const HRESULT entry_result =
+        method_instance->get()->GetRepresentativeEntryAddress(&entry_address);
+    if (entry_result == E_UNEXPECTED) {
+        method_instance->reset();
+        return S_OK;
+    }
+    if (FAILED(entry_result)) {
+        return entry_result;
+    }
+    if (entry_address != 0) {
         info->representative_entry_address = entry_address;
         info->code_available = 1;
     }
+    return S_OK;
 }
 
 bool module_paths_match(const std::wstring& expected, const std::wstring& actual) {
@@ -776,6 +1002,22 @@ extern "C" WindbgDacStatus windbg_dac_enable_module_load_notifications(WindbgDac
     return WINDBG_DAC_OK;
 }
 
+extern "C" WindbgDacStatus windbg_dac_disable_module_load_notifications(WindbgDacBridge* bridge) {
+    g_last_error.clear();
+    if (bridge == nullptr) {
+        return fail(WINDBG_DAC_INVALID_ARGUMENT, L"A bridge is required.");
+    }
+
+    const HRESULT result = bridge->process.get()->SetOtherNotificationFlags(0);
+    if (FAILED(result)) {
+        return fail(
+            WINDBG_DAC_ERROR,
+            format_hresult(L"Disabling CLR managed-module load notifications", result) +
+                L" DAC callback diagnostics: " + bridge->target->diagnostic());
+    }
+    return WINDBG_DAC_OK;
+}
+
 extern "C" WindbgDacStatus windbg_dac_is_module_loaded(
     WindbgDacBridge* bridge,
     const wchar_t* managed_module_path,
@@ -862,11 +1104,28 @@ extern "C" WindbgDacStatus windbg_dac_resolve_and_notify(
     }
 
     bridge->method.reset(selected.detach());
-    populate_method_info(bridge->method.get(), method_info);
+    bridge->method_instance.reset();
+    result = populate_method_info(
+        bridge->method.get(),
+        &bridge->method_instance,
+        method_info);
+    if (FAILED(result)) {
+        bridge->method.reset();
+        bridge->method_instance.reset();
+        return fail(
+            WINDBG_DAC_ERROR,
+            format_hresult(L"Resolving a native code instance for the managed method", result));
+    }
+    method_info->matching_method_count = count;
+    bridge->managed_module_path = managed_module_path;
+    bridge->method_token = method_info->method_token;
     result = bridge->method.get()->SetCodeNotification(method_info->code_notification_flags);
     if (FAILED(result)) {
         bridge->method.reset();
-        return fail(WINDBG_DAC_ERROR, format_hresult(L"Requesting CLR code-generation notification", result));
+        return fail(
+            WINDBG_DAC_ERROR,
+            format_hresult(L"Requesting CLR code-generation notification", result) +
+                L" DAC callback diagnostics: " + bridge->target->diagnostic());
     }
 
     return WINDBG_DAC_OK;
@@ -883,7 +1142,35 @@ extern "C" WindbgDacStatus windbg_dac_refresh_method_code(
         return fail(WINDBG_DAC_NOT_FOUND, L"No managed method has been resolved for this bridge.");
     }
 
-    populate_method_info(bridge->method.get(), method_info);
+    if (bridge->managed_module_path.empty() || bridge->method_token == 0) {
+        return fail(
+            WINDBG_DAC_ERROR,
+            L"The resolved managed method does not retain a module path and metadata token.");
+    }
+    ComReference<IXCLRDataModule> module;
+    const WindbgDacStatus module_status =
+        find_module_by_path(bridge->process.get(), bridge->managed_module_path.c_str(), &module);
+    if (module_status != WINDBG_DAC_OK) {
+        return module_status;
+    }
+    bridge->method_instance.reset();
+    bridge->method.reset();
+    const HRESULT definition_result =
+        module.get()->GetMethodDefinitionByToken(bridge->method_token, bridge->method.put());
+    if (FAILED(definition_result) || bridge->method.get() == nullptr) {
+        return fail(
+            WINDBG_DAC_ERROR,
+            format_hresult(L"Reopening the managed method definition after CLR code generation", definition_result));
+    }
+    const HRESULT result = populate_method_info(
+        bridge->method.get(),
+        &bridge->method_instance,
+        method_info);
+    if (FAILED(result)) {
+        return fail(
+            WINDBG_DAC_ERROR,
+            format_hresult(L"Refreshing the managed method native code instance", result));
+    }
     method_info->matching_method_count = 1;
     if (method_info->code_available == 0) {
         return fail(WINDBG_DAC_CODE_UNAVAILABLE, L"The managed method does not have a representative native entry address yet.");
