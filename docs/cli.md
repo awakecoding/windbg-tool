@@ -135,7 +135,7 @@ Processor breakpoints are a constrained CPU resource. [Microsoft's processor-bre
 
 `live managed-break` does not load SOS or execute `!bpmd`. It starts with a DbgEng create-process event, stops on CoreCLR and the requested managed module load, dynamically loads the exact x64 `mscordaccore.dll` that is a sibling of the target's loaded `coreclr.dll`, resolves the selected `MethodDef` through the DAC, requests CLR code-generation notification, then creates a DbgEng **code** breakpoint at the DAC-mapped native entry. `managed_breakpoint.hit` is true only when both the DbgEng breakpoint ID and current instruction pointer match that DAC-mapped address.
 
-Build and stage `windbg_coreclr_dac_bridge.dll` with `cargo xtask native-build`; `cargo xtask package` places it beside `windbg-tool.exe`. A development build can set `WINDBG_CORECLR_DAC_BRIDGE_DLL` to the bridge DLL. The target DAC is never bundled: it must exactly match the target CoreCLR architecture and file version.
+The DAC host and `ICLRDataTarget2` callback are implemented in-process in Rust. No separate bridge DLL is built, staged, or configured. The target DAC is never bundled: it must exactly match the target CoreCLR architecture and file version.
 
 CLR's notification mechanism writes debugger-notification state into the target. The DAC first requests a small JIT-notification table through `ICLRDataTarget2::AllocVirtual`; the bridge obtains the active target process handle from DbgEng and calls `VirtualAllocEx` only for that CLR-owned allocation. DbgEng then applies its normal code-breakpoint byte at the resolved entry. Therefore `--allow-runtime-write` is explicit and should be used only in an approved test VM. Without it the command fails clearly before any target allocation or write; it does not disable endpoint protection, hollow the process, or silently fall back to SOS.
 
@@ -150,8 +150,6 @@ The command starts from create-process and native module-load events. It resolve
 The safe .NET 10.0.9 x64 fixture established that the native `ManagedBreakpointFixture.dll` load event occurs before the module is visible to the read-only DAC. This invocation therefore correctly returned `managed_breakpoint.binding_state: "module_not_observable_without_runtime_write"` and `hit: false`:
 
 ```powershell
-$env:WINDBG_CORECLR_DAC_BRIDGE_DLL = `
-  (Resolve-Path target\native\coreclr-dac-bridge\bin\Release\windbg_coreclr_dac_bridge.dll)
 $fixture = Resolve-Path crates\windbg-tool\tests\fixtures\ManagedBreakpointFixture
 target\debug\windbg-tool.exe --compact live managed-break `
   --command-line "`"$fixture\bin\Release\net10.0\win-x64\ManagedBreakpointFixture.exe`"" `
@@ -413,7 +411,6 @@ The approved .NET 10.0.9 x64 test VM used this direct, no-SOS invocation:
 ```powershell
 $root = 'C:\Users\Public\windbg-tool-rdm-dac-24dd653'
 $env:WINDBG_DBGENG_RUNTIME_DIR = "$root\tool"
-$env:WINDBG_CORECLR_DAC_BRIDGE_DLL = "$root\tool\windbg_coreclr_dac_bridge.dll"
 
 & "$root\tool\windbg-tool.exe" --compact live managed-break `
   --command-line "`"$root\rdm\RemoteDesktopManager_x64.exe`" /AutoCloseAfter:60" `

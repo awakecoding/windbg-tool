@@ -13,7 +13,6 @@ This page keeps the deeper setup and contributor-oriented material out of the ma
 | `crates\windbg-install` | WinDbg package install/update/launch support |
 | `xtask` | Developer workflow commands |
 | `native\ttd-replay-bridge` | C++ bridge to the TTD Replay API |
-| `native\coreclr-dac-bridge` | C++ bridge hosting a CoreCLR DAC over an active DbgEng client |
 | `scripts\Get-TtdReplayRuntime.ps1` | Runtime acquisition helper |
 | `docs\architecture.md` | Architecture notes and layering details |
 
@@ -45,7 +44,7 @@ cargo xtask native-build
 - stages DbgEng runtime DLLs into `target\dbgeng-runtime`
 - downloads `TTDReplay.dll` and `TTDReplayCPU.dll` into `target\ttd-runtime`
 
-`cargo xtask native-build` configures and builds the TTD bridge under `target\native\ttd-replay-bridge` and the x64 CoreCLR DAC bridge under `target\native\coreclr-dac-bridge`. Packaging copies both bridge DLLs beside `windbg-tool.exe`.
+`cargo xtask native-build` configures and builds the TTD bridge under `target\native\ttd-replay-bridge`. The CoreCLR DAC host is implemented in the Rust DbgEng crate and does not require a separately staged bridge DLL.
 
 For release packaging, use explicit target architecture inputs so the Rust binary, native bridge, and staged debugger runtime DLLs all match:
 
