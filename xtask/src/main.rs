@@ -9,7 +9,6 @@ const DEBUGGING_PLATFORM_VERSION: &str = "20260319.1511.0";
 const DEFAULT_SYMBOL_CACHE: &str = ".ttd-symbol-cache";
 const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
 const NATIVE_BRIDGE_DLL: &str = "ttd_replay_bridge.dll";
-const CORECLR_DAC_BRIDGE_DLL: &str = "windbg_coreclr_dac_bridge.dll";
 const TTD_RUNTIME_FILES: &[&str] = &["TTDReplay.dll", "TTDReplayCPU.dll"];
 const DBGENG_RUNTIME_FILES: &[&str] = &[
     "dbgeng.dll",
@@ -336,7 +335,6 @@ fn native_build(options: &XtaskOptions) -> anyhow::Result<()> {
     let root = workspace_root()?;
     let packages_dir = root.join("target/nuget");
     let ttd_apis_package = package_dir(&packages_dir, "Microsoft.TimeTravelDebugging.Apis")?;
-    let dbgeng_package = package_dir(&packages_dir, "Microsoft.Debugging.Platform.DbgEng")?;
     let source_dir = root.join("native/ttd-replay-bridge");
     let build_dir = native_build_dir(&root, options);
     fs::create_dir_all(&build_dir).context("creating native bridge build directory")?;
@@ -370,40 +368,6 @@ fn native_build(options: &XtaskOptions) -> anyhow::Result<()> {
         .arg("Release"))
     .context("building native TTD replay bridge")?;
 
-    if options.arch == PackageArch::Amd64 {
-        let dac_source_dir = root.join("native/coreclr-dac-bridge");
-        let dac_build_dir = coreclr_dac_bridge_build_dir(&root, options);
-        fs::create_dir_all(&dac_build_dir)
-            .context("creating CoreCLR DAC bridge build directory")?;
-
-        let mut dac_configure = Command::new("cmake");
-        dac_configure
-            .arg("-S")
-            .arg(&dac_source_dir)
-            .arg("-B")
-            .arg(&dac_build_dir)
-            .arg(format!("-DDBGENG_PACKAGE_DIR={}", dbgeng_package.display()))
-            .env("Platform", options.arch.msvc_platform());
-
-        if options.static_crt {
-            dac_configure.arg("-DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded$<$<CONFIG:Debug>:Debug>");
-        }
-
-        if cfg!(windows) && cmake_generator_accepts_platform() {
-            dac_configure.arg("-A").arg(options.arch.msvc_platform());
-        }
-
-        run(&mut dac_configure).context("configuring CoreCLR DAC bridge")?;
-        run(Command::new("cmake")
-            .arg("--build")
-            .arg(&dac_build_dir)
-            .arg("--config")
-            .arg("Release"))
-        .context("building CoreCLR DAC bridge")?;
-    } else {
-        println!("  skipping CoreCLR DAC bridge: direct managed breakpoints are x64-only");
-    }
-
     Ok(())
 }
 
@@ -426,12 +390,6 @@ fn package(options: &XtaskOptions) -> anyhow::Result<()> {
         native_bridge_candidates(&root, options),
         &package_dir.join(NATIVE_BRIDGE_DLL),
     )?;
-    if options.arch == PackageArch::Amd64 {
-        copy_first_existing(
-            coreclr_dac_bridge_candidates(&root, options),
-            &package_dir.join(CORECLR_DAC_BRIDGE_DLL),
-        )?;
-    }
     copy_runtime_files(
         &ttd_runtime_dir(&root, options),
         &package_dir,
@@ -697,15 +655,6 @@ fn native_build_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
     }
 }
 
-fn coreclr_dac_bridge_build_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
-    if options.explicit_target_layout {
-        root.join("target/native")
-            .join(format!("coreclr-dac-bridge-{}", options.arch.nuget_arch()))
-    } else {
-        root.join("target/native/coreclr-dac-bridge")
-    }
-}
-
 fn default_package_dir(root: &Path, options: &XtaskOptions) -> PathBuf {
     if options.explicit_target_layout {
         root.join("target/package")
@@ -739,20 +688,6 @@ fn native_bridge_candidates(root: &Path, options: &XtaskOptions) -> Vec<PathBuf>
     candidates.push(build_dir.join("bin/Debug").join(NATIVE_BRIDGE_DLL));
     candidates.push(build_dir.join("Release").join(NATIVE_BRIDGE_DLL));
     candidates.push(build_dir.join("Debug").join(NATIVE_BRIDGE_DLL));
-    candidates
-}
-
-fn coreclr_dac_bridge_candidates(root: &Path, options: &XtaskOptions) -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Some(path) = env::var_os("WINDBG_CORECLR_DAC_BRIDGE_DLL").map(PathBuf::from) {
-        candidates.push(path);
-    }
-
-    let build_dir = coreclr_dac_bridge_build_dir(root, options);
-    candidates.push(build_dir.join("bin/Release").join(CORECLR_DAC_BRIDGE_DLL));
-    candidates.push(build_dir.join("bin/Debug").join(CORECLR_DAC_BRIDGE_DLL));
-    candidates.push(build_dir.join("Release").join(CORECLR_DAC_BRIDGE_DLL));
-    candidates.push(build_dir.join("Debug").join(CORECLR_DAC_BRIDGE_DLL));
     candidates
 }
 
