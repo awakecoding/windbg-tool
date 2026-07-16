@@ -10,6 +10,22 @@
 - **Canonical agent debugging commands** start with `debug`, `triage`, `symbols doctor`, and `breakpoint plan`
 - **Platform helper commands** cover DbgEng, remote debugging doctors/plans, live-launch probing, and WinDbg installation
 
+## Kernel dump triage
+
+Use the daemon-free, read-only dump triage command to collect DbgEng bugcheck data,
+fault disassembly, AMD64 exception-context registers, stack validity, symbol readiness,
+driver-evidence provenance, and next diagnostic guidance:
+
+```powershell
+target\debug\windbg-tool.exe --compact dump triage C:\Windows\Minidump\example.dmp --max-frames 32
+```
+
+`dump inspect` returns the same triage fields for compatibility. The report distinguishes
+missing dump content (for example, a partial exception context) from an invalid or truncated
+unwind, and never treats a loaded driver or `ntoskrnl.exe` fault location as driver attribution.
+Add `--refresh-symbols` only when the configured symbol path may be contacted; the report records
+whether DbgEng loaded PDB-backed symbols or only has module-level metadata.
+
 ## Common replay workflow
 
 Start or reuse the local daemon:
@@ -529,9 +545,9 @@ In envelope mode, successful commands return `{ "schema_version": 1, "ok": true,
 
 ## Symbol path environment
 
-TTD replay and every DbgEng live-launch, live-attach, and dump session honor the standard Windows symbol environment. Explicit TTD `--symbol-path` values take precedence; otherwise `_NT_SYMBOL_PATH` is searched first, then `_NT_ALT_SYMBOL_PATH`. TTD `--symcache-dir` takes precedence over `_NT_SYMCACHE_PATH`.
+TTD replay and every DbgEng live-launch, live-attach, and dump session honor local symbol directories from the standard Windows symbol environment. windbg-tool never adds an `srv*` path or loads `symsrv.dll`.
 
-If no selected path includes the Microsoft public symbol server, windbg-tool appends `srv*<cache>*https://msdl.microsoft.com/download/symbols`. The default cache directories are `.ttd-symbol-cache` for TTD and `.windbg-symbol-cache` for DbgEng. DbgEng target summaries and `live launch` results expose the final `symbol_path`.
+`dump inspect`, `dump triage`, and daemon-backed `dump open` use the Rust-native symbol client by default. They prefer matching `--image-path` and host-local module images, then use the Microsoft Symbol Server HTTPS image-store format to cache a missing exact PE image under `.windbg-symbol-cache`. Every downloaded image is bounded, atomically cached, and validated against the dump module timestamp and image size before its CodeView PDB is resolved. DbgEng receives only direct local PDB and image directories and is forced to reload. Use `--symbol-cache <path>` to choose the cache or `--offline` as a hard no-network mode; an offline image/PDB cache miss is reported explicitly. The JSON response records image and PDB identity, cache, download, validation, and forced-reload status.
 
 Structured error codes use stable exit codes:
 
@@ -572,7 +588,7 @@ The schema includes curated metadata where available and inferred metadata for o
 | Inspect runtime state | `registers`, `register-context`, `active-threads`, `command-line`, `architecture state` |
 | Inspect code and memory | `disasm`, `memory read`, `memory dump`, `memory strings`, `memory dps`, `memory classify`, `memory chase`, `object vtable` |
 | Symbol and source triage | `symbols doctor`, `symbols diagnose`, `symbols inspect`, `symbols exports`, `symbols nearest`, `source resolve` |
-| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `live startup-profile`, `live startup-report`, `dump create`, `dump open`, `dump inspect`, `target event`, `target thread`, `target dump`, `windbg status` |
+| WinDbg, live, dump, and remote helpers | `remote explain`, `remote doctor`, `remote status`, `remote plan`, `remote server-command`, `remote connect-command`, `dbgeng server`, `live capabilities`, `live startup-break`, `live startup-profile`, `live startup-report`, `dump create`, `dump open`, `dump inspect`, `dump triage`, `target event`, `target thread`, `target dump`, `windbg status` |
 
 ## Useful non-replay commands
 

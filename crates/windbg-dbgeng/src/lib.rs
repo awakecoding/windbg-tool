@@ -21,7 +21,6 @@ pub use coreclr_dac::{
     CoreClrDacBridge, ManagedCodeAvailability, ManagedMethodInfo, ManagedRuntimeInfo,
 };
 
-pub const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
 pub const NT_SYMBOL_PATH_ENV: &str = "_NT_SYMBOL_PATH";
 pub const NT_ALT_SYMBOL_PATH_ENV: &str = "_NT_ALT_SYMBOL_PATH";
 pub const NT_SYMCACHE_PATH_ENV: &str = "_NT_SYMCACHE_PATH";
@@ -94,17 +93,7 @@ pub fn resolve_dbgeng_symbol_path_with_environment(
     let symbol_cache_dir = environment
         .symcache_dir
         .unwrap_or_else(|| default_cache_dir.to_path_buf());
-    let mut paths = environment.symbol_path.into_iter().collect::<Vec<_>>();
-    if !paths
-        .iter()
-        .any(|path| path.contains(MICROSOFT_SYMBOL_SERVER))
-    {
-        paths.push(format!(
-            "srv*{}*{}",
-            symbol_cache_dir.to_string_lossy(),
-            MICROSOFT_SYMBOL_SERVER
-        ));
-    }
+    let paths = environment.symbol_path.into_iter().collect::<Vec<_>>();
     ResolvedDbgEngSymbolPath {
         symbol_path: paths.join(";"),
         symbol_cache_dir,
@@ -425,6 +414,97 @@ pub struct CoreRegisterState {
     pub instruction_offset: Option<u64>,
     pub stack_offset: Option<u64>,
     pub frame_offset: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BugCheckData {
+    pub code: u32,
+    pub parameters: [u64; 4],
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BugCheckDataResult {
+    pub status: String,
+    pub data: Option<BugCheckData>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StackTraceResult {
+    pub requested_frames: u32,
+    pub returned_frames: u32,
+    pub valid_frames: u32,
+    pub status: String,
+    pub stop_reason: Option<String>,
+    pub frames: Vec<StackFrameInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64ExceptionRegisters {
+    pub rax: u64,
+    pub rbx: u64,
+    pub rcx: u64,
+    pub rdx: u64,
+    pub rsi: u64,
+    pub rdi: u64,
+    pub rbp: u64,
+    pub rsp: u64,
+    pub r8: u64,
+    pub r9: u64,
+    pub r10: u64,
+    pub r11: u64,
+    pub r12: u64,
+    pub r13: u64,
+    pub r14: u64,
+    pub r15: u64,
+    pub rip: u64,
+    pub eflags: u32,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64ExceptionContext {
+    pub status: String,
+    pub context_record_address: u64,
+    pub requested_size: u32,
+    pub bytes_read: u32,
+    pub complete: bool,
+    pub context_flags: Option<u32>,
+    pub registers: Option<X64ExceptionRegisters>,
+    pub stack: Option<StackTraceResult>,
+    pub detail: String,
+}
+
+const X64_CONTEXT_SIZE: u32 = 0x4D0;
+const CONTEXT_AMD64_FLAG: u32 = 0x0010_0000;
+const CONTEXT_X64_REQUIRED_REGISTER_FLAGS: u32 = CONTEXT_AMD64_FLAG | 0x0000_0003;
+
+// The dump target's architecture can differ from the host build architecture. Keep this prefix
+// independent of windows::CONTEXT so ARM64 builds can decode an AMD64 dump safely.
+#[repr(C)]
+struct X64ContextPrefix {
+    _homes: [u64; 6],
+    context_flags: u32,
+    _mxcsr: u32,
+    _segments: [u16; 6],
+    eflags: u32,
+    _debug_registers: [u64; 6],
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rsp: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rip: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1188,6 +1268,37 @@ impl DebuggerSession {
         })
     }
 
+    pub fn bugcheck_data(&self) -> BugCheckDataResult {
+        let mut code = 0u32;
+        let mut parameters = [0u64; 4];
+        let result = unsafe {
+            self.control.ReadBugCheckData(
+                &mut code,
+                &mut parameters[0],
+                &mut parameters[1],
+                &mut parameters[2],
+                &mut parameters[3],
+            )
+        };
+        match result {
+            Ok(()) if code != 0 => BugCheckDataResult {
+                status: "captured".to_string(),
+                data: Some(BugCheckData { code, parameters }),
+                detail: "DbgEng returned the target bugcheck code and four parameters.".to_string(),
+            },
+            Ok(()) => BugCheckDataResult {
+                status: "not_present".to_string(),
+                data: None,
+                detail: "DbgEng reported no bugcheck data for the current target.".to_string(),
+            },
+            Err(error) => BugCheckDataResult {
+                status: "unavailable".to_string(),
+                data: None,
+                detail: format!("DbgEng ReadBugCheckData failed: {error}"),
+            },
+        }
+    }
+
     pub fn read_memory(&self, address: u64, size: u32) -> anyhow::Result<MemoryReadResult> {
         let mut buffer = vec![0u8; size as usize];
         let mut bytes_read = 0u32;
@@ -1207,6 +1318,122 @@ impl DebuggerSession {
             complete: bytes_read == size,
             data: encode_hex(&buffer),
         })
+    }
+
+    pub fn x64_exception_context(
+        &self,
+        context_record_address: u64,
+        max_frames: u32,
+    ) -> X64ExceptionContext {
+        let requested_size = X64_CONTEXT_SIZE;
+        let mut buffer = vec![0u8; requested_size as usize];
+        let mut bytes_read = 0u32;
+        let read_result = unsafe {
+            self.data_spaces.ReadVirtual(
+                context_record_address,
+                buffer.as_mut_ptr() as _,
+                requested_size,
+                Some(&mut bytes_read),
+            )
+        };
+        if let Err(error) = read_result {
+            return X64ExceptionContext {
+                status: "unavailable".to_string(),
+                context_record_address,
+                requested_size,
+                bytes_read,
+                complete: false,
+                context_flags: None,
+                registers: None,
+                stack: None,
+                detail: format!(
+                    "DbgEng could not read the x64 exception context at 0x{context_record_address:X}: {error}"
+                ),
+            };
+        }
+        if bytes_read < requested_size {
+            return X64ExceptionContext {
+                status: "partial".to_string(),
+                context_record_address,
+                requested_size,
+                bytes_read,
+                complete: false,
+                context_flags: None,
+                registers: None,
+                stack: None,
+                detail: format!(
+                    "The dump contains only {bytes_read} of {requested_size} bytes for the x64 CONTEXT record."
+                ),
+            };
+        }
+
+        // The target CONTEXT is read from a byte buffer, which is not guaranteed to be naturally aligned.
+        let context =
+            unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<X64ContextPrefix>()) };
+        let context_flags = context.context_flags;
+        if context_flags & CONTEXT_X64_REQUIRED_REGISTER_FLAGS
+            != CONTEXT_X64_REQUIRED_REGISTER_FLAGS
+        {
+            return X64ExceptionContext {
+                status: "invalid".to_string(),
+                context_record_address,
+                requested_size,
+                bytes_read,
+                complete: true,
+                context_flags: Some(context_flags),
+                registers: None,
+                stack: None,
+                detail: "The complete context record does not contain the AMD64 control and integer register groups required for register or stack decoding.".to_string(),
+            };
+        }
+        let registers = X64ExceptionRegisters {
+            rax: context.rax,
+            rbx: context.rbx,
+            rcx: context.rcx,
+            rdx: context.rdx,
+            rsi: context.rsi,
+            rdi: context.rdi,
+            rbp: context.rbp,
+            rsp: context.rsp,
+            r8: context.r8,
+            r9: context.r9,
+            r10: context.r10,
+            r11: context.r11,
+            r12: context.r12,
+            r13: context.r13,
+            r14: context.r14,
+            r15: context.r15,
+            rip: context.rip,
+            eflags: context.eflags,
+        };
+        let stack =
+            self.stack_trace_from_offsets(registers.rbp, registers.rsp, registers.rip, max_frames);
+        let (status, detail) = match &stack {
+            Ok(result) => (
+                "captured".to_string(),
+                format!(
+                    "Decoded an x64 CONTEXT record and captured a {} stack walk.",
+                    result.status
+                ),
+            ),
+            Err(error) => (
+                "context_captured_stack_unavailable".to_string(),
+                format!(
+                    "Decoded an x64 CONTEXT record, but DbgEng could not walk its stack: {error}"
+                ),
+            ),
+        };
+        X64ExceptionContext {
+            status,
+            context_record_address,
+            requested_size,
+            bytes_read,
+            complete: true,
+            context_flags: Some(context_flags),
+            registers: Some(registers),
+            stack: stack.ok(),
+            detail,
+        }
     }
 
     pub fn virtual_memory_map(&self, region_limit: u32) -> anyhow::Result<VirtualMemoryMap> {
@@ -1553,6 +1780,55 @@ impl DebuggerSession {
             .collect())
     }
 
+    pub fn refresh_symbols(&self, module_name: &str) -> anyhow::Result<()> {
+        ensure!(
+            !module_name.is_empty()
+                && module_name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')),
+            "symbol refresh module name must be a non-empty basename"
+        );
+        self.execute_command(&format!(".reload /f {module_name}"))
+    }
+
+    pub fn configure_local_symbol_paths(
+        &self,
+        symbol_directories: &[PathBuf],
+        image_directories: &[PathBuf],
+    ) -> anyhow::Result<()> {
+        use windows::core::PCWSTR;
+
+        for path in symbol_directories {
+            ensure!(
+                !path.to_string_lossy().to_ascii_lowercase().contains("srv*"),
+                "DbgEng local symbol paths must not contain a symbol-server expression"
+            );
+        }
+        let symbol_path = symbol_directories
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(";");
+        let image_path = image_directories
+            .iter()
+            .map(|path| path.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(";");
+        let mut symbol_path_wide = symbol_path.encode_utf16().collect::<Vec<_>>();
+        symbol_path_wide.push(0);
+        let mut image_path_wide = image_path.encode_utf16().collect::<Vec<_>>();
+        image_path_wide.push(0);
+        unsafe {
+            self.symbols
+                .SetSymbolPathWide(PCWSTR(symbol_path_wide.as_ptr()))
+                .context("setting DbgEng local symbol path")?;
+            self.symbols
+                .SetImagePathWide(PCWSTR(image_path_wide.as_ptr()))
+                .context("setting DbgEng local image path")?;
+        }
+        Ok(())
+    }
+
     pub fn symbol_entry_range_by_offset(&self, address: u64) -> anyhow::Result<SymbolEntryRange> {
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
             DEBUG_MODULE_AND_ID, DEBUG_OFFSET_REGION, DEBUG_SYMBOL_ENTRY,
@@ -1682,6 +1958,32 @@ impl DebuggerSession {
         let frame_offset = registers.frame_offset.unwrap_or(0);
         let stack_offset = registers.stack_offset.unwrap_or(0);
         let instruction_offset = registers.instruction_offset.unwrap_or(0);
+        Ok(self
+            .stack_trace_from_offsets(frame_offset, stack_offset, instruction_offset, max_frames)?
+            .frames)
+    }
+
+    pub fn stack_trace_result(&self, max_frames: u32) -> anyhow::Result<StackTraceResult> {
+        let registers = self.core_registers()?;
+        self.stack_trace_from_offsets(
+            registers.frame_offset.unwrap_or(0),
+            registers.stack_offset.unwrap_or(0),
+            registers.instruction_offset.unwrap_or(0),
+            max_frames,
+        )
+    }
+
+    fn stack_trace_from_offsets(
+        &self,
+        frame_offset: u64,
+        stack_offset: u64,
+        instruction_offset: u64,
+        max_frames: u32,
+    ) -> anyhow::Result<StackTraceResult> {
+        ensure!(
+            max_frames > 0,
+            "DbgEng stack walking requires at least one requested frame"
+        );
         let mut frames = vec![
             windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STACK_FRAME::default();
             max_frames as usize
@@ -1697,7 +1999,7 @@ impl DebuggerSession {
             )?;
         }
         frames.truncate(filled as usize);
-        Ok(frames
+        let frames = frames
             .into_iter()
             .map(|frame| StackFrameInfo {
                 instruction_offset: frame.InstructionOffset,
@@ -1716,7 +2018,42 @@ impl DebuggerSession {
                     .ok()
                     .flatten(),
             })
-            .collect())
+            .collect::<Vec<_>>();
+        let first_invalid = frames.iter().find(|frame| {
+            frame.instruction_offset == 0
+                || self
+                    .module_by_offset(frame.instruction_offset)
+                    .ok()
+                    .flatten()
+                    .is_none()
+        });
+        let valid_frames = match first_invalid {
+            Some(frame) => frame.frame_number,
+            None => frames.len() as u32,
+        };
+        let stop_reason = first_invalid.map(|frame| {
+            format!(
+                "frame {} has an instruction offset not mapped to a loaded module: 0x{:X}",
+                frame.frame_number, frame.instruction_offset
+            )
+        });
+        let status = if frames.is_empty() {
+            "empty"
+        } else if stop_reason.is_some() {
+            "invalid_frame"
+        } else if filled == max_frames {
+            "frame_limit_reached"
+        } else {
+            "captured"
+        };
+        Ok(StackTraceResult {
+            requested_frames: max_frames,
+            returned_frames: filled,
+            valid_frames,
+            status: status.to_string(),
+            stop_reason,
+            frames,
+        })
     }
 
     pub fn thread_context(
@@ -2517,6 +2854,13 @@ fn configure_dbgeng_symbol_path(
     use windows::core::PCWSTR;
 
     let symbol_config = resolve_dbgeng_symbol_path();
+    ensure!(
+        !symbol_config
+            .symbol_path
+            .to_ascii_lowercase()
+            .contains("srv*"),
+        "DbgEng symbol-server paths are disabled; use windbg-tool's Rust-native symbol prefetch instead"
+    );
     let mut symbol_path = symbol_config.symbol_path.encode_utf16().collect::<Vec<_>>();
     symbol_path.push(0);
     unsafe {
@@ -2845,16 +3189,23 @@ mod tests {
     }
 
     #[test]
+    fn x64_context_prefix_matches_the_documented_register_offset() {
+        assert_eq!(std::mem::size_of::<X64ContextPrefix>(), 0x100);
+        assert_eq!(X64_CONTEXT_SIZE, 0x4D0);
+        assert_eq!(CONTEXT_X64_REQUIRED_REGISTER_FLAGS, 0x0010_0003);
+    }
+
+    #[test]
     fn standard_symbol_environment_preserves_windows_search_order() {
         let environment = StandardSymbolEnvironment::from_values(
-            Some("srv*C:\\primary*https://symbols.example.test".to_string()),
+            Some("C:\\primary-symbols".to_string()),
             Some("C:\\alternate-symbols".to_string()),
             Some(PathBuf::from("C:\\symbol-cache")),
         );
 
         assert_eq!(
             environment.symbol_path.as_deref(),
-            Some("srv*C:\\primary*https://symbols.example.test;C:\\alternate-symbols")
+            Some("C:\\primary-symbols;C:\\alternate-symbols")
         );
         assert_eq!(
             environment.symcache_dir,
@@ -2863,7 +3214,7 @@ mod tests {
     }
 
     #[test]
-    fn dbgeng_symbol_path_appends_public_server_using_environment_cache() {
+    fn dbgeng_symbol_path_does_not_add_a_symbol_server() {
         let resolved = resolve_dbgeng_symbol_path_with_environment(
             StandardSymbolEnvironment::from_values(
                 Some("C:\\private-symbols".to_string()),
@@ -2875,29 +3226,23 @@ mod tests {
 
         assert_eq!(
             resolved.symbol_path,
-            "C:\\private-symbols;C:\\alternate-symbols;srv*C:\\symbol-cache*https://msdl.microsoft.com/download/symbols"
+            "C:\\private-symbols;C:\\alternate-symbols"
         );
         assert_eq!(resolved.symbol_cache_dir, PathBuf::from("C:\\symbol-cache"));
     }
 
     #[test]
-    fn dbgeng_symbol_path_does_not_duplicate_public_server() {
+    fn dbgeng_symbol_path_preserves_explicit_caller_configuration() {
         let resolved = resolve_dbgeng_symbol_path_with_environment(
             StandardSymbolEnvironment::from_values(
-                Some(format!("srv*C:\\cache*{MICROSOFT_SYMBOL_SERVER}")),
+                Some("C:\\caller-symbols".to_string()),
                 None,
                 Some(PathBuf::from("C:\\unused-cache")),
             ),
             Path::new("unused-cache"),
         );
 
-        assert_eq!(
-            resolved
-                .symbol_path
-                .matches(MICROSOFT_SYMBOL_SERVER)
-                .count(),
-            1
-        );
+        assert_eq!(resolved.symbol_path, "C:\\caller-symbols");
     }
 
     #[test]

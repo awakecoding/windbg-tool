@@ -21,6 +21,10 @@ use windbg_dbgeng::{
     ProcessServerOptions,
 };
 use windbg_install::WindbgManager;
+use windbg_symbols::{
+    image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
+    NativeSymbolStatus, PeImageIdentity,
+};
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
@@ -4533,17 +4537,679 @@ pub(super) fn run_dump_inspect(
     args: DumpInspectArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
-    let session = open_dump_session(DumpOpenOptions { path: args.path })?;
+    let session = open_dump_session(DumpOpenOptions {
+        path: args.path.clone(),
+    })?;
+    let target = session.summary();
+    let modules = session.modules()?;
+    let bugcheck = session.bugcheck_data();
+    let native_symbols = prepare_dump_native_symbols(
+        &session,
+        &modules,
+        &bugcheck,
+        &args.symbol_cache,
+        &args.image_path,
+        args.offline,
+    );
+    let threads = session.threads()?;
+    let registers = session.core_registers()?;
+    let stack = session.stack_trace_result(args.max_frames)?;
+    let triage = dump_triage_value(
+        &session,
+        &target,
+        &modules,
+        &bugcheck,
+        &stack,
+        args.max_frames,
+        args.refresh_symbols,
+        native_symbols,
+    );
     print_value(
         json!({
-            "target": session.summary(),
-            "modules": session.modules()?,
-            "threads": session.threads()?,
-            "registers": session.core_registers()?,
-            "frames": session.stack_trace(args.max_frames)?,
+            "target": target,
+            "modules": modules,
+            "threads": threads,
+            "registers": registers,
+            "frames": stack.frames,
+            "triage": triage,
         }),
         output,
     )
+}
+
+fn prepare_dump_native_symbols(
+    session: &DebuggerSession,
+    _modules: &[ModuleInfo],
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    cache_dir: &Path,
+    extra_image_paths: &[PathBuf],
+    offline: bool,
+) -> Value {
+    let fault_address = bugcheck
+        .data
+        .as_ref()
+        .and_then(|data| (data.code == 0x0000_003B).then_some(data.parameters[1]))
+        .or_else(|| {
+            session
+                .core_registers()
+                .ok()
+                .and_then(|registers| registers.instruction_offset)
+        });
+    let Some(fault_address) = fault_address else {
+        return json!({
+            "status": "not_applicable",
+            "detail": "The dump did not provide a fault address or current instruction for native symbol prefetch.",
+            "offline": offline,
+            "cache_dir": cache_dir,
+        });
+    };
+    let Some(module) = session.module_by_offset(fault_address).ok().flatten() else {
+        return json!({
+            "status": "unavailable",
+            "detail": "DbgEng could not map the fault address to a module for native symbol prefetch.",
+            "offline": offline,
+            "cache_dir": cache_dir,
+        });
+    };
+    let Some(parameters) = session
+        .module_parameters(&[module.base_address])
+        .ok()
+        .and_then(|mut values| values.pop())
+    else {
+        return json!({
+            "status": "unavailable",
+            "module": module,
+            "detail": "DbgEng did not provide module timestamp and image-size data needed to validate a host image.",
+            "offline": offline,
+            "cache_dir": cache_dir,
+        });
+    };
+    let image_roots = dump_image_roots(extra_image_paths);
+    let image_names = [
+        module.image_name.as_deref(),
+        module.loaded_image_name.as_deref(),
+        module.symbol_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|name| Path::new(name).file_name())
+    .collect::<BTreeSet<_>>();
+    let Some(image_name) = image_names.iter().next().and_then(|name| name.to_str()) else {
+        return json!({
+            "status": "unavailable",
+            "module": module,
+            "module_parameters": parameters,
+            "detail": "DbgEng did not provide a usable module image filename for native prefetch.",
+            "offline": offline,
+            "cache_dir": cache_dir,
+        });
+    };
+    let expected_image = match PeImageIdentity::new(
+        image_name,
+        parameters.time_date_stamp,
+        parameters.image_size,
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "module": module,
+                "module_parameters": parameters,
+                "detail": format!("The dump module image identity was invalid: {error:#}"),
+                "offline": offline,
+                "cache_dir": cache_dir,
+            });
+        }
+    };
+
+    let mut rejected = Vec::new();
+    let mut selected_image = None;
+    for root in &image_roots {
+        for name in &image_names {
+            let image_path = root.join(name);
+            if !image_path.is_file() {
+                continue;
+            }
+            match image_matches(&image_path, &expected_image) {
+                Ok(true) => {
+                    selected_image = Some((
+                        image_path,
+                        json!({
+                            "status": NativeImageStatus::Local,
+                            "detail": "Used the caller-provided or host-local image after validating its timestamp and SizeOfImage."
+                        }),
+                    ));
+                    break;
+                }
+                Ok(false) => match inspect_pe_image_identity(&image_path) {
+                    Ok(identity) => rejected.push(json!({
+                    "image_path": image_path,
+                    "status": "mismatch",
+                    "observed_timestamp": identity.image_timestamp,
+                    "expected_timestamp": parameters.time_date_stamp,
+                    "observed_image_size": identity.image_size,
+                    "expected_image_size": parameters.image_size,
+                    })),
+                    Err(error) => rejected.push(json!({
+                        "image_path": image_path,
+                        "status": "unreadable",
+                        "detail": format!("{error:#}"),
+                    })),
+                },
+                Err(error) => rejected.push(json!({
+                    "image_path": image_path,
+                    "status": "unreadable",
+                    "detail": format!("{error:#}"),
+                })),
+            }
+        }
+        if selected_image.is_some() {
+            break;
+        }
+    }
+    let (image_path, image_prefetch) = match selected_image {
+        Some(selected) => selected,
+        None => match prefetch_image(expected_image, cache_dir, offline) {
+            Ok(image) => match image.image_path.clone() {
+                Some(path) => (path, json!(image)),
+                None => {
+                    return json!({
+                        "status": match image.status {
+                            NativeImageStatus::OfflineMissing => "offline_image_missing",
+                            NativeImageStatus::Unavailable => "unavailable",
+                            _ => "image_not_found",
+                        },
+                        "module": module,
+                        "module_parameters": parameters,
+                        "image_prefetch": image,
+                        "cache_dir": cache_dir,
+                        "offline": offline,
+                        "image_search_paths": image_roots,
+                        "rejected_images": rejected,
+                    });
+                }
+            },
+            Err(error) => {
+                return json!({
+                    "status": "failed",
+                    "module": module,
+                    "module_parameters": parameters,
+                    "cache_dir": cache_dir,
+                    "offline": offline,
+                    "image_search_paths": image_roots,
+                    "rejected_images": rejected,
+                    "detail": format!("Rust-native image prefetch failed: {error:#}"),
+                });
+            }
+        },
+    };
+    let image_directory = image_path
+        .parent()
+        .expect("validated PE image path has a parent")
+        .to_path_buf();
+    let prefetch = match prefetch_pdb(&image_path, cache_dir, offline) {
+        Ok(result) => result,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "module": module,
+                "image_path": image_path,
+                "image_prefetch": image_prefetch,
+                "cache_dir": cache_dir,
+                "offline": offline,
+                "detail": format!("Rust-native PDB prefetch failed: {error:#}"),
+            });
+        }
+    };
+    let Some(pdb_path) = prefetch.pdb_path.as_ref() else {
+        return json!({
+            "status": prefetch.status,
+            "module": module,
+            "image_path": image_path,
+            "image_prefetch": image_prefetch,
+            "prefetch": prefetch,
+            "offline": offline,
+        });
+    };
+    let pdb_directory = pdb_path
+        .parent()
+        .expect("PDB cache path has a parent")
+        .to_path_buf();
+    let configure =
+        session.configure_local_symbol_paths(&[pdb_directory.clone()], &[image_directory.clone()]);
+    let reload = configure.and_then(|()| {
+        module
+            .module_name
+            .as_deref()
+            .context("DbgEng did not provide a fault-module name for forced local reload")
+            .and_then(|name| session.refresh_symbols(name))
+    });
+    let resolved_symbol = reload
+        .as_ref()
+        .ok()
+        .and_then(|()| session.symbol_by_offset(fault_address).ok().flatten());
+    json!({
+        "status": match prefetch.status {
+            NativeSymbolStatus::Cached => "configured_from_cache",
+            NativeSymbolStatus::Downloaded => "downloaded_and_configured",
+            NativeSymbolStatus::OfflineMissing => "offline_missing",
+            NativeSymbolStatus::Unavailable => "unavailable",
+        },
+        "module": module,
+        "module_parameters": parameters,
+        "image_path": image_path,
+        "image_prefetch": image_prefetch,
+        "pdb_directory": pdb_directory,
+        "prefetch": prefetch,
+        "forced_reload": match reload {
+            Ok(()) => json!({"status": "loaded"}),
+            Err(error) => json!({"status": "failed", "detail": format!("{error:#}")}),
+        },
+        "resolved_fault_symbol": resolved_symbol,
+        "offline": offline,
+    })
+}
+
+fn dump_image_roots(extra_image_paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = extra_image_paths.to_vec();
+    if let Some(system_root) = env::var_os("SystemRoot").map(PathBuf::from) {
+        roots.push(system_root.join("System32"));
+        roots.push(system_root.join("System32").join("drivers"));
+    }
+    let mut deduplicated = Vec::new();
+    for root in roots {
+        if !deduplicated.contains(&root) {
+            deduplicated.push(root);
+        }
+    }
+    deduplicated
+}
+
+fn dump_triage_value(
+    session: &DebuggerSession,
+    target: &windbg_dbgeng::DebuggerSessionSummary,
+    modules: &[ModuleInfo],
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    current_stack: &windbg_dbgeng::StackTraceResult,
+    max_frames: u32,
+    refresh_symbols: bool,
+    native_symbols: Value,
+) -> Value {
+    let bugcheck_data = bugcheck.data.as_ref();
+    let fault_address = bugcheck_data.and_then(|data| match data.code {
+        0x0000_003B => Some(data.parameters[1]),
+        _ => None,
+    });
+    let exception_context_address = bugcheck_data.and_then(|data| match data.code {
+        0x0000_003B => Some(data.parameters[2]),
+        _ => None,
+    });
+    let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
+    let exception_context = match (
+        target.processor_type,
+        exception_context_address,
+        bugcheck_data.map(|data| data.code),
+    ) {
+        (Some(0x8664), Some(address), Some(0x0000_003B)) => {
+            Some(serde_json::to_value(session.x64_exception_context(address, max_frames))
+                .unwrap_or_else(|error| {
+                    json!({
+                        "status": "serialization_error",
+                        "detail": format!("Could not serialize decoded x64 exception context: {error}"),
+                    })
+                }))
+        }
+        (_, Some(address), Some(0x0000_003B)) => Some(json!({
+            "status": "architecture_unsupported",
+            "context_record_address": address,
+            "detail": "The exception context is present, but x64 decoding is only implemented for AMD64 dump targets.",
+        })),
+        _ => None,
+    };
+    let symbol_modules = dump_symbol_modules(session, fault_address, &exception_context);
+    let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, refresh_symbols);
+    let driver_evidence = dump_driver_evidence(
+        session,
+        modules,
+        fault_address,
+        current_stack,
+        &exception_context,
+    );
+
+    json!({
+        "bugcheck": dump_bugcheck_value(bugcheck),
+        "fault": fault,
+        "exception_context": exception_context,
+        "current_stack": current_stack,
+        "symbol_readiness": symbol_readiness,
+        "native_symbol_prefetch": native_symbols,
+        "driver_evidence": driver_evidence,
+        "data_limits": dump_data_limits(target, current_stack, bugcheck, &fault, &exception_context),
+        "recommendations": dump_recommendations(bugcheck),
+    })
+}
+
+fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
+    let Some(data) = &bugcheck.data else {
+        return json!({
+            "status": bugcheck.status,
+            "detail": bugcheck.detail,
+        });
+    };
+    let name = match data.code {
+        0x0000_003B => "SYSTEM_SERVICE_EXCEPTION",
+        0x0000_0051 => "REGISTRY_ERROR",
+        _ => "UNKNOWN",
+    };
+    let parameter_roles = match data.code {
+        0x0000_003B => json!([
+            "exception_code",
+            "fault_instruction_address",
+            "exception_context_record_address",
+            "unused",
+        ]),
+        0x0000_0051 => json!([
+            "reserved",
+            "reserved",
+            "registry_hive_pointer_if_available",
+            "HvCheckHive_return_code_if_available",
+        ]),
+        _ => Value::Null,
+    };
+    json!({
+        "status": bugcheck.status,
+        "code": data.code,
+        "name": name,
+        "parameters": data.parameters,
+        "parameter_roles": parameter_roles,
+        "detail": bugcheck.detail,
+    })
+}
+
+fn dump_address_observation(
+    session: &DebuggerSession,
+    address: u64,
+    disassembly_count: u32,
+) -> Value {
+    let module = match session.module_by_offset(address) {
+        Ok(module) => serde_json::to_value(module).unwrap_or_else(|error| {
+            json!({
+                "status": "serialization_error",
+                "detail": format!("Could not serialize the module owning 0x{address:X}: {error}"),
+            })
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "detail": format!("DbgEng could not resolve the module owning 0x{address:X}: {error}"),
+        }),
+    };
+    let disassembly = match session.disassemble(Some(address), disassembly_count) {
+        Ok(disassembly) => serde_json::to_value(disassembly).unwrap_or_else(|error| {
+            json!({
+                "status": "serialization_error",
+                "detail": format!("Could not serialize disassembly at 0x{address:X}: {error}"),
+            })
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "detail": format!("The dump does not provide disassembly at 0x{address:X}: {error}"),
+        }),
+    };
+    json!({
+        "address": address,
+        "module": module,
+        "disassembly": disassembly,
+    })
+}
+
+fn dump_symbol_modules(
+    session: &DebuggerSession,
+    fault_address: Option<u64>,
+    exception_context: &Option<Value>,
+) -> Vec<ModuleInfo> {
+    let mut bases = BTreeSet::new();
+    let mut modules = Vec::new();
+    for address in [
+        fault_address,
+        exception_context
+            .as_ref()
+            .and_then(|context| context["registers"]["rip"].as_u64()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if let Ok(Some(module)) = session.module_by_offset(address) {
+            if bases.insert(module.base_address) {
+                modules.push(module);
+            }
+        }
+    }
+    modules
+}
+
+fn dump_symbol_readiness(
+    session: &DebuggerSession,
+    modules: &[ModuleInfo],
+    refresh_symbols: bool,
+) -> Value {
+    if modules.is_empty() {
+        return json!({
+            "status": "not_applicable",
+            "detail": "No observed fault or exception instruction could be mapped to a module.",
+            "modules": [],
+        });
+    }
+    let bases = modules
+        .iter()
+        .map(|module| module.base_address)
+        .collect::<Vec<_>>();
+    let refresh = if refresh_symbols {
+        modules
+            .iter()
+            .map(|module| {
+                let Some(module_name) = module.module_name.as_deref() else {
+                    return json!({
+                        "module_base": module.base_address,
+                        "status": "unavailable",
+                        "detail": "DbgEng did not provide a module basename for symbol reload.",
+                    });
+                };
+                match session.refresh_symbols(module_name) {
+                    Ok(()) => json!({
+                        "module": module_name,
+                        "status": "requested",
+                    }),
+                    Err(error) => json!({
+                        "module": module_name,
+                        "status": "failed",
+                        "detail": format!("DbgEng could not refresh symbols: {error}"),
+                    }),
+                }
+            })
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    match session.module_parameters(&bases) {
+        Ok(parameters) => json!({
+            "status": "captured",
+            "modules": modules,
+            "parameters": parameters,
+            "refresh": refresh,
+            "refresh_requested": refresh_symbols,
+            "detail": "DbgEng symbol types report the current readiness of fault-related modules. A module-only name is not function-level symbol resolution.",
+        }),
+        Err(error) => json!({
+            "status": "unavailable",
+            "modules": modules,
+            "refresh": refresh,
+            "refresh_requested": refresh_symbols,
+            "detail": format!("DbgEng could not query fault-module symbol readiness: {error}"),
+        }),
+    }
+}
+
+fn dump_driver_evidence(
+    session: &DebuggerSession,
+    modules: &[ModuleInfo],
+    fault_address: Option<u64>,
+    current_stack: &windbg_dbgeng::StackTraceResult,
+    exception_context: &Option<Value>,
+) -> Value {
+    let mut direct_modules = BTreeSet::new();
+    let mut stack_modules = BTreeSet::new();
+    let mut observations = Vec::new();
+
+    if let Some(address) = fault_address {
+        match session.module_by_offset(address) {
+            Ok(Some(module)) => {
+                direct_modules.insert(
+                    module
+                        .module_name
+                        .clone()
+                        .unwrap_or_else(|| "<unnamed>".to_string()),
+                );
+                observations.push(json!({
+                    "kind": "fault_instruction_module",
+                    "rank": if module.module_name.as_deref() == Some("nt") { "location_only" } else { "high" },
+                    "module": module,
+                    "detail": "The module owns the fault instruction. Kernel ownership alone is not root-cause attribution.",
+                }));
+            }
+            Ok(None) => observations.push(json!({
+                "kind": "fault_instruction_module",
+                "rank": "unavailable",
+                "detail": "No loaded module owns the fault instruction.",
+            })),
+            Err(error) => observations.push(json!({
+                "kind": "fault_instruction_module",
+                "rank": "unavailable",
+                "detail": format!("DbgEng could not map the fault instruction: {error}"),
+            })),
+        }
+    }
+
+    for frame in current_stack
+        .frames
+        .iter()
+        .take(current_stack.valid_frames as usize)
+    {
+        if let Ok(Some(module)) = session.module_by_offset(frame.instruction_offset) {
+            if module.module_name.as_deref() != Some("nt") {
+                stack_modules.insert(
+                    module
+                        .module_name
+                        .unwrap_or_else(|| "<unnamed>".to_string()),
+                );
+            }
+        }
+    }
+    if let Some(context) = exception_context.as_ref() {
+        let valid_frames = context["stack"]["valid_frames"].as_u64().unwrap_or(0) as usize;
+        if let Some(context_stack) = context["stack"]["frames"].as_array() {
+            for frame in context_stack.iter().take(valid_frames) {
+                if let Some(address) = frame["instruction_offset"].as_u64() {
+                    if let Ok(Some(module)) = session.module_by_offset(address) {
+                        if module.module_name.as_deref() != Some("nt") {
+                            stack_modules.insert(
+                                module
+                                    .module_name
+                                    .unwrap_or_else(|| "<unnamed>".to_string()),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    for module in stack_modules {
+        observations.push(json!({
+            "kind": "validated_stack_module",
+            "rank": "high",
+            "module": module,
+            "detail": "A non-kernel module appeared in a validated stack frame.",
+        }));
+    }
+
+    json!({
+        "status": if observations.iter().any(|item| item["rank"] == "high") {
+            "direct_evidence_present"
+        } else {
+            "no_driver_implicated"
+        },
+        "observations": observations,
+        "loaded_module_count": modules.len(),
+        "inventory_rank": "not_implicated",
+        "detail": format!(
+            "Loaded-module inventory is context only. {} direct fault-module observations were captured; dump-stack participants must not be treated as crash causes without a fault or stack reference.",
+            direct_modules.len()
+        ),
+    })
+}
+
+fn dump_data_limits(
+    target: &windbg_dbgeng::DebuggerSessionSummary,
+    current_stack: &windbg_dbgeng::StackTraceResult,
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    fault: &Option<Value>,
+    exception_context: &Option<Value>,
+) -> Value {
+    json!({
+        "target_kind": target.kind,
+        "bugcheck_data": bugcheck.status,
+        "fault_instruction": fault.as_ref().map_or("not_applicable", |fault| {
+            if fault["disassembly"]["status"].as_str() == Some("unavailable") {
+                "dump_content_missing_or_unavailable"
+            } else {
+                "captured"
+            }
+        }),
+        "exception_context": exception_context.as_ref().map_or("not_applicable", |context| {
+            context["status"].as_str().unwrap_or("unknown")
+        }),
+        "stack": {
+            "status": current_stack.status,
+            "returned_frames": current_stack.returned_frames,
+            "valid_frames": current_stack.valid_frames,
+            "stop_reason": current_stack.stop_reason,
+        },
+        "detail": "A missing or partial context/code page is a dump-content limit. A captured context with an invalid stack is reported separately as an unwind/result limit rather than an invented caller.",
+    })
+}
+
+fn dump_recommendations(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
+    let Some(data) = &bugcheck.data else {
+        return json!([{
+            "priority": "collect",
+            "detail": "Capture a kernel or complete dump if the next crash needs bugcheck-specific triage.",
+        }]);
+    };
+    match data.code {
+        0x0000_003B => json!([
+            {
+                "priority": "high",
+                "detail": "Use the captured exception context and fault instruction to identify a validated caller. If it remains unavailable, collect a kernel or complete dump.",
+            },
+            {
+                "priority": "medium",
+                "detail": "Treat a kernel-only fault location as possible data corruption until a driver appears in validated stack or bugcheck-driver evidence.",
+            },
+        ]),
+        0x0000_0051 => json!([
+            {
+                "priority": "high",
+                "detail": "Review storage, NTFS, and controller events around the crash; the registry hive pointer is evidence of registry failure, not a driver attribution.",
+            },
+            {
+                "priority": "medium",
+                "detail": "Use non-destructive disk health checks first, then collect a kernel or complete dump if the hive validation/caller evidence is absent.",
+            },
+        ]),
+        _ => json!([{
+            "priority": "collect",
+            "detail": "Use the typed bugcheck parameters, validated stack, symbols, and driver evidence before attributing a crash.",
+        }]),
+    }
 }
 
 fn cli_dump_kind(kind: CliDumpKind) -> DumpKind {
@@ -5787,5 +6453,55 @@ mod tests {
         assert_eq!(excluded.len(), 1);
         assert_eq!(excluded[0].start.index, 2);
         assert_eq!(excluded[0].end.index, 3);
+    }
+
+    #[test]
+    fn dump_triage_describes_system_service_exception_parameters() {
+        let value = dump_bugcheck_value(&windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(windbg_dbgeng::BugCheckData {
+                code: 0x3B,
+                parameters: [0xC000_0005, 0xFFFF_F800_A6D9_70B0, 0xFFFF_D100_8947_72F0, 0],
+            }),
+            detail: "fixture".to_string(),
+        });
+
+        assert_eq!(value["name"], "SYSTEM_SERVICE_EXCEPTION");
+        assert_eq!(value["parameter_roles"][0], "exception_code");
+        assert_eq!(
+            value["parameter_roles"][2],
+            "exception_context_record_address"
+        );
+        assert_eq!(
+            dump_recommendations(&windbg_dbgeng::BugCheckDataResult {
+                status: "captured".to_string(),
+                data: Some(windbg_dbgeng::BugCheckData {
+                    code: 0x3B,
+                    parameters: [0; 4],
+                }),
+                detail: "fixture".to_string(),
+            })[0]["priority"],
+            "high"
+        );
+    }
+
+    #[test]
+    fn dump_triage_keeps_registry_parameters_reserved() {
+        let value = dump_bugcheck_value(&windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(windbg_dbgeng::BugCheckData {
+                code: 0x51,
+                parameters: [0x21, 0xFFFF_FFFF_C000_0005, 0x1234, 0],
+            }),
+            detail: "fixture".to_string(),
+        });
+
+        assert_eq!(value["name"], "REGISTRY_ERROR");
+        assert_eq!(value["parameter_roles"][0], "reserved");
+        assert_eq!(value["parameter_roles"][1], "reserved");
+        assert_eq!(
+            value["parameter_roles"][2],
+            "registry_hive_pointer_if_available"
+        );
     }
 }

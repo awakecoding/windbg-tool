@@ -307,6 +307,10 @@ enum DumpCommand {
     Open(DumpOpenArgs),
     #[command(about = "Open and inspect a dump file without the daemon")]
     Inspect(DumpInspectArgs),
+    #[command(
+        about = "Produce structured bugcheck, context, stack, symbol, and driver triage for a dump"
+    )]
+    Triage(DumpInspectArgs),
     #[command(about = "Create a process dump from a live process id")]
     Create(DumpCreateArgs),
 }
@@ -1220,6 +1224,12 @@ struct LiveAttachArgs {
 #[derive(Debug, Args)]
 struct DumpOpenArgs {
     path: PathBuf,
+    #[arg(long, value_name = "PATH", default_value = ".windbg-symbol-cache")]
+    symbol_cache: PathBuf,
+    #[arg(long, value_name = "PATH")]
+    image_path: Vec<PathBuf>,
+    #[arg(long)]
+    offline: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1241,6 +1251,29 @@ struct DumpInspectArgs {
     path: PathBuf,
     #[arg(long, default_value_t = 8)]
     max_frames: u32,
+    #[arg(
+        long,
+        help = "Force a local DbgEng symbol reload after Rust-native prefetch"
+    )]
+    refresh_symbols: bool,
+    #[arg(
+        long,
+        value_name = "PATH",
+        default_value = ".windbg-symbol-cache",
+        help = "Rust-native symbol cache; DbgEng never treats this as an srv* path"
+    )]
+    symbol_cache: PathBuf,
+    #[arg(
+        long,
+        value_name = "PATH",
+        help = "Additional directory containing matching module images; repeat as needed"
+    )]
+    image_path: Vec<PathBuf>,
+    #[arg(
+        long,
+        help = "Do not download missing symbols; report cache misses explicitly"
+    )]
+    offline: bool,
 }
 
 #[derive(Debug, Args)]
@@ -4616,6 +4649,9 @@ async fn dump_open_and_print(
             name: "dump_open_session".to_string(),
             arguments: json!({
                 "path": args.path,
+                "symbol_cache": args.symbol_cache,
+                "image_paths": args.image_path,
+                "offline": args.offline,
             }),
         },
         output,
@@ -5351,6 +5387,9 @@ fn tool_command_map() -> Value {
         { "tool": "target_read_memory", "commands": ["target memory"] },
         { "tool": "target_memory_map", "commands": ["target memory-map"] },
         { "tool": "target_list_threads", "commands": ["target threads"] },
+        { "tool": "target_thread_accounting", "commands": ["target thread-accounting"] },
+        { "tool": "target_module_parameters", "commands": ["target module-parameters"] },
+        { "tool": "target_symbol_entry_range", "commands": ["target symbol-entry-range"] },
         { "tool": "target_list_modules", "commands": ["target modules"] },
         { "tool": "target_symbol_by_offset", "commands": ["target symbol"] },
         { "tool": "target_source_by_offset", "commands": ["target source"] },

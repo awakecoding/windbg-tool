@@ -137,7 +137,6 @@ jobs:
             'dbghelp.dll',
             'dbgmodel.dll',
             'msdia140.dll',
-            'symsrv.dll',
             'srcsrv.dll'
           )
 

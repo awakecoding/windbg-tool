@@ -80,7 +80,7 @@ Representative command areas:
 - Session and replay: `open`, `load`, `sessions`, `info`, `position set`, `step`, `replay to`
 - Agent workflow: `debug capabilities`, `debug snapshot`, `triage crash`, `symbols doctor`, `breakpoint plan`, `debug log summarize`
 - Analysis: `symbols diagnose`, `disasm`, `memory dump`, `memory strings`, `memory chase`, `stack recover`, `stack backtrace`
-- Platform helpers: `remote explain`, `remote doctor`, `remote plan`, `dbgeng server`, `live launch`, `dump create`, `dump inspect`, `windbg status`
+- Platform helpers: `remote explain`, `remote doctor`, `remote plan`, `dbgeng server`, `live launch`, `dump create`, `dump inspect`, `dump triage`, `windbg status`
 
 For a fuller CLI walkthrough, output-shaping flags, and command map, see [the CLI guide](docs/cli.md).
 

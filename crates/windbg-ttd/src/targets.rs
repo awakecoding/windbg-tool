@@ -1,8 +1,10 @@
 use anyhow::{bail, ensure, Context};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::env;
+use std::path::{Path, PathBuf};
 use windbg_dbgeng::{
     attach_live_session, launch_live_session, open_dump_session, BreakpointInfo, CoreRegisterState,
     DebuggerEventInfo, DebuggerExecutionStatus, DebuggerSession, DebuggerSessionKind,
@@ -12,6 +14,10 @@ use windbg_dbgeng::{
     StackFrameInfo, SymbolEntryRange, SymbolInfo, ThreadAccountingSnapshot, ThreadContext,
     ThreadInfo, VirtualMemoryMap, MAX_MODULE_PARAMETER_QUERIES, MAX_THREAD_ACCOUNTING_THREADS,
     MAX_VIRTUAL_MEMORY_MAP_REGIONS,
+};
+use windbg_symbols::{
+    image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
+    NativeSymbolStatus, PeImageIdentity,
 };
 
 pub type TargetId = u64;
@@ -24,6 +30,15 @@ pub struct TargetRegistry {
 
 struct ManagedTarget {
     session: DebuggerSession,
+    native_symbols: Value,
+    native_symbol_options: Option<NativeSymbolOptions>,
+}
+
+#[derive(Clone)]
+struct NativeSymbolOptions {
+    cache_dir: PathBuf,
+    image_paths: Vec<PathBuf>,
+    offline: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -45,6 +60,12 @@ pub struct LiveAttachRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct DumpOpenRequest {
     pub path: PathBuf,
+    #[serde(default = "default_native_symbol_cache")]
+    pub symbol_cache: PathBuf,
+    #[serde(default)]
+    pub image_paths: Vec<PathBuf>,
+    #[serde(default)]
+    pub offline: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -183,12 +204,14 @@ pub struct TargetBreakpointRemoveRequest {
 pub struct TargetOpenedResponse {
     pub target_id: TargetId,
     pub target: DebuggerSessionSummary,
+    pub native_symbols: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetSummary {
     pub target_id: TargetId,
     pub target: DebuggerSessionSummary,
+    pub native_symbols: Value,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -270,12 +293,14 @@ pub struct TargetModuleList {
 pub struct TargetSymbolResponse {
     pub target_id: TargetId,
     pub symbol: Option<SymbolInfo>,
+    pub native_symbols: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct TargetSourceResponse {
     pub target_id: TargetId,
     pub source: Option<SourceLocation>,
+    pub native_symbols: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -288,6 +313,7 @@ pub struct TargetStackTraceResponse {
 pub struct TargetDisassemblyResponse {
     pub target_id: TargetId,
     pub disassembly: DisassemblyResult,
+    pub native_symbols: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -323,6 +349,7 @@ impl TargetRegistry {
             .map(|(target_id, target)| TargetSummary {
                 target_id: *target_id,
                 target: target.session.summary(),
+                native_symbols: target.native_symbols.clone(),
             })
             .collect::<Vec<_>>();
         targets.sort_by_key(|target| target.target_id);
@@ -360,7 +387,7 @@ impl TargetRegistry {
                 LiveInitialStop::SoftwareBreakpoint
             },
         })?;
-        Ok(self.insert_target(session))
+        Ok(self.insert_target(session, Value::Null, None))
     }
 
     pub fn attach_live(
@@ -371,12 +398,24 @@ impl TargetRegistry {
             process_id: request.process_id,
             initial_break_timeout_ms: request.initial_break_timeout_ms,
         })?;
-        Ok(self.insert_target(session))
+        Ok(self.insert_target(session, Value::Null, None))
     }
 
     pub fn open_dump(&mut self, request: DumpOpenRequest) -> anyhow::Result<TargetOpenedResponse> {
         let session = open_dump_session(DumpOpenOptions { path: request.path })?;
-        Ok(self.insert_target(session))
+        let native_symbol_options = NativeSymbolOptions {
+            cache_dir: request.symbol_cache,
+            image_paths: request.image_paths,
+            offline: request.offline,
+        };
+        let native_symbols = prefetch_dump_symbols(
+            &session,
+            None,
+            &native_symbol_options.cache_dir,
+            &native_symbol_options.image_paths,
+            native_symbol_options.offline,
+        );
+        Ok(self.insert_target(session, native_symbols, Some(native_symbol_options)))
     }
 
     pub fn target_status(&self, request: TargetRequest) -> anyhow::Result<TargetSummary> {
@@ -384,6 +423,7 @@ impl TargetRegistry {
         Ok(TargetSummary {
             target_id: request.target_id,
             target: target.session.summary(),
+            native_symbols: target.native_symbols.clone(),
         })
     }
 
@@ -551,9 +591,11 @@ impl TargetRegistry {
         request: TargetAddressRequest,
     ) -> anyhow::Result<TargetSymbolResponse> {
         let target = self.target(request.target_id)?;
+        let native_symbols = prefetch_target_address(target, request.address);
         Ok(TargetSymbolResponse {
             target_id: request.target_id,
             symbol: target.session.symbol_by_offset(request.address)?,
+            native_symbols,
         })
     }
 
@@ -562,9 +604,11 @@ impl TargetRegistry {
         request: TargetAddressRequest,
     ) -> anyhow::Result<TargetSourceResponse> {
         let target = self.target(request.target_id)?;
+        let native_symbols = prefetch_target_address(target, request.address);
         Ok(TargetSourceResponse {
             target_id: request.target_id,
             source: target.session.source_by_offset(request.address)?,
+            native_symbols,
         })
     }
 
@@ -599,9 +643,13 @@ impl TargetRegistry {
         request: TargetDisassembleRequest,
     ) -> anyhow::Result<TargetDisassemblyResponse> {
         let target = self.target(request.target_id)?;
+        let native_symbols = request
+            .address
+            .and_then(|address| prefetch_target_address(target, address));
         Ok(TargetDisassemblyResponse {
             target_id: request.target_id,
             disassembly: target.session.disassemble(request.address, request.count)?,
+            native_symbols,
         })
     }
 
@@ -692,11 +740,27 @@ impl TargetRegistry {
         })
     }
 
-    fn insert_target(&mut self, session: DebuggerSession) -> TargetOpenedResponse {
+    fn insert_target(
+        &mut self,
+        session: DebuggerSession,
+        native_symbols: Value,
+        native_symbol_options: Option<NativeSymbolOptions>,
+    ) -> TargetOpenedResponse {
         let target_id = self.allocate_target_id();
         let target = session.summary();
-        self.targets.insert(target_id, ManagedTarget { session });
-        TargetOpenedResponse { target_id, target }
+        self.targets.insert(
+            target_id,
+            ManagedTarget {
+                session,
+                native_symbols: native_symbols.clone(),
+                native_symbol_options,
+            },
+        );
+        TargetOpenedResponse {
+            target_id,
+            target,
+            native_symbols,
+        }
     }
 
     fn allocate_target_id(&mut self) -> TargetId {
@@ -713,6 +777,258 @@ impl TargetRegistry {
 
 fn default_live_wait_timeout_ms() -> u32 {
     5000
+}
+
+fn default_native_symbol_cache() -> PathBuf {
+    PathBuf::from(".windbg-symbol-cache")
+}
+
+fn prefetch_target_address(target: &ManagedTarget, address: u64) -> Option<Value> {
+    target.native_symbol_options.as_ref().map(|options| {
+        prefetch_dump_symbols(
+            &target.session,
+            Some(address),
+            &options.cache_dir,
+            &options.image_paths,
+            options.offline,
+        )
+    })
+}
+
+fn prefetch_dump_symbols(
+    session: &DebuggerSession,
+    address_override: Option<u64>,
+    cache_dir: &PathBuf,
+    extra_image_paths: &[PathBuf],
+    offline: bool,
+) -> Value {
+    let fault_address = address_override.or_else(|| {
+        session
+            .bugcheck_data()
+            .data
+            .and_then(|data| (data.code == 0x0000_003B).then_some(data.parameters[1]))
+            .or_else(|| {
+                session
+                    .core_registers()
+                    .ok()
+                    .and_then(|registers| registers.instruction_offset)
+            })
+    });
+    let Some(fault_address) = fault_address else {
+        return json!({
+            "status": "not_applicable",
+            "detail": "No supported dump fault module was available for native symbol prefetch.",
+            "offline": offline,
+            "cache_dir": cache_dir,
+        });
+    };
+    let Some(module) = session.module_by_offset(fault_address).ok().flatten() else {
+        return json!({"status": "unavailable", "detail": "DbgEng could not map the fault address to a module."});
+    };
+    let Some(parameters) = session
+        .module_parameters(&[module.base_address])
+        .ok()
+        .and_then(|mut values| values.pop())
+    else {
+        return json!({"status": "unavailable", "module": module, "detail": "DbgEng did not provide module identity metadata."});
+    };
+    let mut roots = extra_image_paths.to_vec();
+    if let Some(system_root) = env::var_os("SystemRoot").map(PathBuf::from) {
+        roots.push(system_root.join("System32"));
+        roots.push(system_root.join("System32").join("drivers"));
+    }
+    let mut deduplicated_roots = Vec::new();
+    for root in roots {
+        if !deduplicated_roots.contains(&root) {
+            deduplicated_roots.push(root);
+        }
+    }
+    let mut image_names = Vec::new();
+    for name in [
+        module.image_name.as_deref(),
+        module.loaded_image_name.as_deref(),
+        module.symbol_file.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let Some(file_name) = Path::new(name).file_name().map(|name| name.to_owned()) else {
+            continue;
+        };
+        if !image_names.contains(&file_name) {
+            image_names.push(file_name);
+        }
+    }
+    let Some(image_name) = image_names.first().and_then(|name| name.to_str()) else {
+        return json!({
+            "status": "unavailable",
+            "module": module,
+            "module_parameters": parameters,
+            "detail": "DbgEng did not provide a usable module image filename for native prefetch.",
+            "offline": offline,
+            "cache_dir": cache_dir,
+        });
+    };
+    let expected_image = match PeImageIdentity::new(
+        image_name,
+        parameters.time_date_stamp,
+        parameters.image_size,
+    ) {
+        Ok(identity) => identity,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "module": module,
+                "module_parameters": parameters,
+                "detail": format!("The dump module image identity was invalid: {error:#}"),
+                "offline": offline,
+                "cache_dir": cache_dir,
+            });
+        }
+    };
+
+    let mut rejected = Vec::new();
+    let mut selected_image = None;
+    for root in &deduplicated_roots {
+        for name in &image_names {
+            let image_path = root.join(name);
+            if !image_path.is_file() {
+                continue;
+            }
+            match image_matches(&image_path, &expected_image) {
+                Ok(true) => {
+                    selected_image = Some((
+                        image_path,
+                        json!({
+                            "status": NativeImageStatus::Local,
+                            "detail": "Used the caller-provided or host-local image after validating its timestamp and SizeOfImage."
+                        }),
+                    ));
+                    break;
+                }
+                Ok(false) => match inspect_pe_image_identity(&image_path) {
+                    Ok(identity) => rejected.push(json!({
+                        "image_path": image_path,
+                        "status": "mismatch",
+                        "observed_timestamp": identity.image_timestamp,
+                        "expected_timestamp": parameters.time_date_stamp,
+                        "observed_image_size": identity.image_size,
+                        "expected_image_size": parameters.image_size,
+                    })),
+                    Err(error) => rejected.push(json!({
+                        "image_path": image_path,
+                        "status": "unreadable",
+                        "detail": format!("{error:#}"),
+                    })),
+                },
+                Err(error) => rejected.push(json!({
+                    "image_path": image_path,
+                    "status": "unreadable",
+                    "detail": format!("{error:#}"),
+                })),
+            }
+        }
+        if selected_image.is_some() {
+            break;
+        }
+    }
+    let (image_path, image_prefetch) = match selected_image {
+        Some(selected) => selected,
+        None => match prefetch_image(expected_image, cache_dir, offline) {
+            Ok(image) => match image.image_path.clone() {
+                Some(path) => (path, json!(image)),
+                None => {
+                    return json!({
+                        "status": match image.status {
+                            NativeImageStatus::OfflineMissing => "offline_image_missing",
+                            NativeImageStatus::Unavailable => "unavailable",
+                            _ => "image_not_found",
+                        },
+                        "module": module,
+                        "module_parameters": parameters,
+                        "image_prefetch": image,
+                        "cache_dir": cache_dir,
+                        "offline": offline,
+                        "image_search_paths": deduplicated_roots,
+                        "rejected_images": rejected,
+                    });
+                }
+            },
+            Err(error) => {
+                return json!({
+                    "status": "failed",
+                    "module": module,
+                    "module_parameters": parameters,
+                    "cache_dir": cache_dir,
+                    "offline": offline,
+                    "image_search_paths": deduplicated_roots,
+                    "rejected_images": rejected,
+                    "detail": format!("Rust-native image prefetch failed: {error:#}"),
+                });
+            }
+        },
+    };
+    let image_directory = image_path
+        .parent()
+        .expect("validated PE image path has a parent")
+        .to_path_buf();
+    let prefetch = match prefetch_pdb(&image_path, cache_dir, offline) {
+        Ok(result) => result,
+        Err(error) => {
+            return json!({
+                "status": "failed",
+                "module": module,
+                "image_path": image_path,
+                "image_prefetch": image_prefetch,
+                "cache_dir": cache_dir,
+                "offline": offline,
+                "detail": format!("Rust-native PDB prefetch failed: {error:#}"),
+            });
+        }
+    };
+    let Some(pdb_path) = prefetch.pdb_path.as_ref() else {
+        return json!({
+            "status": prefetch.status,
+            "module": module,
+            "image_path": image_path,
+            "image_prefetch": image_prefetch,
+            "prefetch": prefetch,
+            "offline": offline,
+        });
+    };
+    let pdb_dir = pdb_path
+        .parent()
+        .expect("PDB path has parent")
+        .to_path_buf();
+    let reload = session
+        .configure_local_symbol_paths(&[pdb_dir.clone()], &[image_directory])
+        .and_then(|()| {
+            module
+                .module_name
+                .as_deref()
+                .context("DbgEng did not provide a fault-module name")
+                .and_then(|name| session.refresh_symbols(name))
+        });
+    json!({
+        "status": match prefetch.status {
+            NativeSymbolStatus::Cached => "configured_from_cache",
+            NativeSymbolStatus::Downloaded => "downloaded_and_configured",
+            NativeSymbolStatus::OfflineMissing => "offline_missing",
+            NativeSymbolStatus::Unavailable => "unavailable",
+        },
+        "module": module,
+        "module_parameters": parameters,
+        "image_path": image_path,
+        "image_prefetch": image_prefetch,
+        "pdb_directory": pdb_dir,
+        "prefetch": prefetch,
+        "forced_reload": match reload {
+            Ok(()) => json!({"status": "loaded"}),
+            Err(error) => json!({"status": "failed", "detail": format!("{error:#}")}),
+        },
+        "resolved_fault_symbol": session.symbol_by_offset(fault_address).ok().flatten(),
+        "offline": offline,
+    })
 }
 
 const BREAK_READ: u32 = 1;

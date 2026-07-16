@@ -15,6 +15,7 @@ tokio.workspace = true
 tracing-subscriber.workspace = true
 windbg-dbgeng = { path = "..\\windbg-dbgeng" }
 windbg-install = { path = "..\\windbg-install" }
+windbg-symbols = { path = "..\\windbg-symbols" }
 windbg-ttd = { path = "..\\windbg-ttd" }
 
 [target.'cfg(windows)'.dependencies]

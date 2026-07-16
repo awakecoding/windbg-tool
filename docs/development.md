@@ -40,7 +40,7 @@ cargo xtask native-build
 `cargo xtask deps`:
 
 - restores native NuGet packages into `target\nuget`
-- stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` into `target\symbol-runtime`
+- stages `dbghelp.dll` and `srcsrv.dll` into `target\symbol-runtime`
 - stages DbgEng runtime DLLs into `target\dbgeng-runtime`
 - downloads `TTDReplay.dll` and `TTDReplayCPU.dll` into `target\ttd-runtime`
 
@@ -114,7 +114,6 @@ Native package restore is driven by `native\ttd-replay-bridge\packages.config`.
 Important packages:
 
 - `Microsoft.TimeTravelDebugging.Apis`
-- `Microsoft.Debugging.Platform.SymSrv`
 - `Microsoft.Debugging.Platform.SrcSrv`
 - `Microsoft.Debugging.Platform.DbgEng`
 
@@ -122,11 +121,7 @@ Runtime replay still depends on `TTDReplay.dll` and `TTDReplayCPU.dll` from the 
 
 ## Symbols
 
-When neither `_NT_SYMBOL_PATH` nor `_NT_ALT_SYMBOL_PATH` is set, the TTD replay default symbol path is equivalent to:
-
-```text
-srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
-```
+TTD replay and DbgEng use local symbol directories. Rust-native symbol retrieval uses the local `.ttd-symbol-cache` directory and does not stage or load `symsrv.dll`.
 
 The project keeps symbol/runtime setup repo-local and process-local. It does not write debugger registry keys or machine-wide symbol environment values. For TTD and DbgEng sessions, explicit paths take precedence over `_NT_SYMBOL_PATH`; `_NT_SYMBOL_PATH` is searched before `_NT_ALT_SYMBOL_PATH`; and explicit cache settings take precedence over `_NT_SYMCACHE_PATH`. If none sets a cache, TTD uses `.ttd-symbol-cache` and DbgEng uses `.windbg-symbol-cache`.
 

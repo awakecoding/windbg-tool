@@ -57,9 +57,7 @@ fn loads_ping_trace_fixture_and_exercises_cursor_path() -> anyhow::Result<()> {
     })?;
     assert_eq!(loaded.symbol_path, resolved_symbols.symbol_path);
     assert_eq!(loaded.symbols, resolved_symbols);
-    assert!(resolved_symbols
-        .symbol_path
-        .contains("https://msdl.microsoft.com/download/symbols"));
+    assert!(resolved_symbols.symbol_path.is_empty());
     assert!(resolved_symbols.has_image_path());
     assert_eq!(resolved_symbols.binary_path_count, 1);
     assert!(resolved_symbols.symbol_runtime_dir.is_some());

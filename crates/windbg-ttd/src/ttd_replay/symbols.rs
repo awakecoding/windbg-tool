@@ -1,7 +1,7 @@
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
-use windbg_dbgeng::{StandardSymbolEnvironment, MICROSOFT_SYMBOL_SERVER};
+use windbg_dbgeng::StandardSymbolEnvironment;
 
 const DEFAULT_SYMBOL_CACHE: &str = ".ttd-symbol-cache";
 const DEFAULT_SYMBOL_RUNTIME_DIR: &str = "target/symbol-runtime";
@@ -36,7 +36,7 @@ impl SymbolSettings {
         symbol_runtime_dir: Option<PathBuf>,
         environment: StandardSymbolEnvironment,
     ) -> ResolvedSymbolConfig {
-        let mut paths = if self.symbol_paths.is_empty() {
+        let paths = if self.symbol_paths.is_empty() {
             environment
                 .symbol_path
                 .map(|path| vec![path])
@@ -44,23 +44,11 @@ impl SymbolSettings {
         } else {
             self.symbol_paths.clone()
         };
-        let microsoft_public_symbols = paths
-            .iter()
-            .any(|path| path.contains(MICROSOFT_SYMBOL_SERVER));
-
         let symbol_cache_dir = self
             .symcache_dir
             .clone()
             .or(environment.symcache_dir)
             .unwrap_or_else(|| PathBuf::from(DEFAULT_SYMBOL_CACHE));
-
-        if !microsoft_public_symbols {
-            paths.push(format!(
-                "srv*{}*{}",
-                symbol_cache_dir.to_string_lossy(),
-                MICROSOFT_SYMBOL_SERVER
-            ));
-        }
 
         ResolvedSymbolConfig {
             symbol_path: paths.join(";"),
@@ -73,7 +61,7 @@ impl SymbolSettings {
             symbol_cache_dir,
             symbol_runtime_dir,
             binary_path_count: self.binary_paths.len(),
-            microsoft_public_symbols: true,
+            microsoft_public_symbols: false,
         }
     }
 }
@@ -105,7 +93,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn builds_default_symbol_path() {
+    fn default_symbol_path_does_not_add_a_symbol_server() {
         let settings = SymbolSettings::default();
         assert!(settings
             .resolve_with_standard_symbol_environment(
@@ -113,7 +101,7 @@ mod tests {
                 StandardSymbolEnvironment::from_values(None, None, None),
             )
             .symbol_path
-            .contains(MICROSOFT_SYMBOL_SERVER));
+            .is_empty());
     }
 
     #[test]
@@ -135,15 +123,13 @@ mod tests {
             resolved.symbol_cache_dir,
             PathBuf::from("target/test-symbol-cache")
         );
-        assert!(resolved
-            .symbol_path
-            .contains("srv*target/test-symbol-cache*https://msdl.microsoft.com/download/symbols"));
+        assert!(resolved.symbol_path.is_empty());
     }
 
     #[test]
-    fn preserves_caller_symbol_paths_without_duplicating_microsoft_server() {
+    fn preserves_caller_symbol_paths_without_adding_a_default_server() {
         let settings = SymbolSettings {
-            symbol_paths: vec![format!("srv*C:/symbols*{MICROSOFT_SYMBOL_SERVER}")],
+            symbol_paths: vec!["C:/symbols".to_string()],
             ..SymbolSettings::default()
         };
 
@@ -151,13 +137,7 @@ mod tests {
             None,
             StandardSymbolEnvironment::from_values(None, None, None),
         );
-        assert_eq!(
-            resolved
-                .symbol_path
-                .matches(MICROSOFT_SYMBOL_SERVER)
-                .count(),
-            1
-        );
+        assert_eq!(resolved.symbol_path, "C:/symbols");
     }
 
     #[test]
@@ -165,15 +145,12 @@ mod tests {
         let resolved = SymbolSettings::default().resolve_with_standard_symbol_environment(
             None,
             StandardSymbolEnvironment::from_values(
-                Some("srv*C:/env-symbols*https://example.invalid/symbols".to_string()),
+                Some("C:/env-symbols".to_string()),
                 Some("C:/alternate-symbols".to_string()),
                 Some(PathBuf::from("C:/symbol-cache")),
             ),
         );
-        assert!(resolved
-            .symbol_path
-            .contains("srv*C:/env-symbols*https://example.invalid/symbols"));
-        assert!(resolved.symbol_path.contains(MICROSOFT_SYMBOL_SERVER));
+        assert!(resolved.symbol_path.contains("C:/env-symbols"));
         assert!(resolved.symbol_path.contains("C:/alternate-symbols"));
         assert_eq!(resolved.symbol_cache_dir, PathBuf::from("C:/symbol-cache"));
     }
@@ -181,24 +158,20 @@ mod tests {
     #[test]
     fn explicit_symbol_paths_override_nt_symbol_path() {
         let settings = SymbolSettings {
-            symbol_paths: vec![
-                "srv*C:/explicit-symbols*https://example.invalid/explicit".to_string()
-            ],
+            symbol_paths: vec!["C:/explicit-symbols".to_string()],
             ..SymbolSettings::default()
         };
 
         let resolved = settings.resolve_with_standard_symbol_environment(
             None,
             StandardSymbolEnvironment::from_values(
-                Some("srv*C:/env-symbols*https://example.invalid/symbols".to_string()),
+                Some("C:/env-symbols".to_string()),
                 Some("C:/alternate-symbols".to_string()),
                 Some(PathBuf::from("C:/symbol-cache")),
             ),
         );
 
-        assert!(resolved
-            .symbol_path
-            .contains("srv*C:/explicit-symbols*https://example.invalid/explicit"));
+        assert!(resolved.symbol_path.contains("C:/explicit-symbols"));
         assert!(!resolved.symbol_path.contains("C:/env-symbols"));
     }
 

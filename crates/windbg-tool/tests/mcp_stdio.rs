@@ -133,10 +133,8 @@ fn ping_trace_replay_scenario_over_mcp_stdio() -> anyhow::Result<()> {
         "load response should include trace metadata: {loaded}"
     );
     ensure!(
-        loaded["symbol_path"]
-            .as_str()
-            .is_some_and(|path| path.contains("https://msdl.microsoft.com/download/symbols")),
-        "load response should include the Microsoft symbol server path: {loaded}"
+        loaded["symbol_path"].as_str() == Some(""),
+        "load response should not configure a DbgEng or TTD srv* path: {loaded}"
     );
 
     let info = client.call_tool_json(
@@ -996,6 +994,10 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         | "target_list_breakpoints" => Ok(&["target_id"]),
         "target_wait" => Ok(&["target_id"]),
         "target_read_memory" => Ok(&["target_id", "address", "size"]),
+        "target_memory_map" => Ok(&["target_id"]),
+        "target_thread_accounting" => Ok(&["target_id"]),
+        "target_module_parameters" => Ok(&["target_id", "module_base_addresses"]),
+        "target_symbol_entry_range" => Ok(&["target_id", "address"]),
         "target_write_dump" => Ok(&["target_id", "path"]),
         "target_symbol_by_offset" | "target_source_by_offset" => Ok(&["target_id", "address"]),
         "target_stack_trace" => Ok(&["target_id"]),
