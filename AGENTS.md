@@ -98,7 +98,7 @@ cargo xtask deps
 cargo xtask native-build
 ```
 
-`cargo xtask deps` restores native NuGet packages into `target/nuget`, stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` into `target/symbol-runtime`, stages DbgEng process-server runtime DLLs into `target/dbgeng-runtime`, and downloads `TTDReplay.dll` plus `TTDReplayCPU.dll` into `target/ttd-runtime`.
+`cargo xtask deps` restores native NuGet packages into `target/nuget`, stages `dbghelp.dll` and `srcsrv.dll` into `target/symbol-runtime`, stages DbgEng process-server runtime DLLs into `target/dbgeng-runtime`, and downloads `TTDReplay.dll` plus `TTDReplayCPU.dll` into `target/ttd-runtime`.
 
 ## Native Dependencies
 
@@ -107,7 +107,6 @@ Native package restore is driven by `native/ttd-replay-bridge/packages.config`.
 Important packages:
 
 - `Microsoft.TimeTravelDebugging.Apis` for TTD Replay headers and import libraries.
-- `Microsoft.Debugging.Platform.SymSrv` for Microsoft symbol-server compatible symbol acquisition.
 - `Microsoft.Debugging.Platform.SrcSrv` for source-server support next to symbol acquisition.
 - `Microsoft.Debugging.Platform.DbgEng` for DbgEng process-server runtime DLLs, headers, and import libraries.
 
@@ -115,13 +114,7 @@ Runtime replay DLLs come from the WinDbg/TTD distribution, not from the TTD API 
 
 ## Symbols
 
-The default symbol path is built in `crates/windbg-ttd/src/ttd_replay/symbols.rs` and should include:
-
-```text
-srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
-```
-
-`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` into `target/symbol-runtime`, and stages DbgEng runtime DLLs into `target/dbgeng-runtime`. Preserve support for caller-provided binary paths, symbol paths, and symbol cache directories. Public Microsoft symbols are enough for module and function names in many Windows binaries; private symbols are not expected for normal tests.
+`windbg-symbols` resolves public PDBs with the Rust-native `symsrv` crate and hands DbgEng only direct local PDB/image directories. `cargo xtask deps` stages `dbghelp.dll` and `srcsrv.dll` into `target/symbol-runtime`, and stages DbgEng runtime DLLs into `target/dbgeng-runtime`. Preserve support for caller-provided binary paths, local symbol paths, and symbol cache directories. Public Microsoft symbols are enough for module and function names in many Windows binaries; private symbols are not expected for normal tests.
 
 ## Good Test Trace Target
 

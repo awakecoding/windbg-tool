@@ -7,7 +7,6 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 const DEBUGGING_PLATFORM_VERSION: &str = "20260319.1511.0";
 const DEFAULT_SYMBOL_CACHE: &str = ".ttd-symbol-cache";
-const MICROSOFT_SYMBOL_SERVER: &str = "https://msdl.microsoft.com/download/symbols";
 const NATIVE_BRIDGE_DLL: &str = "ttd_replay_bridge.dll";
 const TTD_RUNTIME_FILES: &[&str] = &["TTDReplay.dll", "TTDReplayCPU.dll"];
 const DBGENG_RUNTIME_FILES: &[&str] = &[
@@ -27,10 +26,6 @@ const SYMBOL_RUNTIME_FILES: &[SymbolRuntimeFile] = &[
     SymbolRuntimeFile {
         package: "Microsoft.Debugging.Platform.DbgEng",
         dll: "dbghelp.dll",
-    },
-    SymbolRuntimeFile {
-        package: "Microsoft.Debugging.Platform.SymSrv",
-        dll: "symsrv.dll",
     },
     SymbolRuntimeFile {
         package: "Microsoft.Debugging.Platform.SrcSrv",
@@ -268,10 +263,7 @@ fn doctor() -> anyhow::Result<()> {
     for file in DBGENG_RUNTIME_FILES {
         check_file(&dbgeng_runtime_dir.join(file));
     }
-    println!(
-        "  info: default symbol path srv*{}*{}",
-        DEFAULT_SYMBOL_CACHE, MICROSOFT_SYMBOL_SERVER
-    );
+    println!("  info: native Rust symbol cache {}", DEFAULT_SYMBOL_CACHE);
 
     let test_trace = env::var_os("TTD_TEST_TRACE")
         .map(PathBuf::from)

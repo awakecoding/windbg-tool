@@ -2,6 +2,7 @@
 members = [
     "crates/windbg-dbgeng",
     "crates/windbg-install",
+    "crates/windbg-symbols",
     "crates/windbg-tool",
     "crates/windbg-ttd",
     "xtask",

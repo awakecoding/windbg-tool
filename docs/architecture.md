@@ -15,7 +15,6 @@ The C++ bridge exists because the public TTD API is C++-oriented. Rust should no
 Build-time SDK inputs come from NuGet:
 
 - `Microsoft.TimeTravelDebugging.Apis` for headers and import libraries.
-- `Microsoft.Debugging.Platform.SymSrv` for Microsoft symbol-server compatible downloads.
 - `Microsoft.Debugging.Platform.SrcSrv` for source-server support alongside public symbols.
 - `Microsoft.Debugging.Platform.DbgEng` for DbgEng process-server headers, import libraries, and redistributable runtime DLLs.
 
@@ -37,13 +36,9 @@ Direct `IDebugEventCallbacksWide` payload capture is intentionally not installed
 
 ## Symbols
 
-The default symbol path is equivalent to:
+Symbol-server retrieval is Rust-native. `windbg-symbols` prefers a supplied or host-local PE image, then retrieves a missing exact PE image from the Microsoft Symbol Server HTTPS image store using its dump timestamp and `SizeOfImage` key. It bounds, atomically caches, and validates every image before parsing CodeView/RSDS and using the Rust `symsrv` crate to cache the exact PDB. DbgEng then receives only direct local PDB and image directories; it never receives an `srv*` path and has no `symsrv.dll` runtime dependency.
 
-```text
-srv*.ttd-symbol-cache*https://msdl.microsoft.com/download/symbols
-```
-
-`cargo xtask deps` stages `dbghelp.dll`, `symsrv.dll`, and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`, and stages DbgEng process-server runtime DLLs into `target/dbgeng-runtime`. Architecture-explicit release staging uses `target/runtime/<arch>/...` to keep x64 and ARM64 DLLs separate. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation. If `_NT_SYMBOL_PATH` is already set in the server process environment, use it as a fallback only when the MCP request does not provide explicit `symbols.symbol_paths`.
+`cargo xtask deps` stages `dbghelp.dll` and `srcsrv.dll` from Microsoft Debugging Platform NuGet packages into `target/symbol-runtime`, and stages DbgEng process-server runtime DLLs into `target/dbgeng-runtime`. Architecture-explicit release staging uses `target/runtime/<arch>/...` to keep x64 and ARM64 DLLs separate. Keep this repo-local and process-local; do not set machine-wide `_NT_SYMBOL_PATH` or write debugger registry keys as part of normal server operation.
 
 Callers can provide additional binary paths, symbol paths, and a symbol cache directory when loading a trace. Public symbols are useful for module/function names. Private symbols are needed for richer function signatures and local details.
 

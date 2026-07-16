@@ -77,7 +77,7 @@ Then create a cursor:
 ```json
 {
   "binary_paths": ["traces\\ping\\ping.exe", "C:\\Windows\\System32"],
-  "symbol_paths": ["srv*C:\\symbols*https://msdl.microsoft.com/download/symbols"],
+  "symbol_paths": ["C:\\symbols"],
   "symcache_dir": ".ttd-symbol-cache"
 }
 ```
@@ -88,7 +88,7 @@ Symbol settings use this precedence:
 2. `_NT_SYMBOL_PATH`, then `_NT_ALT_SYMBOL_PATH`, when no explicit paths are supplied.
 3. The module directory, as provided by the Windows symbol handler.
 
-`symbols.symcache_dir` overrides `_NT_SYMCACHE_PATH`; otherwise `_NT_SYMCACHE_PATH` supplies the cache directory. If the resulting path does not already include the Microsoft public symbol server, the server appends `srv*<cache>*https://msdl.microsoft.com/download/symbols`.
+`symbols.symcache_dir` overrides `_NT_SYMCACHE_PATH`; otherwise `_NT_SYMCACHE_PATH` supplies the cache directory. These settings configure local symbol directories only; windbg-tool does not append `srv*` or load `symsrv.dll`.
 
 The same environment resolution is applied to DbgEng live-launch, live-attach, and dump sessions. Their active resolved path is included in the target session summary as `symbol_path`.
 

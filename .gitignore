@@ -5,6 +5,7 @@ target/
 *.lib
 *.dll
 *.exe
+*.dmp
 *.run
 *.idx
 *.ttd
