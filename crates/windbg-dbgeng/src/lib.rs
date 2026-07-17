@@ -8,7 +8,7 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::{
-    env,
+    env, fs,
     path::{Path, PathBuf},
     sync::OnceLock,
     time::Instant,
@@ -31,7 +31,6 @@ pub const MAX_MODULE_PARAMETER_QUERIES: usize = 128;
 pub const MAX_SYMBOL_ENTRY_OFFSET_REGIONS: usize = 16;
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
 const DBGENG_DLL_NAME: &str = "dbgeng.dll";
-#[cfg(windows)]
 const DBGENG_RUNTIME_COMPONENTS: [&str; 4] = [
     "dbgcore.dll",
     "dbghelp.dll",
@@ -39,6 +38,49 @@ const DBGENG_RUNTIME_COMPONENTS: [&str; 4] = [
     DBGENG_DLL_NAME,
 ];
 const DBGENG_WAIT_TIMEOUT_HRESULT: i32 = 1;
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DbgEngRuntimeComponent {
+    pub name: String,
+    pub path: PathBuf,
+    pub machine: String,
+    pub machine_raw: u16,
+    pub image_version: String,
+    pub image_timestamp: u32,
+    pub file_size: u64,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct DbgEngRuntime {
+    pub source: String,
+    pub directory: Option<PathBuf>,
+    pub architecture: Option<String>,
+    pub components: Vec<DbgEngRuntimeComponent>,
+    pub compatible: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DbgEngRuntimeSource {
+    ExplicitDirectory,
+    AdjacentDirectory,
+    System,
+}
+
+impl DbgEngRuntimeSource {
+    fn name(self) -> &'static str {
+        match self {
+            Self::ExplicitDirectory => "explicit_runtime_directory",
+            Self::AdjacentDirectory => "adjacent_executable_directory",
+            Self::System => "system_runtime",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SelectedDbgEngRuntime {
+    source: DbgEngRuntimeSource,
+    dbgeng_dll: Option<PathBuf>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StandardSymbolEnvironment {
@@ -107,11 +149,17 @@ fn env_path(name: &str) -> Option<String> {
     })
 }
 
-#[cfg(windows)]
 fn dbgeng_runtime_dll(
     explicit_runtime_dir: Option<&Path>,
     executable_path: Option<&Path>,
 ) -> anyhow::Result<Option<PathBuf>> {
+    Ok(select_dbgeng_runtime(explicit_runtime_dir, executable_path)?.dbgeng_dll)
+}
+
+fn select_dbgeng_runtime(
+    explicit_runtime_dir: Option<&Path>,
+    executable_path: Option<&Path>,
+) -> anyhow::Result<SelectedDbgEngRuntime> {
     if let Some(runtime_dir) = explicit_runtime_dir {
         let dll = runtime_dir.join(DBGENG_DLL_NAME);
         ensure!(
@@ -119,13 +167,146 @@ fn dbgeng_runtime_dll(
             "{DBGENG_RUNTIME_DIR_ENV} must name a directory containing {}",
             dll.display()
         );
-        return Ok(Some(dll));
+        return Ok(SelectedDbgEngRuntime {
+            source: DbgEngRuntimeSource::ExplicitDirectory,
+            dbgeng_dll: Some(dll),
+        });
     }
 
-    Ok(executable_path
+    let adjacent = executable_path
         .and_then(Path::parent)
         .map(|directory| directory.join(DBGENG_DLL_NAME))
-        .filter(|dll| dll.is_file()))
+        .filter(|dll| dll.is_file());
+    Ok(SelectedDbgEngRuntime {
+        source: if adjacent.is_some() {
+            DbgEngRuntimeSource::AdjacentDirectory
+        } else {
+            DbgEngRuntimeSource::System
+        },
+        dbgeng_dll: adjacent,
+    })
+}
+
+/// Inspects the exact DbgEng runtime selected by the normal loader without
+/// loading any native DLL. Staged component architecture mismatches are rejected
+/// before a session can bind to the engine.
+pub fn inspect_dbgeng_runtime() -> anyhow::Result<DbgEngRuntime> {
+    let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
+    let executable_path = env::current_exe().ok();
+    let selected =
+        select_dbgeng_runtime(explicit_runtime_dir.as_deref(), executable_path.as_deref())?;
+    inspect_selected_dbgeng_runtime(&selected)
+}
+
+fn inspect_selected_dbgeng_runtime(
+    selected: &SelectedDbgEngRuntime,
+) -> anyhow::Result<DbgEngRuntime> {
+    let Some(dbgeng_dll) = selected.dbgeng_dll.as_deref() else {
+        return Ok(DbgEngRuntime {
+            source: selected.source.name().to_string(),
+            directory: None,
+            architecture: None,
+            components: Vec::new(),
+            compatible: true,
+        });
+    };
+    let directory = dbgeng_dll
+        .parent()
+        .context("the selected DbgEng runtime DLL has no parent directory")?;
+    let components = DBGENG_RUNTIME_COMPONENTS
+        .iter()
+        .map(|name| inspect_dbgeng_runtime_component(&directory.join(name), name))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let machine_raw = components
+        .first()
+        .map(|component| component.machine_raw)
+        .context("the selected DbgEng runtime has no components")?;
+    ensure!(
+        components
+            .iter()
+            .all(|component| component.machine_raw == machine_raw),
+        "the selected DbgEng runtime mixes component architectures: {}",
+        components
+            .iter()
+            .map(|component| format!("{}={}", component.name, component.machine))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    Ok(DbgEngRuntime {
+        source: selected.source.name().to_string(),
+        directory: Some(directory.to_path_buf()),
+        architecture: Some(pe_machine_name(machine_raw).to_string()),
+        components,
+        compatible: true,
+    })
+}
+
+fn inspect_dbgeng_runtime_component(
+    path: &Path,
+    name: &str,
+) -> anyhow::Result<DbgEngRuntimeComponent> {
+    ensure!(
+        path.is_file(),
+        "the selected DbgEng runtime is missing required component {}",
+        path.display()
+    );
+    let bytes = fs::read(path)
+        .with_context(|| format!("reading DbgEng runtime component {}", path.display()))?;
+    ensure!(
+        bytes.len() >= 0x40 && &bytes[..2] == b"MZ",
+        "DbgEng runtime component {} is not a PE image",
+        path.display()
+    );
+    let pe_offset =
+        usize::try_from(read_u32(&bytes, 0x3c)?).context("converting DbgEng PE header offset")?;
+    ensure!(
+        bytes.get(pe_offset..pe_offset + 4) == Some(b"PE\0\0"),
+        "DbgEng runtime component {} has an invalid PE signature",
+        path.display()
+    );
+    let machine_raw = read_u16(&bytes, pe_offset + 4)?;
+    let image_timestamp = read_u32(&bytes, pe_offset + 8)?;
+    let optional_header_offset = pe_offset + 24;
+    let optional_magic = read_u16(&bytes, optional_header_offset)?;
+    ensure!(
+        optional_magic == 0x10b || optional_magic == 0x20b,
+        "DbgEng runtime component {} has unsupported PE optional-header magic 0x{optional_magic:04X}",
+        path.display()
+    );
+    let major_image_version = read_u16(&bytes, optional_header_offset + 44)?;
+    let minor_image_version = read_u16(&bytes, optional_header_offset + 46)?;
+    Ok(DbgEngRuntimeComponent {
+        name: name.to_string(),
+        path: path.to_path_buf(),
+        machine: pe_machine_name(machine_raw).to_string(),
+        machine_raw,
+        image_version: format!("{major_image_version}.{minor_image_version}"),
+        image_timestamp,
+        file_size: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+    })
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> anyhow::Result<u16> {
+    let value = bytes
+        .get(offset..offset + 2)
+        .context("PE image is truncated while reading a 16-bit field")?;
+    Ok(u16::from_le_bytes([value[0], value[1]]))
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> anyhow::Result<u32> {
+    let value = bytes
+        .get(offset..offset + 4)
+        .context("PE image is truncated while reading a 32-bit field")?;
+    Ok(u32::from_le_bytes([value[0], value[1], value[2], value[3]]))
+}
+
+fn pe_machine_name(machine: u16) -> &'static str {
+    match machine {
+        0x014c => "x86",
+        0x8664 => "x64",
+        0xaa64 => "arm64",
+        _ => "unknown",
+    }
 }
 
 #[cfg(windows)]
@@ -164,9 +345,9 @@ fn ensure_dbgeng_runtime_loaded() -> anyhow::Result<windows::Win32::Foundation::
         (|| -> anyhow::Result<usize> {
             let explicit_runtime_dir = env::var_os(DBGENG_RUNTIME_DIR_ENV).map(PathBuf::from);
             let executable_path = env::current_exe().ok();
-            let dll =
-                dbgeng_runtime_dll(explicit_runtime_dir.as_deref(), executable_path.as_deref())?;
-            let Some(dll) = dll else {
+            let selected =
+                select_dbgeng_runtime(explicit_runtime_dir.as_deref(), executable_path.as_deref())?;
+            let Some(dll) = selected.dbgeng_dll.as_deref() else {
                 let mut component_wide = "dbgeng.dll".encode_utf16().collect::<Vec<_>>();
                 component_wide.push(0);
                 let module = unsafe {
@@ -179,6 +360,7 @@ fn ensure_dbgeng_runtime_loaded() -> anyhow::Result<windows::Win32::Foundation::
                 .context("loading DbgEng from the system runtime")?;
                 return Ok(module.0 as usize);
             };
+            inspect_selected_dbgeng_runtime(&selected)?;
             let runtime_dir = dll
                 .parent()
                 .context("the selected DbgEng runtime DLL has no parent directory")?;
@@ -406,6 +588,7 @@ pub struct DebuggerSessionSummary {
     pub processor_name: Option<String>,
     pub execution_status: DebuggerExecutionStatus,
     pub symbol_path: String,
+    pub runtime: DbgEngRuntime,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -569,6 +752,14 @@ pub struct DebuggerOutputCaptureResult {
     pub max_chars_per_record: u32,
     pub max_total_chars: u32,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DebuggerRunResult {
+    pub execution_status: DebuggerExecutionStatus,
+    pub event: Option<DebuggerEventInfo>,
+    pub event_error: Option<String>,
+    pub debuggee_output: Option<DebuggerOutputCaptureResult>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -799,6 +990,7 @@ pub struct DebuggerSession {
     symbols: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSymbols5,
     system_objects: windows::Win32::System::Diagnostics::Debug::Extensions::IDebugSystemObjects,
     symbol_path: String,
+    runtime: DbgEngRuntime,
 }
 
 #[cfg(windows)]
@@ -993,6 +1185,7 @@ impl DebuggerSession {
             processor_name: self.processor_name().ok(),
             execution_status: self.execution_status(),
             symbol_path: self.symbol_path.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 
@@ -1122,6 +1315,50 @@ impl DebuggerSession {
             self.control.SetExecutionStatus(DEBUG_STATUS_STEP_INTO)?;
         }
         Ok(self.execution_status())
+    }
+
+    pub fn step_over(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_STATUS_STEP_OVER;
+
+        unsafe {
+            self.control.SetExecutionStatus(DEBUG_STATUS_STEP_OVER)?;
+        }
+        Ok(self.execution_status())
+    }
+
+    pub fn continue_and_wait(
+        &self,
+        timeout_ms: u32,
+        output_options: Option<DebuggerOutputCaptureOptions>,
+    ) -> anyhow::Result<DebuggerRunResult> {
+        let capture = output_options
+            .map(|options| self.begin_debuggee_output_capture(options))
+            .transpose()?;
+        let result: anyhow::Result<(
+            DebuggerExecutionStatus,
+            Option<DebuggerEventInfo>,
+            Option<String>,
+        )> = (|| {
+            self.continue_execution()?;
+            let execution_status = self.wait_for_event(timeout_ms)?;
+            let (event, event_error) = if execution_status.name.as_deref() == Some("timeout") {
+                (None, None)
+            } else {
+                match self.last_event() {
+                    Ok(event) => (Some(event), None),
+                    Err(error) => (None, Some(format!("{error:#}"))),
+                }
+            };
+            Ok((execution_status, event, event_error))
+        })();
+        let debuggee_output = capture.map(DebuggerOutputCapture::finish).transpose()?;
+        let (execution_status, event, event_error) = result?;
+        Ok(DebuggerRunResult {
+            execution_status,
+            event,
+            event_error,
+            debuggee_output,
+        })
     }
 
     pub fn last_event(&self) -> anyhow::Result<DebuggerEventInfo> {
@@ -2279,6 +2516,24 @@ impl DebuggerSession {
         Ok(())
     }
 
+    pub fn set_breakpoint_enabled(
+        &self,
+        breakpoint_id: u32,
+        enabled: bool,
+    ) -> anyhow::Result<BreakpointInfo> {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::DEBUG_BREAKPOINT_ENABLED;
+
+        let breakpoint = unsafe { self.control.GetBreakpointById2(breakpoint_id)? };
+        unsafe {
+            if enabled {
+                breakpoint.AddFlags(DEBUG_BREAKPOINT_ENABLED)?;
+            } else {
+                breakpoint.RemoveFlags(DEBUG_BREAKPOINT_ENABLED)?;
+            }
+        }
+        self.breakpoint_info(&breakpoint)
+    }
+
     pub fn evaluate(&self, expression: &str) -> anyhow::Result<EvaluationResult> {
         use windows::core::PCWSTR;
         use windows::Win32::System::Diagnostics::Debug::Extensions::{
@@ -2485,6 +2740,13 @@ impl DebuggerSession {
                 name: None,
             },
             symbol_path: resolve_dbgeng_symbol_path().symbol_path,
+            runtime: inspect_dbgeng_runtime().unwrap_or(DbgEngRuntime {
+                source: "unavailable".to_string(),
+                directory: None,
+                architecture: None,
+                components: Vec::new(),
+                compatible: false,
+            }),
         }
     }
 
@@ -2508,6 +2770,18 @@ impl DebuggerSession {
     }
 
     pub fn step_into(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn step_over(&self) -> anyhow::Result<DebuggerExecutionStatus> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn continue_and_wait(
+        &self,
+        _timeout_ms: u32,
+        _output_options: Option<DebuggerOutputCaptureOptions>,
+    ) -> anyhow::Result<DebuggerRunResult> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -2605,6 +2879,14 @@ impl DebuggerSession {
     }
 
     pub fn remove_breakpoint(&self, _breakpoint_id: u32) -> anyhow::Result<()> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn set_breakpoint_enabled(
+        &self,
+        _breakpoint_id: u32,
+        _enabled: bool,
+    ) -> anyhow::Result<BreakpointInfo> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -2722,6 +3004,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
         IDebugSystemObjects, DEBUG_PROCESS_ONLY_THIS_PROCESS,
     };
 
+    let runtime = inspect_dbgeng_runtime()?;
     let mut command_line = options.command_line.encode_utf16().collect::<Vec<_>>();
     command_line.push(0);
 
@@ -2765,6 +3048,7 @@ fn launch_live_session_impl(options: LiveLaunchSessionOptions) -> anyhow::Result
         symbols,
         system_objects,
         symbol_path,
+        runtime,
     })
 }
 
@@ -2776,6 +3060,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
         IDebugSystemObjects, DEBUG_ATTACH_DEFAULT,
     };
 
+    let runtime = inspect_dbgeng_runtime()?;
     let client: IDebugClient5 = create_debug_client()?;
     let control: IDebugControl5 = client.cast().context("querying IDebugControl5")?;
     let data_spaces: IDebugDataSpaces4 = client.cast().context("querying IDebugDataSpaces4")?;
@@ -2802,6 +3087,7 @@ fn attach_live_session_impl(options: LiveAttachOptions) -> anyhow::Result<Debugg
         symbols,
         system_objects,
         symbol_path,
+        runtime,
     })
 }
 
@@ -2813,6 +3099,7 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
         IDebugSystemObjects, DEBUG_WAIT_DEFAULT,
     };
 
+    let runtime = inspect_dbgeng_runtime()?;
     let path_string = options.path.to_string_lossy().to_string();
     let mut path = path_string.encode_utf16().collect::<Vec<_>>();
     path.push(0);
@@ -2844,6 +3131,7 @@ fn open_dump_session_impl(options: DumpOpenOptions) -> anyhow::Result<DebuggerSe
         symbols,
         system_objects,
         symbol_path,
+        runtime,
     })
 }
 
@@ -3175,6 +3463,38 @@ fn write_process_dump_impl(options: ProcessDumpOptions) -> anyhow::Result<DumpWr
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temporary_runtime_directory(label: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "windbg-dbgeng-{label}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn minimal_pe_image(machine: u16) -> Vec<u8> {
+        let mut bytes = vec![0_u8; 0x100];
+        bytes[..2].copy_from_slice(b"MZ");
+        bytes[0x3c..0x40].copy_from_slice(&0x80_u32.to_le_bytes());
+        bytes[0x80..0x84].copy_from_slice(b"PE\0\0");
+        bytes[0x84..0x86].copy_from_slice(&machine.to_le_bytes());
+        bytes[0x88..0x8c].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        bytes[0x98..0x9a].copy_from_slice(&0x20b_u16.to_le_bytes());
+        bytes[0xc4..0xc6].copy_from_slice(&10_u16.to_le_bytes());
+        bytes[0xc6..0xc8].copy_from_slice(&5_u16.to_le_bytes());
+        bytes
+    }
+
+    fn write_runtime(directory: &Path, machine: u16) {
+        fs::create_dir_all(directory).unwrap();
+        for component in DBGENG_RUNTIME_COMPONENTS {
+            fs::write(directory.join(component), minimal_pe_image(machine)).unwrap();
+        }
+    }
 
     #[test]
     fn maps_dump_kinds_to_dbgeng_qualifiers() {
@@ -3260,13 +3580,9 @@ mod tests {
         assert!(!is_dbgeng_wait_timeout_hresult(-1));
     }
 
-    #[cfg(windows)]
     #[test]
     fn explicit_dbgeng_runtime_overrides_an_adjacent_runtime() {
-        use std::fs;
-
-        let root =
-            env::temp_dir().join(format!("windbg-dbgeng-runtime-test-{}", std::process::id()));
+        let root = temporary_runtime_directory("selection");
         let explicit_runtime = root.join("explicit");
         let executable = root.join("bin").join("windbg-tool.exe");
         let adjacent_runtime = executable.parent().unwrap().join(DBGENG_DLL_NAME);
@@ -3279,5 +3595,89 @@ mod tests {
 
         let _ = fs::remove_dir_all(&root);
         assert_eq!(resolved, Some(explicit_runtime.join(DBGENG_DLL_NAME)));
+    }
+
+    #[test]
+    fn inspects_a_complete_matching_staged_runtime() {
+        let directory = temporary_runtime_directory("valid");
+        write_runtime(&directory, 0x8664);
+        let selected = SelectedDbgEngRuntime {
+            source: DbgEngRuntimeSource::ExplicitDirectory,
+            dbgeng_dll: Some(directory.join(DBGENG_DLL_NAME)),
+        };
+
+        let runtime = inspect_selected_dbgeng_runtime(&selected).unwrap();
+
+        let _ = fs::remove_dir_all(&directory);
+        assert!(runtime.compatible);
+        assert_eq!(runtime.architecture.as_deref(), Some("x64"));
+        assert_eq!(runtime.components.len(), DBGENG_RUNTIME_COMPONENTS.len());
+        assert!(runtime
+            .components
+            .iter()
+            .all(|component| component.image_version == "10.5"));
+    }
+
+    #[test]
+    fn rejects_a_runtime_missing_a_required_component() {
+        let directory = temporary_runtime_directory("missing");
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(directory.join(DBGENG_DLL_NAME), minimal_pe_image(0x8664)).unwrap();
+        let selected = SelectedDbgEngRuntime {
+            source: DbgEngRuntimeSource::ExplicitDirectory,
+            dbgeng_dll: Some(directory.join(DBGENG_DLL_NAME)),
+        };
+
+        let error = inspect_selected_dbgeng_runtime(&selected).unwrap_err();
+
+        let _ = fs::remove_dir_all(&directory);
+        assert!(error.to_string().contains("missing required component"));
+    }
+
+    #[test]
+    fn rejects_a_malformed_runtime_component() {
+        let directory = temporary_runtime_directory("malformed");
+        write_runtime(&directory, 0x8664);
+        fs::write(directory.join("dbghelp.dll"), b"not a PE").unwrap();
+        let selected = SelectedDbgEngRuntime {
+            source: DbgEngRuntimeSource::ExplicitDirectory,
+            dbgeng_dll: Some(directory.join(DBGENG_DLL_NAME)),
+        };
+
+        let error = inspect_selected_dbgeng_runtime(&selected).unwrap_err();
+
+        let _ = fs::remove_dir_all(&directory);
+        assert!(error.to_string().contains("not a PE image"));
+    }
+
+    #[test]
+    fn rejects_a_runtime_with_mixed_component_architectures() {
+        let directory = temporary_runtime_directory("mixed-architecture");
+        write_runtime(&directory, 0x8664);
+        fs::write(directory.join("dbgmodel.dll"), minimal_pe_image(0x014c)).unwrap();
+        let selected = SelectedDbgEngRuntime {
+            source: DbgEngRuntimeSource::ExplicitDirectory,
+            dbgeng_dll: Some(directory.join(DBGENG_DLL_NAME)),
+        };
+
+        let error = inspect_selected_dbgeng_runtime(&selected).unwrap_err();
+
+        let _ = fs::remove_dir_all(&directory);
+        assert!(error.to_string().contains("mixes component architectures"));
+    }
+
+    #[test]
+    fn reports_system_runtime_without_staged_component_claims() {
+        let selected = SelectedDbgEngRuntime {
+            source: DbgEngRuntimeSource::System,
+            dbgeng_dll: None,
+        };
+
+        let runtime = inspect_selected_dbgeng_runtime(&selected).unwrap();
+
+        assert_eq!(runtime.source, "system_runtime");
+        assert!(runtime.compatible);
+        assert!(runtime.directory.is_none());
+        assert!(runtime.components.is_empty());
     }
 }

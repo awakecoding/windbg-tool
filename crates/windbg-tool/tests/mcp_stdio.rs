@@ -987,12 +987,13 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         | "target_terminate"
         | "target_continue"
         | "target_step_into"
+        | "target_step_over"
         | "target_core_registers"
         | "target_last_event"
         | "target_list_threads"
         | "target_list_modules"
         | "target_list_breakpoints" => Ok(&["target_id"]),
-        "target_wait" => Ok(&["target_id"]),
+        "target_wait" | "target_continue_wait" => Ok(&["target_id"]),
         "target_read_memory" => Ok(&["target_id", "address", "size"]),
         "target_memory_map" => Ok(&["target_id"]),
         "target_thread_accounting" => Ok(&["target_id"]),
@@ -1003,8 +1004,10 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         "target_stack_trace" => Ok(&["target_id"]),
         "target_thread_context" => Ok(&["target_id", "engine_thread_id"]),
         "target_disassemble" => Ok(&["target_id"]),
-        "target_set_breakpoint" => Ok(&["target_id", "address"]),
-        "target_remove_breakpoint" => Ok(&["target_id", "breakpoint_id"]),
+        "target_set_breakpoint" => Ok(&["target_id"]),
+        "target_set_breakpoint_enabled" | "target_remove_breakpoint" => {
+            Ok(&["target_id", "breakpoint_id"])
+        }
         "target_evaluate_expression" => Ok(&["target_id", "expression"]),
         "job_start_watch_memory_sweep" => Ok(&[
             "session_id",

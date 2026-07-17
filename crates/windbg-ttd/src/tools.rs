@@ -2,11 +2,11 @@ use crate::jobs::{JobRequest, SweepWatchMemoryJobRequest};
 use crate::state::ServiceState;
 use crate::targets::{
     DumpOpenRequest, LiveAttachRequest, LiveLaunchRequest, TargetAddressRequest,
-    TargetBreakpointRemoveRequest, TargetBreakpointSetRequest, TargetDisassembleRequest,
-    TargetExpressionRequest, TargetMemoryMapRequest, TargetMemoryReadRequest,
-    TargetModuleParametersRequest, TargetRequest, TargetStackTraceRequest,
-    TargetThreadAccountingRequest, TargetThreadContextRequest, TargetWaitRequest,
-    TargetWriteDumpRequest,
+    TargetBreakpointEnableRequest, TargetBreakpointRemoveRequest, TargetBreakpointSetRequest,
+    TargetContinueWaitRequest, TargetDisassembleRequest, TargetExpressionRequest,
+    TargetMemoryMapRequest, TargetMemoryReadRequest, TargetModuleParametersRequest, TargetRequest,
+    TargetStackTraceRequest, TargetThreadAccountingRequest, TargetThreadContextRequest,
+    TargetWaitRequest, TargetWriteDumpRequest,
 };
 use crate::ttd_replay::{
     AddressInfoRequest, CursorId, IndexBuildRequest, IndexStatsRequest, IndexStatusRequest,
@@ -206,6 +206,14 @@ pub fn definitions() -> Vec<Tool> {
             "Single-step a daemon-owned live target session.",
         ),
         tool::<TargetRequest>(
+            "target_step_over",
+            "Step over one instruction in a daemon-owned live target session.",
+        ),
+        tool::<TargetContinueWaitRequest>(
+            "target_continue_wait",
+            "Continue a live target and wait for one bounded stop, with optional bounded debuggee output capture.",
+        ),
+        tool::<TargetRequest>(
             "target_core_registers",
             "Read current thread and instruction, stack, and frame offsets from a daemon-owned target session.",
         ),
@@ -267,7 +275,11 @@ pub fn definitions() -> Vec<Tool> {
         ),
         tool::<TargetBreakpointSetRequest>(
             "target_set_breakpoint",
-            "Set a code or data breakpoint in a daemon-owned live target session.",
+            "Set a code, data, or deferred symbol code breakpoint in a daemon-owned live target session.",
+        ),
+        tool::<TargetBreakpointEnableRequest>(
+            "target_set_breakpoint_enabled",
+            "Enable or disable an existing breakpoint in a daemon-owned live target session.",
         ),
         tool::<TargetBreakpointRemoveRequest>(
             "target_remove_breakpoint",
@@ -476,7 +488,7 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         }
         "target_list" => {
             let _request = parse::<EmptyArgs>(call.arguments)?;
-            Ok(serde_json::to_value(state.targets.list_targets())?)
+            Ok(serde_json::to_value(state.targets.list_targets()?)?)
         }
         "target_status" => {
             let request = parse::<TargetRequest>(call.arguments)?;
@@ -507,6 +519,16 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         "target_step_into" => {
             let request = parse::<TargetRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.step_into(request)?)?)
+        }
+        "target_step_over" => {
+            let request = parse::<TargetRequest>(call.arguments)?;
+            Ok(serde_json::to_value(state.targets.step_over(request)?)?)
+        }
+        "target_continue_wait" => {
+            let request = parse::<TargetContinueWaitRequest>(call.arguments)?;
+            Ok(serde_json::to_value(
+                state.targets.continue_and_wait(request)?,
+            )?)
         }
         "target_core_registers" => {
             let request = parse::<TargetRequest>(call.arguments)?;
@@ -590,6 +612,12 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
                 state.targets.set_breakpoint(request)?,
             )?)
         }
+        "target_set_breakpoint_enabled" => {
+            let request = parse::<TargetBreakpointEnableRequest>(call.arguments)?;
+            Ok(serde_json::to_value(
+                state.targets.set_breakpoint_enabled(request)?,
+            )?)
+        }
         "target_remove_breakpoint" => {
             let request = parse::<TargetBreakpointRemoveRequest>(call.arguments)?;
             Ok(serde_json::to_value(
@@ -645,12 +673,15 @@ fn tool_is_read_only(name: &str) -> bool {
             | "target_close"
             | "target_terminate"
             | "target_continue"
-            | "target_step"
-            | "target_breakpoint_set"
-            | "target_breakpoint_remove"
-            | "live_launch"
-            | "live_attach"
-            | "dump_open"
+            | "target_continue_wait"
+            | "target_step_into"
+            | "target_step_over"
+            | "target_set_breakpoint"
+            | "target_set_breakpoint_enabled"
+            | "target_remove_breakpoint"
+            | "live_launch_session"
+            | "live_attach_process"
+            | "dump_open_session"
             | "sweep_watch_memory_start"
     )
 }
@@ -658,13 +689,7 @@ fn tool_is_read_only(name: &str) -> bool {
 fn tool_is_destructive(name: &str) -> bool {
     matches!(
         name,
-        "ttd_close_trace"
-            | "job_cancel"
-            | "target_close"
-            | "target_terminate"
-            | "target_continue"
-            | "target_step"
-            | "target_breakpoint_remove"
+        "ttd_close_trace" | "job_cancel" | "target_close" | "target_terminate"
     )
 }
 
@@ -695,9 +720,9 @@ fn tool_is_open_world(name: &str) -> bool {
         name,
         "ttd_load_trace"
             | "ttd_trace_list"
-            | "live_launch"
-            | "live_attach"
-            | "dump_open"
+            | "live_launch_session"
+            | "live_attach_process"
+            | "dump_open_session"
             | "target_write_dump"
     )
 }

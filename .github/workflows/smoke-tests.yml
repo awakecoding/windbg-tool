@@ -212,7 +212,11 @@ jobs:
             }
 
             $debugCapabilities = & $tool --pipe $pipe --compact debug capabilities --target $targetId | ConvertFrom-Json
-            if ($debugCapabilities.selected.subject.kind -ne 'target' -or -not $debugCapabilities.selected.matrix.can_stack) {
+            if (
+              $debugCapabilities.selected.subject.kind -ne 'target' -or
+              $debugCapabilities.selected.matrix.backend -ne 'dbgeng_dump' -or
+              $debugCapabilities.selected.matrix.operations.stack -ne 'supported'
+            ) {
               throw "debug capabilities did not describe the dump target: $($debugCapabilities | ConvertTo-Json -Compress -Depth 20)"
             }
 

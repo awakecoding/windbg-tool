@@ -25,6 +25,7 @@ use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
     NativeSymbolStatus, PeImageIdentity,
 };
+use windbg_ttd::backend::capability_contract;
 use windows::core::{PCWSTR, PWSTR};
 use windows::Win32::Foundation::{CloseHandle, HANDLE};
 use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
@@ -5221,6 +5222,7 @@ fn cli_dump_kind(kind: CliDumpKind) -> DumpKind {
 
 pub(super) fn live_capabilities() -> Value {
     json!({
+        "backend_contract": capability_contract("dbgeng_live"),
         "implemented": [
             "dbgeng server",
             "live launch --command-line <cmd> --end detach|terminate",
@@ -5232,7 +5234,7 @@ pub(super) fn live_capabilities() -> Value {
             "dump create --process-id <pid> --output <path>",
             "dump inspect <path>",
             "target dump --target <id> --output <path>",
-            "target list/status/wait/continue/step for live targets",
+            "target list/status/wait/continue/continue-wait/step/step-over for live targets",
             "target threads/modules/registers/memory/stack/disasm/symbol/source for live targets"
         ],
         "partial": [
@@ -5269,14 +5271,14 @@ pub(super) fn live_capabilities() -> Value {
             {
                 "feature": "daemon-backed live sessions",
                 "status": "persistent_core_control",
-                "notes": "Daemon-owned live targets now cover launch, attach, status, event wait, continue, step-into, modules, threads, registers, memory, stack, symbol/source lookup, disassembly, and breakpoints."
+                "notes": "Daemon-owned live targets cover launch, attach, status, event wait, continue, bounded continue-and-wait with optional debuggee output capture, step-into, step-over, modules, threads, registers, memory, stack, symbol/source lookup, disassembly, and breakpoints."
             }
         ],
         "gaps": [
-            "step-over/step-out controls",
+            "step-out control",
             "module/symbol reload management",
             "event callbacks",
-            "richer debugger output capture"
+            "continuous debugger output/event streaming"
         ],
         "safety": [
             "Live debugging mutates target execution state.",
@@ -5287,12 +5289,17 @@ pub(super) fn live_capabilities() -> Value {
 
 pub(super) fn breakpoint_capabilities() -> Value {
     json!({
+        "backend_contracts": [
+            capability_contract("ttd_cursor"),
+            capability_contract("dbgeng_live")
+        ],
         "implemented": [
             "memory watchpoint",
             "replay watch-memory",
             "sweep watch-memory",
             "breakpoint list --target <id>",
-            "breakpoint set --target <id> --address <addr>",
+            "breakpoint set --target <id> --address <addr>|--symbol <expr>",
+            "breakpoint enable/disable --target <id> --breakpoint-id <id>",
             "breakpoint remove --target <id> --breakpoint-id <id>"
         ],
         "partial": [
@@ -5305,20 +5312,22 @@ pub(super) fn breakpoint_capabilities() -> Value {
             },
             {
                 "feature": "live breakpoint manager",
-                "status": "core_code_and_data_breakpoints",
+                "status": "core_code_data_and_deferred_symbol_breakpoints",
                 "commands": [
                     "breakpoint list",
                     "breakpoint set",
+                    "breakpoint enable",
+                    "breakpoint disable",
                     "breakpoint remove"
                 ],
-                "notes": "Live DbgEng targets support code breakpoints and data breakpoints with read/write/execute access masks."
+                "notes": "Live DbgEng targets support absolute code breakpoints, deferred code symbol expressions, data breakpoints with read/write/execute access masks, and explicit enablement changes."
             }
         ],
         "gaps": [
-            "source breakpoints and persistent daemon symbol breakpoints",
+            "source breakpoints",
             "position watchpoints",
             "call/return trace jobs",
-            "breakpoint enable/disable without remove"
+            "conditional/logging breakpoint actions"
         ],
         "safe_next_steps": [
             "Use memory watchpoint for one hit.",
@@ -5330,6 +5339,10 @@ pub(super) fn breakpoint_capabilities() -> Value {
 
 pub(super) fn datamodel_capabilities() -> Value {
     json!({
+        "target_backend_contracts": [
+            capability_contract("dbgeng_live"),
+            capability_contract("dbgeng_dump")
+        ],
         "implemented": [
             "structured JSON command output",
             "discover.command_metadata",
@@ -5921,6 +5934,13 @@ mod tests {
                     name: Some("break".to_string()),
                 },
                 symbol_path: "srv*cache*https://msdl.microsoft.com/download/symbols".to_string(),
+                runtime: windbg_dbgeng::DbgEngRuntime {
+                    source: "test_fixture".to_string(),
+                    directory: None,
+                    architecture: Some("x64".to_string()),
+                    components: Vec::new(),
+                    compatible: true,
+                },
             },
             timing: json!({}),
             event_filters: json!({}),
