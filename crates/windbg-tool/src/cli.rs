@@ -2439,12 +2439,7 @@ async fn debug_capabilities_and_print(
         Some(DebugSubject::Target { target }) => {
             let status =
                 call_status_value(client.call_tool(target_call("target_status", target)).await);
-            let backend = if status.pointer("/target/kind").and_then(Value::as_str) == Some("dump")
-            {
-                "dbgeng_dump"
-            } else {
-                "dbgeng_live"
-            };
+            let backend = dbgeng_backend_for_status(&status);
             Some(json!({
                 "subject": debug_subject_value(&DebugSubject::Target { target }),
                 "status": status,
@@ -2463,6 +2458,14 @@ async fn debug_capabilities_and_print(
         }),
         output,
     )
+}
+
+fn dbgeng_backend_for_status(status: &Value) -> &'static str {
+    if status.pointer("/value/target/kind").and_then(Value::as_str) == Some("dump") {
+        "dbgeng_dump"
+    } else {
+        "dbgeng_live"
+    }
 }
 
 async fn debug_snapshot_and_print(
@@ -8418,5 +8421,28 @@ mod tests {
         assert_eq!(disable.name, "target_set_breakpoint_enabled");
         assert_eq!(disable.arguments["enabled"], false);
         Ok(())
+    }
+
+    #[test]
+    fn selects_dump_contract_from_wrapped_target_status() {
+        let dump_status = json!({
+            "ok": true,
+            "value": {
+                "target": {
+                    "kind": "dump"
+                }
+            }
+        });
+        assert_eq!(dbgeng_backend_for_status(&dump_status), "dbgeng_dump");
+
+        let live_status = json!({
+            "ok": true,
+            "value": {
+                "target": {
+                    "kind": "live"
+                }
+            }
+        });
+        assert_eq!(dbgeng_backend_for_status(&live_status), "dbgeng_live");
     }
 }
