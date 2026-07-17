@@ -671,7 +671,7 @@ fn ping_trace_agent_cli_scenario_uses_long_lived_daemon_session() -> anyhow::Res
     ensure!(
         debug_capabilities["canonical_command"] == "debug capabilities"
             && debug_capabilities["selected"]["subject"]["kind"] == "ttd_cursor"
-            && debug_capabilities["selected"]["matrix"]["can_time_travel"] == true,
+            && debug_capabilities["selected"]["matrix"]["operations"]["time_travel"] == "supported",
         "debug capabilities should describe the selected TTD cursor: {debug_capabilities}"
     );
     let debug_snapshot = run_json_vec(

@@ -443,6 +443,30 @@ The same command with `--method Devolutions.RemoteDesktopManager.Program.ApplyDp
 
 The prior RDM evidence above was collected in an approved test VM. RDM remains blocked for breakpoint and DAC workflows: do not launch, resume, or attach it under software or hardware breakpoints, CLR notifications, or target-memory writes, and do not seek an exclusion or workaround. The separate `live startup-profile` flow above is limited to lifecycle-event filters and has no target-memory operation; it may be attempted once under the current profiling policy after fixture validation. If that safe mode is blocked, stop rather than retrying. Any future breakpoint/DAC RDM proof requires a new explicit direction plus written approval from the application owner and endpoint-security owner for the designated test VM and RDM build. That approval must state the allowed debugger operations; it does not authorize disabling, weakening, bypassing, or otherwise altering Sophos, HitmanPro.Alert, or RDM protections.
 
+## Daemon-owned live controls
+
+After `live start` or `live attach` returns a target id, use typed DbgEng controls
+through the daemon rather than shelling out to CDB:
+
+```powershell
+# Create a deferred code breakpoint; module symbols may load later.
+target\debug\windbg-tool.exe breakpoint set --target 1 --symbol 'app!EntryPoint'
+target\debug\windbg-tool.exe breakpoint disable --target 1 --breakpoint-id 0
+target\debug\windbg-tool.exe breakpoint enable --target 1 --breakpoint-id 0
+
+# Step over one instruction, or resume until one bounded stop.
+target\debug\windbg-tool.exe target step-over --target 1
+target\debug\windbg-tool.exe target continue-wait --target 1 --timeout-ms 5000 `
+  --capture-debuggee-output --max-output-records 32 --max-output-chars 512
+```
+
+`continue-wait` returns the DbgEng execution status and, when the target stopped,
+best-effort stop-event metadata. Its debuggee output capture is opt-in and bounded
+by record count and character limits; the preceding DbgEng callback and output mask
+are restored before the command returns. It is not a continuous event or output
+stream. Step-out remains intentionally unavailable because the typed DbgEng API has
+no equivalent execution status.
+
 ## AI-oriented DbgEng target inspection
 
 Daemon-owned live and dump targets expose bounded, read-only inspection commands for agent workflows. After `target wait` reports a stop on a live target, use `target event` to identify the DbgEng event that caused it. The response includes the process/thread IDs, event type, and, where DbgEng provides it, a breakpoint ID, exception code/address/first-chance state, module base, or exit code. It does not return unbounded debugger output. Event inspection is unavailable for dump targets because a dump has no live event stream.

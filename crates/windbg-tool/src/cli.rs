@@ -10,6 +10,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use windbg_ttd::backend::{capability_catalog, capability_contract};
 use windbg_ttd::daemon::{default_pipe_name, run_daemon, DaemonClient};
 use windbg_ttd::server::TtdMcpServer;
 use windbg_ttd::tools::{self, ToolCall};
@@ -436,6 +437,10 @@ enum BreakpointCommand {
     List(TargetIdArgs),
     #[command(about = "Set a code or data breakpoint for a daemon-owned live target")]
     Set(BreakpointSetArgs),
+    #[command(about = "Enable an existing breakpoint for a daemon-owned live target")]
+    Enable(BreakpointEnableArgs),
+    #[command(about = "Disable an existing breakpoint for a daemon-owned live target")]
+    Disable(BreakpointEnableArgs),
     #[command(about = "Remove a breakpoint from a daemon-owned live target")]
     Remove(BreakpointRemoveArgs),
     #[command(about = "Plan a breakpoint or watchpoint without mutating the target")]
@@ -480,8 +485,14 @@ enum TargetCommand {
     Wait(TargetWaitArgs),
     #[command(about = "Continue execution of a daemon-owned live target")]
     Continue(TargetIdArgs),
+    #[command(
+        about = "Continue a live target and wait for one bounded stop, with optional debuggee output"
+    )]
+    ContinueWait(TargetContinueWaitArgs),
     #[command(about = "Single-step a daemon-owned live target")]
     Step(TargetIdArgs),
+    #[command(about = "Step over one instruction in a daemon-owned live target")]
+    StepOver(TargetIdArgs),
     #[command(about = "List threads for a daemon-owned target")]
     Threads(TargetIdArgs),
     #[command(
@@ -1542,6 +1553,25 @@ struct TargetWaitArgs {
 }
 
 #[derive(Debug, Args)]
+struct TargetContinueWaitArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long, default_value_t = 5000)]
+    timeout_ms: u32,
+    #[arg(
+        long,
+        help = "Capture bounded debuggee output during this one continue-and-wait operation"
+    )]
+    capture_debuggee_output: bool,
+    #[arg(long, default_value_t = 32, requires = "capture_debuggee_output")]
+    max_output_records: u32,
+    #[arg(long, default_value_t = 512, requires = "capture_debuggee_output")]
+    max_output_chars: u32,
+    #[arg(long, default_value_t = 8192, requires = "capture_debuggee_output")]
+    max_total_output_chars: u32,
+}
+
+#[derive(Debug, Args)]
 struct TargetAddressArgs {
     #[arg(short = 't', long = "target")]
     target: u64,
@@ -1647,8 +1677,15 @@ struct TargetDisasmArgs {
 struct BreakpointSetArgs {
     #[arg(short = 't', long = "target")]
     target: u64,
-    #[arg(long)]
-    address: String,
+    #[arg(long, required_unless_present = "symbol", conflicts_with = "symbol")]
+    address: Option<String>,
+    #[arg(
+        long,
+        required_unless_present = "address",
+        conflicts_with = "address",
+        help = "Deferred DbgEng code-breakpoint expression, for example module!symbol"
+    )]
+    symbol: Option<String>,
     #[arg(long, default_value = "code", value_parser = ["code", "read", "write", "execute", "read_write"])]
     kind: String,
     #[arg(long)]
@@ -1657,6 +1694,14 @@ struct BreakpointSetArgs {
 
 #[derive(Debug, Args)]
 struct BreakpointRemoveArgs {
+    #[arg(short = 't', long = "target")]
+    target: u64,
+    #[arg(long)]
+    breakpoint_id: u32,
+}
+
+#[derive(Debug, Args)]
+struct BreakpointEnableArgs {
     #[arg(short = 't', long = "target")]
     target: u64,
     #[arg(long)]
@@ -2276,6 +2321,7 @@ async fn target_capabilities_and_print(
         json!({
             "selected_ttd": selected_ttd,
             "daemon_targets": daemon_targets,
+            "backend_contracts": capability_catalog(),
             "target_kinds": [
                 {
                     "kind": "ttd_trace",
@@ -2387,14 +2433,24 @@ async fn debug_capabilities_and_print(
                 "subject": debug_subject_value(&DebugSubject::Ttd { session, cursor }),
                 "capabilities": capabilities,
                 "architecture": architecture,
-                "matrix": backend_capability("ttd_cursor")
+                "matrix": capability_contract("ttd_cursor")
             }))
         }
-        Some(DebugSubject::Target { target }) => Some(json!({
-            "subject": debug_subject_value(&DebugSubject::Target { target }),
-            "status": call_status_value(client.call_tool(target_call("target_status", target)).await),
-            "matrix": backend_capability("dbgeng_target")
-        })),
+        Some(DebugSubject::Target { target }) => {
+            let status =
+                call_status_value(client.call_tool(target_call("target_status", target)).await);
+            let backend = if status.pointer("/target/kind").and_then(Value::as_str) == Some("dump")
+            {
+                "dbgeng_dump"
+            } else {
+                "dbgeng_live"
+            };
+            Some(json!({
+                "subject": debug_subject_value(&DebugSubject::Target { target }),
+                "status": status,
+                "matrix": capability_contract(backend)
+            }))
+        }
         None => None,
     };
     print_value(
@@ -2402,12 +2458,7 @@ async fn debug_capabilities_and_print(
             "schema_version": 1,
             "canonical_command": "debug capabilities",
             "selected": selected,
-            "backend_matrix": [
-                backend_capability("ttd_cursor"),
-                backend_capability("dbgeng_live"),
-                backend_capability("dbgeng_dump"),
-                backend_capability("dbgeng_remote_plan")
-            ],
+            "backend_matrix": capability_catalog(),
             "safe_command_taxonomy": safe_command_taxonomy()
         }),
         output,
@@ -2526,7 +2577,13 @@ async fn debug_target_snapshot_value(
                 "status": "ok",
                 "duration_ms": 0,
                 "truncated": false,
-                "value": backend_capability("dbgeng_target"),
+                "value": {
+                    "selection": "target kind is resolved by debug capabilities --target <id>",
+                    "candidates": [
+                        capability_contract("dbgeng_live"),
+                        capability_contract("dbgeng_dump")
+                    ]
+                },
                 "diagnostics": [],
                 "command": "debug capabilities --target <id>"
             }),
@@ -4066,105 +4123,6 @@ fn filter_sections(sections: &mut Map<String, Value>, include: &[String], exclud
     }
 }
 
-fn backend_capability(kind: &str) -> Value {
-    match kind {
-        "ttd_cursor" => json!({
-            "backend": "ttd_cursor",
-            "can_read_memory": true,
-            "can_disassemble": true,
-            "can_stack": true,
-            "can_query_symbols": true,
-            "can_query_source": true,
-            "can_step": true,
-            "can_continue": false,
-            "can_set_breakpoint": false,
-            "can_set_data_breakpoint": true,
-            "can_write_dump": false,
-            "can_time_travel": true,
-            "supports_jobs": true,
-            "supports_timeline": true,
-            "required_identifiers": ["session_id", "cursor_id"],
-            "safe_commands": ["debug snapshot", "timeline events", "memory read", "stack backtrace", "symbols nearest"],
-            "mutating_commands": ["position set", "step"],
-            "destructive_commands": ["close"],
-            "unsupported_operations": [
-                { "operation": "live_continue", "reason": "TTD cursors replay; they do not continue a live process." }
-            ]
-        }),
-        "dbgeng_live" | "dbgeng_target" => json!({
-            "backend": "dbgeng_live",
-            "can_read_memory": true,
-            "can_disassemble": true,
-            "can_stack": true,
-            "can_query_symbols": true,
-            "can_query_source": true,
-            "can_query_virtual_memory_map": "live_user_mode_only",
-            "can_step": true,
-            "can_continue": true,
-            "can_set_breakpoint": true,
-            "can_set_data_breakpoint": false,
-            "can_write_dump": true,
-            "can_time_travel": false,
-            "supports_jobs": false,
-            "supports_timeline": false,
-            "required_identifiers": ["target_id"],
-            "safe_commands": ["debug snapshot", "target status", "target event", "target thread", "target stack", "target disasm", "target memory-map", "breakpoint plan"],
-            "mutating_commands": ["target continue", "target step", "breakpoint set", "target dump"],
-            "destructive_commands": ["target terminate", "target close"],
-            "unsupported_operations": [
-                { "operation": "time_travel", "reason": "Live DbgEng targets are not TTD replay cursors." }
-            ]
-        }),
-        "dbgeng_dump" => json!({
-            "backend": "dbgeng_dump",
-            "can_read_memory": true,
-            "can_disassemble": true,
-            "can_stack": true,
-            "can_query_symbols": true,
-            "can_query_source": true,
-            "can_step": false,
-            "can_continue": false,
-            "can_set_breakpoint": false,
-            "can_set_data_breakpoint": false,
-            "can_write_dump": false,
-            "can_time_travel": false,
-            "supports_jobs": false,
-            "supports_timeline": false,
-            "required_identifiers": ["target_id"],
-            "safe_commands": ["debug snapshot", "target status", "target thread", "target stack", "target disasm"],
-            "mutating_commands": [],
-            "destructive_commands": ["target close"],
-            "unsupported_operations": [
-                { "operation": "execution_control", "reason": "Dump targets are immutable snapshots." }
-            ]
-        }),
-        "dbgeng_remote_plan" => json!({
-            "backend": "dbgeng_remote_plan",
-            "can_read_memory": false,
-            "can_disassemble": false,
-            "can_stack": false,
-            "can_query_symbols": false,
-            "can_query_source": false,
-            "can_step": false,
-            "can_continue": false,
-            "can_set_breakpoint": false,
-            "can_set_data_breakpoint": false,
-            "can_write_dump": false,
-            "can_time_travel": false,
-            "supports_jobs": false,
-            "supports_timeline": false,
-            "required_identifiers": ["transport"],
-            "safe_commands": ["remote doctor", "remote status", "remote plan", "remote server-command", "remote connect-command"],
-            "mutating_commands": [],
-            "destructive_commands": [],
-            "unsupported_operations": [
-                { "operation": "debugger_actions", "reason": "Remote plan commands generate connection instructions; attach/launch happens after connecting." }
-            ]
-        }),
-        _ => json!({ "backend": kind, "status": "unknown" }),
-    }
-}
-
 fn safe_command_taxonomy() -> Value {
     json!({
         "safe": "Read-only commands that inspect local state, debugger state, or generate command lines.",
@@ -5381,7 +5339,9 @@ fn tool_command_map() -> Value {
         { "tool": "target_terminate", "commands": ["target terminate"] },
         { "tool": "target_wait", "commands": ["target wait"] },
         { "tool": "target_continue", "commands": ["target continue"] },
+        { "tool": "target_continue_wait", "commands": ["target continue-wait"] },
         { "tool": "target_step_into", "commands": ["target step"] },
+        { "tool": "target_step_over", "commands": ["target step-over"] },
         { "tool": "target_core_registers", "commands": ["target registers"] },
         { "tool": "target_last_event", "commands": ["target event", "debug snapshot --include event"] },
         { "tool": "target_read_memory", "commands": ["target memory"] },
@@ -5398,6 +5358,7 @@ fn tool_command_map() -> Value {
         { "tool": "target_disassemble", "commands": ["target disasm"] },
         { "tool": "target_list_breakpoints", "commands": ["breakpoint list"] },
         { "tool": "target_set_breakpoint", "commands": ["breakpoint set"] },
+        { "tool": "target_set_breakpoint_enabled", "commands": ["breakpoint enable", "breakpoint disable"] },
         { "tool": "target_remove_breakpoint", "commands": ["breakpoint remove"] },
         { "tool": "target_evaluate_expression", "commands": ["datamodel eval"] },
         { "tool": "job_start_watch_memory_sweep", "commands": ["sweep watch-memory --background"] },
@@ -5977,6 +5938,20 @@ fn target_wait_call(args: TargetWaitArgs) -> ToolCall {
     }
 }
 
+fn target_continue_wait_call(args: TargetContinueWaitArgs) -> ToolCall {
+    ToolCall {
+        name: "target_continue_wait".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "timeout_ms": args.timeout_ms,
+            "capture_debuggee_output": args.capture_debuggee_output,
+            "max_output_records": args.max_output_records,
+            "max_output_chars": args.max_output_chars,
+            "max_total_output_chars": args.max_total_output_chars,
+        }),
+    }
+}
+
 fn target_memory_call(args: TargetMemoryReadArgs) -> anyhow::Result<ToolCall> {
     Ok(ToolCall {
         name: "target_read_memory".to_string(),
@@ -6097,11 +6072,18 @@ fn target_address_call(name: &str, args: TargetAddressArgs) -> anyhow::Result<To
 }
 
 fn breakpoint_set_call(args: BreakpointSetArgs) -> anyhow::Result<ToolCall> {
+    let address = args
+        .address
+        .as_deref()
+        .map(parse_u64_argument)
+        .transpose()?;
+
     Ok(ToolCall {
         name: "target_set_breakpoint".to_string(),
         arguments: json!({
             "target_id": args.target,
-            "address": parse_u64_argument(&args.address)?,
+            "address": address,
+            "symbol": args.symbol,
             "kind": args.kind,
             "size": args.size,
         }),
@@ -6114,6 +6096,17 @@ fn breakpoint_remove_call(args: BreakpointRemoveArgs) -> ToolCall {
         arguments: json!({
             "target_id": args.target,
             "breakpoint_id": args.breakpoint_id,
+        }),
+    }
+}
+
+fn breakpoint_enable_call(args: BreakpointEnableArgs, enabled: bool) -> ToolCall {
+    ToolCall {
+        name: "target_set_breakpoint_enabled".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "breakpoint_id": args.breakpoint_id,
+            "enabled": enabled,
         }),
     }
 }
@@ -8387,6 +8380,43 @@ mod tests {
             module_bases: vec!["0x1000".to_string(), "0x1000".to_string()],
         })
         .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn builds_live_control_tool_calls() -> anyhow::Result<()> {
+        let breakpoint = breakpoint_set_call(BreakpointSetArgs {
+            target: 7,
+            address: None,
+            symbol: Some("app!EntryPoint".to_string()),
+            kind: "code".to_string(),
+            size: None,
+        })?;
+        assert_eq!(breakpoint.name, "target_set_breakpoint");
+        assert_eq!(breakpoint.arguments["address"], Value::Null);
+        assert_eq!(breakpoint.arguments["symbol"], "app!EntryPoint");
+
+        let output = target_continue_wait_call(TargetContinueWaitArgs {
+            target: 7,
+            timeout_ms: 500,
+            capture_debuggee_output: true,
+            max_output_records: 4,
+            max_output_chars: 64,
+            max_total_output_chars: 256,
+        });
+        assert_eq!(output.name, "target_continue_wait");
+        assert_eq!(output.arguments["capture_debuggee_output"], true);
+        assert_eq!(output.arguments["max_total_output_chars"], 256);
+
+        let disable = breakpoint_enable_call(
+            BreakpointEnableArgs {
+                target: 7,
+                breakpoint_id: 3,
+            },
+            false,
+        );
+        assert_eq!(disable.name, "target_set_breakpoint_enabled");
+        assert_eq!(disable.arguments["enabled"], false);
         Ok(())
     }
 }

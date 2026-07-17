@@ -260,7 +260,7 @@ mod windows {
             (&Method::GET, "/targets") => Ok(json_response(
                 StatusCode::OK,
                 json!({
-                    "targets": service.targets().await,
+                    "targets": service.targets().await?,
                 }),
             )),
             (&Method::POST, "/tools/call") => {

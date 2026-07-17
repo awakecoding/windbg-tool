@@ -115,7 +115,7 @@ impl ReplayService {
         self.state.lock().await.ttd.session_summaries()
     }
 
-    pub async fn targets(&self) -> Vec<TargetSummary> {
-        self.state.lock().await.targets.list_targets().targets
+    pub async fn targets(&self) -> anyhow::Result<Vec<TargetSummary>> {
+        Ok(self.state.lock().await.targets.list_targets()?.targets)
     }
 }

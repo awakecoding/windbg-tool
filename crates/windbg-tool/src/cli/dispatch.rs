@@ -252,6 +252,12 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             BreakpointCommand::Set(args) => {
                 call_and_print(pipe, breakpoint_set_call(args)?, &output).await
             }
+            BreakpointCommand::Enable(args) => {
+                call_and_print(pipe, breakpoint_enable_call(args, true), &output).await
+            }
+            BreakpointCommand::Disable(args) => {
+                call_and_print(pipe, breakpoint_enable_call(args, false), &output).await
+            }
             BreakpointCommand::Remove(args) => {
                 call_and_print(pipe, breakpoint_remove_call(args), &output).await
             }
@@ -285,8 +291,14 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             TargetCommand::Continue(args) => {
                 call_and_print(pipe, target_call("target_continue", args.target), &output).await
             }
+            TargetCommand::ContinueWait(args) => {
+                call_and_print(pipe, target_continue_wait_call(args), &output).await
+            }
             TargetCommand::Step(args) => {
                 call_and_print(pipe, target_call("target_step_into", args.target), &output).await
+            }
+            TargetCommand::StepOver(args) => {
+                call_and_print(pipe, target_call("target_step_over", args.target), &output).await
             }
             TargetCommand::Threads(args) => {
                 call_and_print(

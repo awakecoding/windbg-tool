@@ -5,15 +5,18 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, SyncSender};
+use std::thread::{self, JoinHandle};
+use std::time::Instant;
 use windbg_dbgeng::{
     attach_live_session, launch_live_session, open_dump_session, BreakpointInfo, CoreRegisterState,
-    DebuggerEventInfo, DebuggerExecutionStatus, DebuggerSession, DebuggerSessionKind,
-    DebuggerSessionSummary, DisassemblyResult, DumpKind, DumpOpenOptions, DumpWriteOptions,
-    DumpWriteResult, EvaluationResult, LiveAttachOptions, LiveInitialStop,
-    LiveLaunchSessionOptions, MemoryReadResult, ModuleDebugParameters, ModuleInfo, SourceLocation,
-    StackFrameInfo, SymbolEntryRange, SymbolInfo, ThreadAccountingSnapshot, ThreadContext,
-    ThreadInfo, VirtualMemoryMap, MAX_MODULE_PARAMETER_QUERIES, MAX_THREAD_ACCOUNTING_THREADS,
-    MAX_VIRTUAL_MEMORY_MAP_REGIONS,
+    DebuggerEventInfo, DebuggerExecutionStatus, DebuggerOutputCaptureOptions, DebuggerRunResult,
+    DebuggerSession, DebuggerSessionKind, DebuggerSessionSummary, DisassemblyResult, DumpKind,
+    DumpOpenOptions, DumpWriteOptions, DumpWriteResult, EvaluationResult, LiveAttachOptions,
+    LiveInitialStop, LiveLaunchSessionOptions, MemoryReadResult, ModuleDebugParameters, ModuleInfo,
+    SourceLocation, StackFrameInfo, SymbolEntryRange, SymbolInfo, ThreadAccountingSnapshot,
+    ThreadContext, ThreadInfo, VirtualMemoryMap, MAX_MODULE_PARAMETER_QUERIES,
+    MAX_THREAD_ACCOUNTING_THREADS, MAX_VIRTUAL_MEMORY_MAP_REGIONS,
 };
 use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
@@ -29,9 +32,120 @@ pub struct TargetRegistry {
 }
 
 struct ManagedTarget {
-    session: DebuggerSession,
+    worker: EngineWorker,
     native_symbols: Value,
     native_symbol_options: Option<NativeSymbolOptions>,
+}
+
+enum EngineCommand {
+    Run(Box<dyn FnOnce(&DebuggerSession) + Send + 'static>),
+    Shutdown {
+        detach_live_target: bool,
+        response: mpsc::Sender<()>,
+    },
+}
+
+/// Owns a DbgEng client on one dedicated thread. DbgEng requests are serialized
+/// even when future daemon callers no longer hold the global service-state lock.
+struct EngineWorker {
+    kind: DebuggerSessionKind,
+    sender: Option<SyncSender<EngineCommand>>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl EngineWorker {
+    fn new(session: DebuggerSession) -> anyhow::Result<Self> {
+        let kind = session.kind();
+        let (sender, receiver) = mpsc::sync_channel::<EngineCommand>(64);
+        let join = thread::Builder::new()
+            .name("windbg-dbgeng-engine".to_string())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        EngineCommand::Run(operation) => operation(&session),
+                        EngineCommand::Shutdown {
+                            detach_live_target,
+                            response,
+                        } => {
+                            if detach_live_target && session.kind() == DebuggerSessionKind::Live {
+                                let _ = session.detach();
+                            }
+                            let _ = response.send(());
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("starting the serialized DbgEng engine worker")?;
+        Ok(Self {
+            kind,
+            sender: Some(sender),
+            join: Some(join),
+        })
+    }
+
+    fn kind(&self) -> DebuggerSessionKind {
+        self.kind
+    }
+
+    fn call<T, F>(&self, operation: &'static str, action: F) -> anyhow::Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&DebuggerSession) -> anyhow::Result<T> + Send + 'static,
+    {
+        let sender = self
+            .sender
+            .as_ref()
+            .context("DbgEng engine worker is closed")?;
+        let (response_sender, response_receiver) = mpsc::sync_channel(1);
+        sender
+            .send(EngineCommand::Run(Box::new(move |session| {
+                let _ = response_sender.send(action(session));
+            })))
+            .map_err(|_| {
+                anyhow::anyhow!("DbgEng engine worker closed while queueing {operation}")
+            })?;
+        response_receiver
+            .recv()
+            .with_context(|| format!("waiting for DbgEng {operation} response"))?
+    }
+
+    fn shutdown(&mut self, detach_live_target: bool) -> anyhow::Result<()> {
+        let Some(sender) = self.sender.take() else {
+            return Ok(());
+        };
+        let (response_sender, response_receiver) = mpsc::channel();
+        sender
+            .send(EngineCommand::Shutdown {
+                detach_live_target,
+                response: response_sender,
+            })
+            .map_err(|_| anyhow::anyhow!("DbgEng engine worker closed during shutdown"))?;
+        response_receiver
+            .recv()
+            .context("waiting for DbgEng engine worker shutdown")?;
+        if let Some(join) = self.join.take() {
+            join.join()
+                .map_err(|_| anyhow::anyhow!("DbgEng engine worker panicked during shutdown"))?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for EngineWorker {
+    fn drop(&mut self) {
+        let _ = self.shutdown(true);
+    }
+}
+
+impl ManagedTarget {
+    fn kind(&self) -> DebuggerSessionKind {
+        self.worker.kind()
+    }
+
+    fn summary(&self) -> anyhow::Result<DebuggerSessionSummary> {
+        self.worker.call("summary", |session| Ok(session.summary()))
+    }
 }
 
 #[derive(Clone)]
@@ -78,6 +192,24 @@ pub struct TargetWaitRequest {
     pub target_id: TargetId,
     #[serde(default = "default_live_wait_timeout_ms")]
     pub timeout_ms: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetContinueWaitRequest {
+    pub target_id: TargetId,
+    #[serde(default = "default_live_wait_timeout_ms")]
+    pub timeout_ms: u32,
+    #[serde(default)]
+    pub capture_debuggee_output: bool,
+    #[serde(default = "default_target_output_records")]
+    #[schemars(range(min = 1, max = 128))]
+    pub max_output_records: u32,
+    #[serde(default = "default_target_output_chars")]
+    #[schemars(range(min = 1, max = 4096))]
+    pub max_output_chars: u32,
+    #[serde(default = "default_target_output_total_chars")]
+    #[schemars(range(min = 1, max = 32768))]
+    pub max_total_output_chars: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -188,7 +320,8 @@ pub enum TargetBreakpointKind {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct TargetBreakpointSetRequest {
     pub target_id: TargetId,
-    pub address: u64,
+    pub address: Option<u64>,
+    pub symbol: Option<String>,
     #[serde(default)]
     pub kind: Option<TargetBreakpointKind>,
     pub size: Option<u32>,
@@ -198,6 +331,13 @@ pub struct TargetBreakpointSetRequest {
 pub struct TargetBreakpointRemoveRequest {
     pub target_id: TargetId,
     pub breakpoint_id: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TargetBreakpointEnableRequest {
+    pub target_id: TargetId,
+    pub breakpoint_id: u32,
+    pub enabled: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -243,6 +383,12 @@ pub struct TargetRegisterState {
 pub struct TargetEventResponse {
     pub target_id: TargetId,
     pub event: DebuggerEventInfo,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetContinueWaitResponse {
+    pub target_id: TargetId,
+    pub run: DebuggerRunResult,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -342,18 +488,20 @@ pub struct TargetWriteDumpResponse {
 }
 
 impl TargetRegistry {
-    pub fn list_targets(&self) -> TargetListResponse {
+    pub fn list_targets(&self) -> anyhow::Result<TargetListResponse> {
         let mut targets = self
             .targets
             .iter()
-            .map(|(target_id, target)| TargetSummary {
-                target_id: *target_id,
-                target: target.session.summary(),
-                native_symbols: target.native_symbols.clone(),
+            .map(|(target_id, target)| {
+                Ok(TargetSummary {
+                    target_id: *target_id,
+                    target: target.summary()?,
+                    native_symbols: target.native_symbols.clone(),
+                })
             })
-            .collect::<Vec<_>>();
+            .collect::<anyhow::Result<Vec<_>>>()?;
         targets.sort_by_key(|target| target.target_id);
-        TargetListResponse { targets }
+        Ok(TargetListResponse { targets })
     }
 
     pub fn target_count(&self) -> usize {
@@ -363,14 +511,14 @@ impl TargetRegistry {
     pub fn live_target_count(&self) -> usize {
         self.targets
             .values()
-            .filter(|target| target.session.kind() == DebuggerSessionKind::Live)
+            .filter(|target| target.kind() == DebuggerSessionKind::Live)
             .count()
     }
 
     pub fn dump_target_count(&self) -> usize {
         self.targets
             .values()
-            .filter(|target| target.session.kind() == DebuggerSessionKind::Dump)
+            .filter(|target| target.kind() == DebuggerSessionKind::Dump)
             .count()
     }
 
@@ -387,7 +535,7 @@ impl TargetRegistry {
                 LiveInitialStop::SoftwareBreakpoint
             },
         })?;
-        Ok(self.insert_target(session, Value::Null, None))
+        self.insert_target(session, Value::Null, None)
     }
 
     pub fn attach_live(
@@ -398,7 +546,7 @@ impl TargetRegistry {
             process_id: request.process_id,
             initial_break_timeout_ms: request.initial_break_timeout_ms,
         })?;
-        Ok(self.insert_target(session, Value::Null, None))
+        self.insert_target(session, Value::Null, None)
     }
 
     pub fn open_dump(&mut self, request: DumpOpenRequest) -> anyhow::Result<TargetOpenedResponse> {
@@ -415,27 +563,28 @@ impl TargetRegistry {
             &native_symbol_options.image_paths,
             native_symbol_options.offline,
         );
-        Ok(self.insert_target(session, native_symbols, Some(native_symbol_options)))
+        self.insert_target(session, native_symbols, Some(native_symbol_options))
     }
 
     pub fn target_status(&self, request: TargetRequest) -> anyhow::Result<TargetSummary> {
         let target = self.target(request.target_id)?;
         Ok(TargetSummary {
             target_id: request.target_id,
-            target: target.session.summary(),
+            target: target.summary()?,
             native_symbols: target.native_symbols.clone(),
         })
     }
 
     pub fn close_target(&mut self, request: TargetRequest) -> anyhow::Result<TargetClosedResponse> {
-        let target = self
+        let mut target = self
             .targets
             .remove(&request.target_id)
             .with_context(|| format!("unknown target id: {}", request.target_id))?;
-        let detached = matches!(target.session.kind(), DebuggerSessionKind::Live);
+        let detached = matches!(target.kind(), DebuggerSessionKind::Live);
         if detached {
-            target.session.detach()?;
+            target.worker.call("detach", |session| session.detach())?;
         }
+        target.worker.shutdown(false)?;
         Ok(TargetClosedResponse {
             target_id: request.target_id,
             closed: true,
@@ -448,14 +597,17 @@ impl TargetRegistry {
         &mut self,
         request: TargetRequest,
     ) -> anyhow::Result<TargetClosedResponse> {
-        let target = self
+        let mut target = self
             .targets
             .remove(&request.target_id)
             .with_context(|| format!("unknown target id: {}", request.target_id))?;
-        if target.session.kind() != DebuggerSessionKind::Live {
+        if target.kind() != DebuggerSessionKind::Live {
             bail!("target {} is not a live session", request.target_id);
         }
-        target.session.terminate()?;
+        target
+            .worker
+            .call("terminate", |session| session.terminate())?;
+        target.worker.shutdown(false)?;
         Ok(TargetClosedResponse {
             target_id: request.target_id,
             closed: true,
@@ -468,9 +620,12 @@ impl TargetRegistry {
         &self,
         request: TargetWaitRequest,
     ) -> anyhow::Result<DebuggerExecutionStatus> {
+        let timeout_ms = request.timeout_ms;
         self.target(request.target_id)?
-            .session
-            .wait_for_event(request.timeout_ms)
+            .worker
+            .call("wait_for_event", move |session| {
+                session.wait_for_event(timeout_ms)
+            })
     }
 
     pub fn continue_execution(
@@ -478,30 +633,71 @@ impl TargetRegistry {
         request: TargetRequest,
     ) -> anyhow::Result<DebuggerExecutionStatus> {
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
-        target.session.continue_execution()
+        ensure_live_target(request.target_id, target.kind())?;
+        target
+            .worker
+            .call("continue_execution", |session| session.continue_execution())
     }
 
     pub fn step_into(&self, request: TargetRequest) -> anyhow::Result<DebuggerExecutionStatus> {
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
-        target.session.step_into()
+        ensure_live_target(request.target_id, target.kind())?;
+        target
+            .worker
+            .call("step_into", |session| session.step_into())
+    }
+
+    pub fn step_over(&self, request: TargetRequest) -> anyhow::Result<DebuggerExecutionStatus> {
+        let target = self.target(request.target_id)?;
+        ensure_live_target(request.target_id, target.kind())?;
+        target
+            .worker
+            .call("step_over", |session| session.step_over())
+    }
+
+    pub fn continue_and_wait(
+        &self,
+        request: TargetContinueWaitRequest,
+    ) -> anyhow::Result<TargetContinueWaitResponse> {
+        validate_target_output_capture(&request)?;
+        let target = self.target(request.target_id)?;
+        ensure_live_target(request.target_id, target.kind())?;
+        let timeout_ms = request.timeout_ms;
+        let output_options =
+            request
+                .capture_debuggee_output
+                .then(|| DebuggerOutputCaptureOptions {
+                    started_at: Instant::now(),
+                    max_records: request.max_output_records,
+                    max_chars_per_record: request.max_output_chars,
+                    max_total_chars: request.max_total_output_chars,
+                });
+        Ok(TargetContinueWaitResponse {
+            target_id: request.target_id,
+            run: target.worker.call("continue_and_wait", move |session| {
+                session.continue_and_wait(timeout_ms, output_options)
+            })?,
+        })
     }
 
     pub fn core_registers(&self, request: TargetRequest) -> anyhow::Result<TargetRegisterState> {
         let target = self.target(request.target_id)?;
         Ok(TargetRegisterState {
             target_id: request.target_id,
-            registers: target.session.core_registers()?,
+            registers: target
+                .worker
+                .call("core_registers", |session| session.core_registers())?,
         })
     }
 
     pub fn last_event(&self, request: TargetRequest) -> anyhow::Result<TargetEventResponse> {
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
+        ensure_live_target(request.target_id, target.kind())?;
         Ok(TargetEventResponse {
             target_id: request.target_id,
-            event: target.session.last_event()?,
+            event: target
+                .worker
+                .call("last_event", |session| session.last_event())?,
         })
     }
 
@@ -510,9 +706,13 @@ impl TargetRegistry {
         request: TargetMemoryReadRequest,
     ) -> anyhow::Result<TargetMemoryReadResponse> {
         let target = self.target(request.target_id)?;
+        let address = request.address;
+        let size = request.size;
         Ok(TargetMemoryReadResponse {
             target_id: request.target_id,
-            memory: target.session.read_memory(request.address, request.size)?,
+            memory: target.worker.call("read_memory", move |session| {
+                session.read_memory(address, size)
+            })?,
         })
     }
 
@@ -522,10 +722,13 @@ impl TargetRegistry {
     ) -> anyhow::Result<TargetMemoryMapResponse> {
         validate_target_memory_map_region_limit(request.region_limit)?;
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
+        ensure_live_target(request.target_id, target.kind())?;
+        let region_limit = request.region_limit;
         Ok(TargetMemoryMapResponse {
             target_id: request.target_id,
-            memory_map: target.session.virtual_memory_map(request.region_limit)?,
+            memory_map: target.worker.call("virtual_memory_map", move |session| {
+                session.virtual_memory_map(region_limit)
+            })?,
         })
     }
 
@@ -533,7 +736,9 @@ impl TargetRegistry {
         let target = self.target(request.target_id)?;
         Ok(TargetThreadList {
             target_id: request.target_id,
-            threads: target.session.threads()?,
+            threads: target
+                .worker
+                .call("list_threads", |session| session.threads())?,
         })
     }
 
@@ -543,11 +748,14 @@ impl TargetRegistry {
     ) -> anyhow::Result<TargetThreadAccountingResponse> {
         validate_target_thread_accounting_limit(request.max_threads)?;
         let target = self.target(request.target_id)?;
+        let max_threads = request.max_threads;
         Ok(TargetThreadAccountingResponse {
             target_id: request.target_id,
             thread_accounting: target
-                .session
-                .thread_accounting_snapshot(request.max_threads)?,
+                .worker
+                .call("thread_accounting_snapshot", move |session| {
+                    session.thread_accounting_snapshot(max_threads)
+                })?,
         })
     }
 
@@ -557,10 +765,13 @@ impl TargetRegistry {
     ) -> anyhow::Result<TargetModuleParametersResponse> {
         validate_target_module_parameter_bases(&request.module_base_addresses)?;
         let target = self.target(request.target_id)?;
+        let module_base_addresses = request.module_base_addresses;
         Ok(TargetModuleParametersResponse {
             target_id: request.target_id,
             source: "dbgeng_idebugsymbols5_getmoduleparameters".to_string(),
-            parameters: target.session.module_parameters(&request.module_base_addresses)?,
+            parameters: target.worker.call("module_parameters", move |session| {
+                session.module_parameters(&module_base_addresses)
+            })?,
             detail: "This bounded DbgEng symbol-readiness query applies only to supplied module base addresses. Its result describes debugger module metadata, not target timing; configured symbol paths can cause host-side symbol-resolution I/O.".to_string(),
         })
     }
@@ -570,11 +781,14 @@ impl TargetRegistry {
         request: TargetAddressRequest,
     ) -> anyhow::Result<TargetSymbolEntryRangeResponse> {
         let target = self.target(request.target_id)?;
+        let address = request.address;
         Ok(TargetSymbolEntryRangeResponse {
             target_id: request.target_id,
             symbol_entry_range: target
-                .session
-                .symbol_entry_range_by_offset(request.address)?,
+                .worker
+                .call("symbol_entry_range_by_offset", move |session| {
+                    session.symbol_entry_range_by_offset(address)
+                })?,
         })
     }
 
@@ -582,7 +796,9 @@ impl TargetRegistry {
         let target = self.target(request.target_id)?;
         Ok(TargetModuleList {
             target_id: request.target_id,
-            modules: target.session.modules()?,
+            modules: target
+                .worker
+                .call("list_modules", |session| session.modules())?,
         })
     }
 
@@ -591,10 +807,13 @@ impl TargetRegistry {
         request: TargetAddressRequest,
     ) -> anyhow::Result<TargetSymbolResponse> {
         let target = self.target(request.target_id)?;
-        let native_symbols = prefetch_target_address(target, request.address);
+        let native_symbols = prefetch_target_address(target, request.address)?;
+        let address = request.address;
         Ok(TargetSymbolResponse {
             target_id: request.target_id,
-            symbol: target.session.symbol_by_offset(request.address)?,
+            symbol: target.worker.call("symbol_by_offset", move |session| {
+                session.symbol_by_offset(address)
+            })?,
             native_symbols,
         })
     }
@@ -604,10 +823,13 @@ impl TargetRegistry {
         request: TargetAddressRequest,
     ) -> anyhow::Result<TargetSourceResponse> {
         let target = self.target(request.target_id)?;
-        let native_symbols = prefetch_target_address(target, request.address);
+        let native_symbols = prefetch_target_address(target, request.address)?;
+        let address = request.address;
         Ok(TargetSourceResponse {
             target_id: request.target_id,
-            source: target.session.source_by_offset(request.address)?,
+            source: target.worker.call("source_by_offset", move |session| {
+                session.source_by_offset(address)
+            })?,
             native_symbols,
         })
     }
@@ -617,9 +839,12 @@ impl TargetRegistry {
         request: TargetStackTraceRequest,
     ) -> anyhow::Result<TargetStackTraceResponse> {
         let target = self.target(request.target_id)?;
+        let max_frames = request.max_frames;
         Ok(TargetStackTraceResponse {
             target_id: request.target_id,
-            frames: target.session.stack_trace(request.max_frames)?,
+            frames: target.worker.call("stack_trace", move |session| {
+                session.stack_trace(max_frames)
+            })?,
         })
     }
 
@@ -628,13 +853,14 @@ impl TargetRegistry {
         request: TargetThreadContextRequest,
     ) -> anyhow::Result<TargetThreadContextResponse> {
         let target = self.target(request.target_id)?;
+        let engine_thread_id = request.engine_thread_id;
+        let max_frames = request.max_frames;
+        let disassembly_count = request.disassembly_count;
         Ok(TargetThreadContextResponse {
             target_id: request.target_id,
-            context: target.session.thread_context(
-                request.engine_thread_id,
-                request.max_frames,
-                request.disassembly_count,
-            )?,
+            context: target.worker.call("thread_context", move |session| {
+                session.thread_context(engine_thread_id, max_frames, disassembly_count)
+            })?,
         })
     }
 
@@ -643,22 +869,29 @@ impl TargetRegistry {
         request: TargetDisassembleRequest,
     ) -> anyhow::Result<TargetDisassemblyResponse> {
         let target = self.target(request.target_id)?;
-        let native_symbols = request
-            .address
-            .and_then(|address| prefetch_target_address(target, address));
+        let native_symbols = match request.address {
+            Some(address) => prefetch_target_address(target, address)?,
+            None => None,
+        };
+        let address = request.address;
+        let count = request.count;
         Ok(TargetDisassemblyResponse {
             target_id: request.target_id,
-            disassembly: target.session.disassemble(request.address, request.count)?,
+            disassembly: target.worker.call("disassemble", move |session| {
+                session.disassemble(address, count)
+            })?,
             native_symbols,
         })
     }
 
     pub fn list_breakpoints(&self, request: TargetRequest) -> anyhow::Result<TargetBreakpointList> {
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
+        ensure_live_target(request.target_id, target.kind())?;
         Ok(TargetBreakpointList {
             target_id: request.target_id,
-            breakpoints: target.session.list_breakpoints()?,
+            breakpoints: target
+                .worker
+                .call("list_breakpoints", |session| session.list_breakpoints())?,
         })
     }
 
@@ -666,32 +899,62 @@ impl TargetRegistry {
         &self,
         request: TargetBreakpointSetRequest,
     ) -> anyhow::Result<TargetBreakpointChangeResponse> {
+        validate_breakpoint_set_request(&request)?;
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
+        ensure_live_target(request.target_id, target.kind())?;
         let kind = request.kind.unwrap_or(TargetBreakpointKind::Code);
-        let breakpoint = match kind {
-            TargetBreakpointKind::Code => target.session.add_code_breakpoint(request.address)?,
-            TargetBreakpointKind::Read => target.session.add_data_breakpoint(
-                request.address,
-                request.size.unwrap_or(1),
-                BREAK_READ,
-            )?,
-            TargetBreakpointKind::Write => target.session.add_data_breakpoint(
-                request.address,
-                request.size.unwrap_or(1),
-                BREAK_WRITE,
-            )?,
-            TargetBreakpointKind::Execute => target.session.add_data_breakpoint(
-                request.address,
-                request.size.unwrap_or(1),
-                BREAK_EXECUTE,
-            )?,
-            TargetBreakpointKind::ReadWrite => target.session.add_data_breakpoint(
-                request.address,
-                request.size.unwrap_or(1),
-                BREAK_READ | BREAK_WRITE,
-            )?,
-        };
+        let address = request.address;
+        let symbol = request.symbol;
+        let size = request.size.unwrap_or(1);
+        let breakpoint = target
+            .worker
+            .call("set_breakpoint", move |session| match kind {
+                TargetBreakpointKind::Code => match (address, symbol.as_deref()) {
+                    (Some(address), None) => session.add_code_breakpoint(address),
+                    (None, Some(symbol)) => session.add_code_breakpoint_expression(symbol),
+                    _ => unreachable!("validated code breakpoint location"),
+                },
+                TargetBreakpointKind::Read => session.add_data_breakpoint(
+                    address.context("data breakpoint requires an address")?,
+                    size,
+                    BREAK_READ,
+                ),
+                TargetBreakpointKind::Write => session.add_data_breakpoint(
+                    address.context("data breakpoint requires an address")?,
+                    size,
+                    BREAK_WRITE,
+                ),
+                TargetBreakpointKind::Execute => session.add_data_breakpoint(
+                    address.context("data breakpoint requires an address")?,
+                    size,
+                    BREAK_EXECUTE,
+                ),
+                TargetBreakpointKind::ReadWrite => session.add_data_breakpoint(
+                    address.context("data breakpoint requires an address")?,
+                    size,
+                    BREAK_READ | BREAK_WRITE,
+                ),
+            })?;
+        Ok(TargetBreakpointChangeResponse {
+            target_id: request.target_id,
+            breakpoint: Some(breakpoint),
+            removed: false,
+        })
+    }
+
+    pub fn set_breakpoint_enabled(
+        &self,
+        request: TargetBreakpointEnableRequest,
+    ) -> anyhow::Result<TargetBreakpointChangeResponse> {
+        let target = self.target(request.target_id)?;
+        ensure_live_target(request.target_id, target.kind())?;
+        let breakpoint_id = request.breakpoint_id;
+        let enabled = request.enabled;
+        let breakpoint = target
+            .worker
+            .call("set_breakpoint_enabled", move |session| {
+                session.set_breakpoint_enabled(breakpoint_id, enabled)
+            })?;
         Ok(TargetBreakpointChangeResponse {
             target_id: request.target_id,
             breakpoint: Some(breakpoint),
@@ -704,8 +967,11 @@ impl TargetRegistry {
         request: TargetBreakpointRemoveRequest,
     ) -> anyhow::Result<TargetBreakpointChangeResponse> {
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
-        target.session.remove_breakpoint(request.breakpoint_id)?;
+        ensure_live_target(request.target_id, target.kind())?;
+        let breakpoint_id = request.breakpoint_id;
+        target.worker.call("remove_breakpoint", move |session| {
+            session.remove_breakpoint(breakpoint_id)
+        })?;
         Ok(TargetBreakpointChangeResponse {
             target_id: request.target_id,
             breakpoint: None,
@@ -718,9 +984,12 @@ impl TargetRegistry {
         request: TargetExpressionRequest,
     ) -> anyhow::Result<TargetEvaluationResponse> {
         let target = self.target(request.target_id)?;
+        let expression = request.expression;
         Ok(TargetEvaluationResponse {
             target_id: request.target_id,
-            evaluation: target.session.evaluate(&request.expression)?,
+            evaluation: target
+                .worker
+                .call("evaluate", move |session| session.evaluate(&expression))?,
         })
     }
 
@@ -729,14 +998,17 @@ impl TargetRegistry {
         request: TargetWriteDumpRequest,
     ) -> anyhow::Result<TargetWriteDumpResponse> {
         let target = self.target(request.target_id)?;
-        ensure_live_target(request.target_id, &target.session)?;
+        ensure_live_target(request.target_id, target.kind())?;
+        let options = DumpWriteOptions {
+            path: request.path,
+            kind: request.kind.into(),
+            overwrite: request.overwrite,
+        };
         Ok(TargetWriteDumpResponse {
             target_id: request.target_id,
-            dump: target.session.write_dump(DumpWriteOptions {
-                path: request.path,
-                kind: request.kind.into(),
-                overwrite: request.overwrite,
-            })?,
+            dump: target
+                .worker
+                .call("write_dump", move |session| session.write_dump(options))?,
         })
     }
 
@@ -745,22 +1017,23 @@ impl TargetRegistry {
         session: DebuggerSession,
         native_symbols: Value,
         native_symbol_options: Option<NativeSymbolOptions>,
-    ) -> TargetOpenedResponse {
+    ) -> anyhow::Result<TargetOpenedResponse> {
         let target_id = self.allocate_target_id();
         let target = session.summary();
+        let worker = EngineWorker::new(session)?;
         self.targets.insert(
             target_id,
             ManagedTarget {
-                session,
+                worker,
                 native_symbols: native_symbols.clone(),
                 native_symbol_options,
             },
         );
-        TargetOpenedResponse {
+        Ok(TargetOpenedResponse {
             target_id,
             target,
             native_symbols,
-        }
+        })
     }
 
     fn allocate_target_id(&mut self) -> TargetId {
@@ -783,16 +1056,22 @@ fn default_native_symbol_cache() -> PathBuf {
     PathBuf::from(".windbg-symbol-cache")
 }
 
-fn prefetch_target_address(target: &ManagedTarget, address: u64) -> Option<Value> {
-    target.native_symbol_options.as_ref().map(|options| {
-        prefetch_dump_symbols(
-            &target.session,
-            Some(address),
-            &options.cache_dir,
-            &options.image_paths,
-            options.offline,
-        )
-    })
+fn prefetch_target_address(target: &ManagedTarget, address: u64) -> anyhow::Result<Option<Value>> {
+    let Some(options) = target.native_symbol_options.clone() else {
+        return Ok(None);
+    };
+    target
+        .worker
+        .call("prefetch_dump_symbols", move |session| {
+            Ok(prefetch_dump_symbols(
+                session,
+                Some(address),
+                &options.cache_dir,
+                &options.image_paths,
+                options.offline,
+            ))
+        })
+        .map(Some)
 }
 
 fn prefetch_dump_symbols(
@@ -1001,7 +1280,7 @@ fn prefetch_dump_symbols(
         .expect("PDB path has parent")
         .to_path_buf();
     let reload = session
-        .configure_local_symbol_paths(&[pdb_dir.clone()], &[image_directory])
+        .configure_local_symbol_paths(std::slice::from_ref(&pdb_dir), &[image_directory])
         .and_then(|()| {
             module
                 .module_name
@@ -1047,6 +1326,18 @@ fn default_target_thread_accounting_threads() -> u32 {
     32
 }
 
+fn default_target_output_records() -> u32 {
+    32
+}
+
+fn default_target_output_chars() -> u32 {
+    512
+}
+
+fn default_target_output_total_chars() -> u32 {
+    8192
+}
+
 fn validate_target_memory_map_region_limit(region_limit: u32) -> anyhow::Result<()> {
     ensure!(
         (1..=MAX_VIRTUAL_MEMORY_MAP_REGIONS).contains(&region_limit),
@@ -1082,12 +1373,53 @@ fn validate_target_module_parameter_bases(base_addresses: &[u64]) -> anyhow::Res
     Ok(())
 }
 
+fn validate_target_output_capture(request: &TargetContinueWaitRequest) -> anyhow::Result<()> {
+    if !request.capture_debuggee_output {
+        return Ok(());
+    }
+    ensure!(
+        (1..=128).contains(&request.max_output_records),
+        "target continue-wait max_output_records must be from 1 through 128"
+    );
+    ensure!(
+        (1..=4096).contains(&request.max_output_chars),
+        "target continue-wait max_output_chars must be from 1 through 4096"
+    );
+    ensure!(
+        (1..=32768).contains(&request.max_total_output_chars),
+        "target continue-wait max_total_output_chars must be from 1 through 32768"
+    );
+    Ok(())
+}
+
+fn validate_breakpoint_set_request(request: &TargetBreakpointSetRequest) -> anyhow::Result<()> {
+    ensure!(
+        request.address.is_some() != request.symbol.is_some(),
+        "target breakpoint requires exactly one of address or symbol"
+    );
+    let kind = request.kind.clone().unwrap_or(TargetBreakpointKind::Code);
+    if request.symbol.is_some() {
+        ensure!(
+            matches!(kind, TargetBreakpointKind::Code),
+            "target symbol breakpoints only support kind=code"
+        );
+        ensure!(
+            request
+                .symbol
+                .as_deref()
+                .is_some_and(|symbol| !symbol.trim().is_empty()),
+            "target symbol breakpoint expression cannot be empty"
+        );
+    }
+    Ok(())
+}
+
 fn default_target_disasm_count() -> u32 {
     16
 }
 
-fn ensure_live_target(target_id: TargetId, session: &DebuggerSession) -> anyhow::Result<()> {
-    if session.kind() != DebuggerSessionKind::Live {
+fn ensure_live_target(target_id: TargetId, kind: DebuggerSessionKind) -> anyhow::Result<()> {
+    if kind != DebuggerSessionKind::Live {
         bail!("target {target_id} is not a live session")
     }
     Ok(())
@@ -1135,5 +1467,55 @@ mod tests {
             &(0..=MAX_MODULE_PARAMETER_QUERIES as u64).collect::<Vec<_>>()
         )
         .is_err());
+    }
+
+    #[test]
+    fn validates_address_or_deferred_symbol_breakpoint_locations() {
+        let address = TargetBreakpointSetRequest {
+            target_id: 1,
+            address: Some(0x1000),
+            symbol: None,
+            kind: Some(TargetBreakpointKind::Code),
+            size: None,
+        };
+        assert!(validate_breakpoint_set_request(&address).is_ok());
+
+        let symbol = TargetBreakpointSetRequest {
+            target_id: 1,
+            address: None,
+            symbol: Some("kernel32!CreateFileW".to_string()),
+            kind: Some(TargetBreakpointKind::Code),
+            size: None,
+        };
+        assert!(validate_breakpoint_set_request(&symbol).is_ok());
+
+        let mut invalid = symbol.clone();
+        invalid.address = Some(0x1000);
+        assert!(validate_breakpoint_set_request(&invalid).is_err());
+        invalid.address = None;
+        invalid.symbol = Some("  ".to_string());
+        assert!(validate_breakpoint_set_request(&invalid).is_err());
+        invalid.symbol = Some("kernel32!CreateFileW".to_string());
+        invalid.kind = Some(TargetBreakpointKind::Write);
+        assert!(validate_breakpoint_set_request(&invalid).is_err());
+    }
+
+    #[test]
+    fn validates_output_capture_bounds_only_when_enabled() {
+        let disabled = TargetContinueWaitRequest {
+            target_id: 1,
+            timeout_ms: 1,
+            capture_debuggee_output: false,
+            max_output_records: 0,
+            max_output_chars: 0,
+            max_total_output_chars: 0,
+        };
+        assert!(validate_target_output_capture(&disabled).is_ok());
+
+        let enabled = TargetContinueWaitRequest {
+            capture_debuggee_output: true,
+            ..disabled
+        };
+        assert!(validate_target_output_capture(&enabled).is_err());
     }
 }
