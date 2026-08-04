@@ -732,7 +732,55 @@ pub struct VirtualAddressInspection {
     pub query_virtual_status: String,
     pub virtual_region: Option<VirtualMemoryRegion>,
     pub query_virtual_detail: String,
+    pub page_table_walk: X64PageTableWalk,
+    pub extension_command_bridge: ExtensionCommandBridgeStatus,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ExtensionCommandBridgeStatus {
+    pub status: String,
+    pub allowed_forms: Vec<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64PageTableWalk {
+    pub status: String,
+    pub address: u64,
+    pub virtual_address_bits: Option<u8>,
+    pub canonical: Option<bool>,
+    pub directory_table_base: Option<u64>,
+    pub root_physical_address: Option<u64>,
+    pub entries: Vec<X64PageTableEntry>,
+    pub final_mapping: Option<X64PageTableMapping>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64PageTableEntry {
+    pub level: String,
+    pub index: u16,
+    pub entry_physical_address: u64,
+    pub raw_value: u64,
+    pub present: bool,
+    pub writable: bool,
+    pub user_accessible: bool,
+    pub write_through: bool,
+    pub cache_disabled: bool,
+    pub accessed: bool,
+    pub dirty: Option<bool>,
+    pub large_page: bool,
+    pub global: Option<bool>,
+    pub no_execute: bool,
+    pub page_frame_number: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64PageTableMapping {
+    pub physical_address: u64,
+    pub page_size: u64,
+    pub page_size_name: String,
 }
 
 #[derive(Debug, Clone)]
@@ -1185,6 +1233,63 @@ unsafe impl Send for DebuggerSession {}
 
 #[cfg(not(windows))]
 pub struct DebuggerSession;
+
+const X64_PHYSICAL_ADDRESS_MASK: u64 = 0x000f_ffff_ffff_f000;
+
+fn x64_virtual_address_is_canonical(address: u64, virtual_address_bits: u8) -> bool {
+    debug_assert!(virtual_address_bits == 48 || virtual_address_bits == 57);
+    let sign_bit = u32::from(virtual_address_bits - 1);
+    let upper_bits = !0u64 << virtual_address_bits;
+    let upper = address & upper_bits;
+    let sign_extended_upper = if address & (1u64 << sign_bit) == 0 {
+        0
+    } else {
+        upper_bits
+    };
+    upper == sign_extended_upper
+}
+
+fn x64_page_table_entry(
+    level: &str,
+    index: u16,
+    entry_physical_address: u64,
+    raw_value: u64,
+) -> X64PageTableEntry {
+    let supports_large_page = matches!(level, "PDPTE" | "PDE");
+    let large_page = supports_large_page && raw_value & (1 << 7) != 0;
+    let is_leaf = level == "PTE" || large_page;
+    X64PageTableEntry {
+        level: level.to_string(),
+        index,
+        entry_physical_address,
+        raw_value,
+        present: raw_value & 1 != 0,
+        writable: raw_value & (1 << 1) != 0,
+        user_accessible: raw_value & (1 << 2) != 0,
+        write_through: raw_value & (1 << 3) != 0,
+        cache_disabled: raw_value & (1 << 4) != 0,
+        accessed: raw_value & (1 << 5) != 0,
+        dirty: is_leaf.then_some(raw_value & (1 << 6) != 0),
+        large_page,
+        global: is_leaf.then_some(raw_value & (1 << 8) != 0),
+        no_execute: raw_value & (1 << 63) != 0,
+        page_frame_number: (raw_value & X64_PHYSICAL_ADDRESS_MASK) >> 12,
+    }
+}
+
+fn unavailable_x64_page_table_walk(address: u64, detail: String) -> X64PageTableWalk {
+    X64PageTableWalk {
+        status: "unavailable".to_string(),
+        address,
+        virtual_address_bits: None,
+        canonical: None,
+        directory_table_base: None,
+        root_physical_address: None,
+        entries: Vec::new(),
+        final_mapping: None,
+        detail,
+    }
+}
 
 #[cfg(windows)]
 impl DebuggerSession {
@@ -1820,8 +1925,211 @@ impl DebuggerSession {
             query_virtual_status,
             virtual_region,
             query_virtual_detail,
+            page_table_walk: self.walk_x64_page_tables(address),
+            extension_command_bridge: ExtensionCommandBridgeStatus {
+                status: "unsupported".to_string(),
+                allowed_forms: vec![
+                    "!pte <canonical-x64-address>".to_string(),
+                    "!pool <canonical-x64-address>".to_string(),
+                ],
+                detail: "DbgEng IDebugControl::ExecuteWide executes synchronously on the owning debugger session. This wrapper has no safe, enforceable cancellation or timeout mechanism that can prevent a hung extension query without leaving the dump session in an indeterminate state. To preserve bounded, read-only analysis, no extension command is executed and no command output is claimed. The structured x64 page-table walker is the supported PTE diagnostic.".to_string(),
+            },
             detail: "A captured virtual-to-physical translation proves only that DbgEng can translate the address in this snapshot. QueryVirtual protection fields are reported only when DbgEng supplies them. Neither result reconstructs the PTE state or write permission at the historical fault instant.".to_string(),
         }
+    }
+
+    fn walk_x64_page_tables(&self, address: u64) -> X64PageTableWalk {
+        let cr4 = match self.evaluate("@cr4").and_then(|value| {
+            value
+                .unsigned_value
+                .context("DbgEng evaluated @cr4 without an unsigned integer result")
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                return unavailable_x64_page_table_walk(
+                    address,
+                    format!("DbgEng could not read @cr4 to determine x64 address width: {error}"),
+                )
+            }
+        };
+        let virtual_address_bits = if cr4 & (1 << 12) != 0 { 57 } else { 48 };
+        let canonical = x64_virtual_address_is_canonical(address, virtual_address_bits);
+        if !canonical {
+            return X64PageTableWalk {
+                status: "noncanonical_address".to_string(),
+                address,
+                virtual_address_bits: Some(virtual_address_bits),
+                canonical: Some(false),
+                directory_table_base: None,
+                root_physical_address: None,
+                entries: Vec::new(),
+                final_mapping: None,
+                detail: "The supplied virtual address is not canonical for the captured CR4.LA57 state; no physical page-table reads were attempted.".to_string(),
+            };
+        }
+        let directory_table_base = match self.evaluate("@cr3").and_then(|value| {
+            value
+                .unsigned_value
+                .context("DbgEng evaluated @cr3 without an unsigned integer result")
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                return unavailable_x64_page_table_walk(
+                    address,
+                    format!("DbgEng could not read @cr3 for the current captured processor context: {error}"),
+                )
+            }
+        };
+        let root_physical_address = directory_table_base & X64_PHYSICAL_ADDRESS_MASK;
+        if root_physical_address == 0 {
+            return X64PageTableWalk {
+                status: "unavailable".to_string(),
+                address,
+                virtual_address_bits: Some(virtual_address_bits),
+                canonical: Some(true),
+                directory_table_base: Some(directory_table_base),
+                root_physical_address: Some(root_physical_address),
+                entries: Vec::new(),
+                final_mapping: None,
+                detail: "The captured CR3 does not contain a nonzero page-table physical base."
+                    .to_string(),
+            };
+        }
+
+        let levels: &[(&str, u32)] = if virtual_address_bits == 57 {
+            &[
+                ("PML5E", 48),
+                ("PML4E", 39),
+                ("PDPTE", 30),
+                ("PDE", 21),
+                ("PTE", 12),
+            ]
+        } else {
+            &[("PML4E", 39), ("PDPTE", 30), ("PDE", 21), ("PTE", 12)]
+        };
+        let mut entries = Vec::with_capacity(levels.len());
+        let mut table_physical_address = root_physical_address;
+        for (level_index, (level, shift)) in levels.iter().enumerate() {
+            let index = ((address >> shift) & 0x1ff) as u16;
+            let Some(entry_physical_address) =
+                table_physical_address.checked_add(u64::from(index) * 8)
+            else {
+                return unavailable_x64_page_table_walk(
+                    address,
+                    "The calculated physical page-table entry address overflowed.".to_string(),
+                );
+            };
+            let raw_value = match self.read_physical_u64(entry_physical_address) {
+                Ok(value) => value,
+                Err(error) => {
+                    return X64PageTableWalk {
+                        status: "physical_read_unavailable".to_string(),
+                        address,
+                        virtual_address_bits: Some(virtual_address_bits),
+                        canonical: Some(true),
+                        directory_table_base: Some(directory_table_base),
+                        root_physical_address: Some(root_physical_address),
+                        entries,
+                        final_mapping: None,
+                        detail: format!(
+                            "DbgEng could not read the {level} physical entry at 0x{entry_physical_address:X}: {error}"
+                        ),
+                    }
+                }
+            };
+            let entry = x64_page_table_entry(level, index, entry_physical_address, raw_value);
+            if !entry.present {
+                entries.push(entry);
+                return X64PageTableWalk {
+                    status: "nonpresent".to_string(),
+                    address,
+                    virtual_address_bits: Some(virtual_address_bits),
+                    canonical: Some(true),
+                    directory_table_base: Some(directory_table_base),
+                    root_physical_address: Some(root_physical_address),
+                    entries,
+                    final_mapping: None,
+                    detail: format!("The captured {level} is not present. This is post-bugcheck snapshot evidence and does not establish an earlier transition."),
+                };
+            }
+
+            let is_pdpt = *level == "PDPTE";
+            let is_pd = *level == "PDE";
+            if entry.large_page && (is_pdpt || is_pd) {
+                let page_size = if is_pdpt { 1u64 << 30 } else { 1u64 << 21 };
+                let page_mask = !(page_size - 1);
+                let physical_address = (raw_value & page_mask) | (address & (page_size - 1));
+                entries.push(entry);
+                return X64PageTableWalk {
+                    status: "captured".to_string(),
+                    address,
+                    virtual_address_bits: Some(virtual_address_bits),
+                    canonical: Some(true),
+                    directory_table_base: Some(directory_table_base),
+                    root_physical_address: Some(root_physical_address),
+                    entries,
+                    final_mapping: Some(X64PageTableMapping {
+                        physical_address,
+                        page_size,
+                        page_size_name: if is_pdpt { "1_gib" } else { "2_mib" }.to_string(),
+                    }),
+                    detail: "The walker reached a present large-page mapping. Entries are preserved post-bugcheck state, not proof of the permission or lifetime state at the earlier fault instant.".to_string(),
+                };
+            }
+            entries.push(entry);
+            if level_index + 1 == levels.len() {
+                let physical_address = (raw_value & X64_PHYSICAL_ADDRESS_MASK) | (address & 0xfff);
+                return X64PageTableWalk {
+                    status: "captured".to_string(),
+                    address,
+                    virtual_address_bits: Some(virtual_address_bits),
+                    canonical: Some(true),
+                    directory_table_base: Some(directory_table_base),
+                    root_physical_address: Some(root_physical_address),
+                    entries,
+                    final_mapping: Some(X64PageTableMapping {
+                        physical_address,
+                        page_size: 4096,
+                        page_size_name: "4_kib".to_string(),
+                    }),
+                    detail: "The walker reached a present 4 KiB mapping. Entries are preserved post-bugcheck state, not proof of the permission or lifetime state at the earlier fault instant.".to_string(),
+                };
+            }
+            table_physical_address = raw_value & X64_PHYSICAL_ADDRESS_MASK;
+            if table_physical_address == 0 {
+                return X64PageTableWalk {
+                    status: "invalid_next_table".to_string(),
+                    address,
+                    virtual_address_bits: Some(virtual_address_bits),
+                    canonical: Some(true),
+                    directory_table_base: Some(directory_table_base),
+                    root_physical_address: Some(root_physical_address),
+                    entries,
+                    final_mapping: None,
+                    detail: format!("The present {level} has a zero next-table physical base."),
+                };
+            }
+        }
+        unreachable!("the x64 page-table level list always ends in a PTE");
+    }
+
+    fn read_physical_u64(&self, physical_address: u64) -> anyhow::Result<u64> {
+        let mut bytes = [0u8; std::mem::size_of::<u64>()];
+        let mut bytes_read = 0u32;
+        unsafe {
+            self.data_spaces.ReadPhysical(
+                physical_address,
+                bytes.as_mut_ptr().cast(),
+                bytes.len() as u32,
+                Some(&mut bytes_read),
+            )?;
+        }
+        ensure!(
+            bytes_read == bytes.len() as u32,
+            "DbgEng returned only {bytes_read} of {} requested physical bytes",
+            bytes.len()
+        );
+        Ok(u64::from_le_bytes(bytes))
     }
 
     pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {
@@ -3747,5 +4055,28 @@ mod tests {
         assert!(runtime.compatible);
         assert!(runtime.directory.is_none());
         assert!(runtime.components.is_empty());
+    }
+
+    #[test]
+    fn validates_48_and_57_bit_canonical_addresses() {
+        assert!(x64_virtual_address_is_canonical(0x0000_7fff_ffff_ffff, 48));
+        assert!(x64_virtual_address_is_canonical(0xffff_8000_0000_0000, 48));
+        assert!(!x64_virtual_address_is_canonical(0x0000_8000_0000_0000, 48));
+        assert!(x64_virtual_address_is_canonical(0x00ff_ffff_ffff_ffff, 57));
+        assert!(!x64_virtual_address_is_canonical(0x0100_0000_0000_0000, 57));
+    }
+
+    #[test]
+    fn decodes_x64_page_table_entry_flags() {
+        let entry = x64_page_table_entry("PTE", 42, 0x1_000, 0x8000_0000_1234_51e7);
+        assert!(entry.present);
+        assert!(entry.writable);
+        assert!(entry.user_accessible);
+        assert!(entry.accessed);
+        assert_eq!(entry.dirty, Some(true));
+        assert!(!entry.large_page);
+        assert_eq!(entry.global, Some(true));
+        assert!(entry.no_execute);
+        assert_eq!(entry.page_frame_number, 0x12345);
     }
 }
