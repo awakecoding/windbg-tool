@@ -5252,6 +5252,11 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         &pool_tracker,
         input.target_exception,
     );
+    let address_space_consistency = dump_address_space_consistency(
+        session,
+        fault_mechanics["register_dataflow"]["effective_address"].as_u64(),
+        input.tracker_table_base,
+    );
     let kernel_integrity = dump_kernel_integrity_snapshot(input.modules);
     let physical_page_provenance = dump_physical_page_provenance_feasibility();
 
@@ -5274,6 +5279,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "write_provenance": write_provenance,
         "kernel_integrity": kernel_integrity,
         "physical_page_provenance": physical_page_provenance,
+        "address_space_consistency": address_space_consistency,
         "address_inspection": address_inspection,
         "evidence": evidence,
         "data_limits": dump_data_limits(
@@ -6029,6 +6035,68 @@ fn dump_physical_page_provenance_feasibility() -> Value {
         "scope": "pfn_database_and_alias_mappings",
         "detail": "The documented offline DbgEng APIs expose a virtual-to-physical translation for an explicit virtual address, but no typed PFN database record or reverse physical-alias enumeration. No PFN layout or page-state bit is decoded without a build-validated public type contract."
     })
+}
+
+fn dump_address_space_consistency(
+    session: &DebuggerSession,
+    fault_target: Option<u64>,
+    tracker_table_base: Option<u64>,
+) -> Value {
+    let fault_mapping = fault_target.map(|address| {
+        serde_json::to_value(session.inspect_virtual_address(address)).unwrap_or_else(|error| {
+            json!({
+                "address": address,
+                "status": "serialization_error",
+                "detail": error.to_string()
+            })
+        })
+    });
+    let tracker_mapping = tracker_table_base.map(|address| {
+        serde_json::to_value(session.inspect_virtual_address(address)).unwrap_or_else(|error| {
+            json!({
+                "address": address,
+                "status": "serialization_error",
+                "detail": error.to_string()
+            })
+        })
+    });
+    let fault_page = fault_mapping
+        .as_ref()
+        .and_then(address_mapping_physical_page);
+    let tracker_page = tracker_mapping
+        .as_ref()
+        .and_then(address_mapping_physical_page);
+    let same_known_page = fault_page
+        .zip(tracker_page)
+        .map(|(left, right)| left == right);
+    json!({
+        "status": if fault_mapping.is_some() || tracker_mapping.is_some() {
+            "captured"
+        } else {
+            "not_applicable"
+        },
+        "fault_target_mapping": fault_mapping,
+        "tracker_table_base_mapping": tracker_mapping,
+        "known_mapping_relation": match same_known_page {
+            Some(true) => "same_physical_page",
+            Some(false) => "distinct_physical_pages",
+            None => "unavailable",
+        },
+        "fault_target_physical_page": fault_page,
+        "tracker_table_base_physical_page": tracker_page,
+        "reverse_alias_enumeration": {
+            "status": "unsupported",
+            "detail": "The documented DbgEng data-space APIs translate a supplied virtual address but do not enumerate virtual aliases for a physical page. Only the two explicitly supplied/derived virtual addresses are compared; no RAM, page-table, or PFN database scan is performed."
+        },
+        "detail": "Each mapping is a bounded x64 page-table walk for one known address. Present/writable leaf flags describe the saved snapshot only and do not establish historical access state."
+    })
+}
+
+fn address_mapping_physical_page(mapping: &Value) -> Option<u64> {
+    mapping
+        .pointer("/page_table_walk/final_mapping/physical_address")
+        .and_then(Value::as_u64)
+        .map(|address| address & !0xfff)
 }
 
 fn dump_address_inspection(
@@ -8033,13 +8101,33 @@ mod tests {
 
         let recurrence = dump_cohort_recurrence(&entries, 2);
 
-        assert_eq!(recurrence["bugcheck"]["status"], "not_consistently_observed");
+        assert_eq!(
+            recurrence["bugcheck"]["status"],
+            "not_consistently_observed"
+        );
         assert_eq!(
             recurrence["fault_instruction_bytes"]["status"],
             "consistent_across_analyzed_dumps"
         );
-        assert_eq!(cohort_instruction_bytes("fffff800`1234 f04b0fc12c06 lock xadd"), Some("f04b0fc12c06"));
+        assert_eq!(
+            cohort_instruction_bytes("fffff800`1234 f04b0fc12c06 lock xadd"),
+            Some("f04b0fc12c06")
+        );
         assert_eq!(cohort_instruction_bytes("nt!Foo"), None);
+    }
+
+    #[test]
+    fn mapping_relation_compares_only_explicit_physical_pages() {
+        let mapping = json!({
+            "page_table_walk": {
+                "final_mapping": {
+                    "physical_address": 0x1363_BDD10u64
+                }
+            }
+        });
+
+        assert_eq!(address_mapping_physical_page(&mapping), Some(0x1363_BD000));
+        assert_eq!(address_mapping_physical_page(&json!({})), None);
     }
 
     #[test]
