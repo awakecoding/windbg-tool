@@ -4563,6 +4563,13 @@ pub(super) fn run_dump_inspect(
     let bugcheck_started = Instant::now();
     let bugcheck = session.bugcheck_data();
     let bugcheck_elapsed_ms = bugcheck_started.elapsed().as_millis() as u64;
+    let dump_header_started = Instant::now();
+    let dump_header = serde_json::to_value(session.dump_header())?;
+    let dump_header_elapsed_ms = dump_header_started.elapsed().as_millis() as u64;
+    let target_exception_started = Instant::now();
+    let target_exception =
+        serde_json::to_value(session.target_exception_snapshot(args.max_frames))?;
+    let target_exception_elapsed_ms = target_exception_started.elapsed().as_millis() as u64;
     let symbols_started = Instant::now();
     let native_symbols = prepare_dump_native_symbols(
         &session,
@@ -4613,6 +4620,8 @@ pub(super) fn run_dump_inspect(
             inspected_address,
             tracker_table_base,
             processor_snapshot: &processor_snapshot,
+            dump_header: &dump_header,
+            target_exception: &target_exception,
         },
     );
     let triage_elapsed_ms = triage_started.elapsed().as_millis() as u64;
@@ -4625,6 +4634,7 @@ pub(super) fn run_dump_inspect(
             "registers": registers,
             "frames": stack.frames,
             "processor_snapshot": processor_snapshot,
+            "crash_adjacent": dump_crash_adjacent_snapshot(&dump_header, &target_exception),
             "triage": triage,
             "telemetry": {
                 "source": "host_monotonic_wall_clock",
@@ -4632,6 +4642,8 @@ pub(super) fn run_dump_inspect(
                 "dump_open_elapsed_ms": open_elapsed_ms,
                 "module_enumeration_elapsed_ms": modules_elapsed_ms,
                 "bugcheck_read_elapsed_ms": bugcheck_elapsed_ms,
+                "dump_header_read_elapsed_ms": dump_header_elapsed_ms,
+                "target_exception_read_elapsed_ms": target_exception_elapsed_ms,
                 "native_symbol_preparation_elapsed_ms": symbols_elapsed_ms,
                 "thread_enumeration_elapsed_ms": threads_elapsed_ms,
                 "register_read_elapsed_ms": registers_elapsed_ms,
@@ -4911,14 +4923,33 @@ struct DumpTriageInput<'a> {
     inspected_address: Option<u64>,
     tracker_table_base: Option<u64>,
     processor_snapshot: &'a Value,
+    dump_header: &'a Value,
+    target_exception: &'a Value,
 }
 
 fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> Value {
     let bugcheck_data = input.bugcheck.data.as_ref();
     let fault_address = bugcheck_data.and_then(dump_fault_address);
     let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
-    let exception_context =
+    let heuristic_exception_context =
         dump_exception_context(session, input.target, bugcheck_data, input.max_frames);
+    let documented_exception_context = input
+        .target_exception
+        .get("context")
+        .filter(|context| {
+            matches!(
+                context["status"].as_str(),
+                Some("captured" | "context_captured_stack_unavailable")
+            )
+        })
+        .map(|context| {
+            json!({
+                "selection": "documented_dbgeng_target_exception_context",
+                "context": context,
+                "detail": "This context is returned by DbgEng's documented target-exception request rather than inferred from a bugcheck parameter."
+            })
+        });
+    let exception_context = documented_exception_context.or(heuristic_exception_context.clone());
     let symbol_modules = dump_symbol_modules(session, fault_address, &exception_context);
     let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, input.refresh_symbols);
     let driver_evidence = dump_driver_evidence(
@@ -4943,15 +4974,23 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let processor_activity = dump_processor_activity(input.processor_snapshot);
     let driver_verifier = dump_driver_verifier_snapshot();
     let write_provenance = dump_write_provenance_feasibility();
-    let fault_mechanics =
-        dump_fault_mechanics_audit(input.bugcheck, &exception_context, &fault, &pool_tracker);
+    let fault_mechanics = dump_fault_mechanics_audit(
+        input.bugcheck,
+        &exception_context,
+        &fault,
+        &pool_tracker,
+        input.target_exception,
+    );
     let kernel_integrity = dump_kernel_integrity_snapshot(input.modules);
     let physical_page_provenance = dump_physical_page_provenance_feasibility();
 
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
+        "dump_header": input.dump_header,
+        "target_exception": input.target_exception,
         "fault": fault,
         "exception_context": exception_context,
+        "heuristic_exception_context": heuristic_exception_context,
         "fault_mechanics": fault_mechanics,
         "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
@@ -5584,11 +5623,39 @@ fn dump_write_provenance_feasibility() -> Value {
     })
 }
 
+fn dump_crash_adjacent_snapshot(dump_header: &Value, target_exception: &Value) -> Value {
+    json!({
+        "status": if dump_header["status"].as_str() == Some("captured")
+            || target_exception["status"].as_str() == Some("captured") {
+            "captured"
+        } else {
+            "partial_or_unavailable"
+        },
+        "header_source": dump_header["source"],
+        "target_exception_source": target_exception["source"],
+        "blackbox_streams": {
+            "status": "unsupported",
+            "secondary_data_state": dump_header["secondary_data_state"],
+            "detail": "The documented DUMP_HEADER64 exposes SecondaryDataState, but documented DbgEng requests do not enumerate kernel BlackboxBSD, BlackboxNTFS, BlackboxPNP, or BlackboxWINLOGON payloads for a kernel dump or publish their versioned payload layouts. This inspector does not infer a stream identifier, presence, event, or timeline from that aggregate field."
+        },
+        "filter_state": {
+            "status": "unsupported",
+            "detail": "Documented DbgEng dump APIs expose module inventory and target exception records, not a public typed FLTMGR frame, instance, or current-I/O traversal. No FLTMGR layout is guessed and no debugger extension command is executed."
+        },
+        "crash_history": {
+            "status": "unsupported",
+            "detail": "The documented header and target-exception requests expose this capture's static record only. They do not enumerate WER history, Windows event logs, prior bugchecks, or arbitrary secondary telemetry stored in RAM."
+        },
+        "snapshot_limits": "Header fields and target exception data describe the saved crash capture. They do not record historical direct writers, allocation/free ownership, or a pre-crash timeline."
+    })
+}
+
 fn dump_fault_mechanics_audit(
     bugcheck: &windbg_dbgeng::BugCheckDataResult,
     exception_context: &Option<Value>,
     fault: &Option<Value>,
     pool_tracker: &Value,
+    target_exception: &Value,
 ) -> Value {
     let bugcheck_data = bugcheck.data.as_ref();
     let fault_instruction_address = bugcheck_data.and_then(dump_fault_address);
@@ -5657,13 +5724,11 @@ fn dump_fault_mechanics_audit(
             "detail": "No public typed layout identifies the qword at this build-observed offset as a named counter or defines its valid range. The inspector therefore does not classify the 0x110 delta or current qword as normal, malformed, overflowed, or corrupt."
         },
         "exception_provenance": {
-            "status": if bugcheck_data.is_some_and(|data| data.code == 0x0000_001E) {
-                "partial"
-            } else {
-                "not_applicable"
-            },
+            "status": target_exception["status"].as_str().unwrap_or("unavailable"),
             "exception_code": bugcheck_data.map(|data| data.parameters[0] as u32),
-            "detail": "Bugcheck 0x1E preserves an exception code and fault instruction address, but this dump path does not expose a separate documented EXCEPTION_RECORD/trap frame binding. The decoded x64 CONTEXT is selected only by a bounded structural probe, so it is not used to assign a faulting CPU/thread, IRQL, or historical access type."
+            "documented_exception_thread": target_exception["thread_system_id"],
+            "documented_exception_record": target_exception["record"],
+            "detail": "The target-exception requests are authoritative only when DbgEng returned them. A documented exception thread identifies the recorded DbgEng exception thread, not a logical processor, IRQL, historical writer, or trap-frame provenance beyond the returned record/context."
         },
         "interrupt_state": {
             "context_eflags": eflags,
@@ -7639,7 +7704,13 @@ mod tests {
             }]
         });
 
-        let audit = dump_fault_mechanics_audit(&bugcheck, &context, &fault, &tracker);
+        let target_exception = json!({
+            "status": "captured",
+            "thread_system_id": 12,
+            "record": { "code": 0xC0000005u32 }
+        });
+        let audit =
+            dump_fault_mechanics_audit(&bugcheck, &context, &fault, &tracker, &target_exception);
         assert_eq!(audit["status"], "captured");
         assert_eq!(audit["memory_access"]["kind"], "atomic_read_modify_write");
         assert_eq!(audit["register_dataflow"]["effective_address"], 0x2020);
@@ -7653,10 +7724,32 @@ mod tests {
             "disassembly": { "lines": [{ "text": "add qword ptr [r14+r8],rbp" }] }
         }));
         assert_eq!(
-            dump_fault_mechanics_audit(&bugcheck, &context, &incompatible_fault, &tracker)
-                ["status"],
+            dump_fault_mechanics_audit(
+                &bugcheck,
+                &context,
+                &incompatible_fault,
+                &tracker,
+                &target_exception,
+            )["status"],
             "incomplete"
         );
+    }
+
+    #[test]
+    fn crash_adjacent_snapshot_keeps_blackbox_and_filter_state_unsupported() {
+        let snapshot = dump_crash_adjacent_snapshot(
+            &json!({
+                "status": "captured",
+                "source": "header",
+                "secondary_data_state": 1
+            }),
+            &json!({"status": "captured", "source": "exception"}),
+        );
+
+        assert_eq!(snapshot["status"], "captured");
+        assert_eq!(snapshot["blackbox_streams"]["status"], "unsupported");
+        assert_eq!(snapshot["filter_state"]["status"], "unsupported");
+        assert_eq!(snapshot["crash_history"]["status"], "unsupported");
     }
 
     #[test]
