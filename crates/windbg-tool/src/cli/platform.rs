@@ -38,11 +38,11 @@ use windows::Win32::System::Threading::{
 
 use super::output::{print_value, OutputOptions};
 use super::{
-    parse_u64_argument, CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs,
-    LiveLaunchArgs, LiveManagedBreakArgs, LiveStartupBreakArgs, LiveStartupProfileArgs,
-    LiveStartupProfileCompareArgs, LiveStartupProfileReportArgs, StartupProfileContextEvent,
-    StartupProfileReportFormat, TraceRecordArgs, TraceRecordProfile, TraceReplayCpuSupport,
-    WindbgCommand,
+    parse_u64_argument, CliDumpKind, DbgEngServerArgs, DumpCohortArgs, DumpCreateArgs,
+    DumpInspectArgs, LiveLaunchArgs, LiveManagedBreakArgs, LiveStartupBreakArgs,
+    LiveStartupProfileArgs, LiveStartupProfileCompareArgs, LiveStartupProfileReportArgs,
+    StartupProfileContextEvent, StartupProfileReportFormat, TraceRecordArgs, TraceRecordProfile,
+    TraceReplayCpuSupport, WindbgCommand,
 };
 use crate::pe_symbols::bounded_pe_file_metadata;
 
@@ -4534,6 +4534,277 @@ pub(super) fn run_dump_create(args: DumpCreateArgs, output: &OutputOptions) -> a
     )
 }
 
+const RETAINED_CRASH_COHORT_PATHS: [&str; 8] = [
+    r"D:\dumps\MEMORY-2026-08-04.dmp",
+    r"C:\Windows\Minidump\071526-24406-01.dmp",
+    r"C:\Windows\Minidump\071526-26000-01.dmp",
+    r"C:\Windows\Minidump\071626-21875-01.dmp",
+    r"C:\Windows\Minidump\071726-22625-01.dmp",
+    r"C:\Windows\Minidump\071726-22593-01.dmp",
+    r"C:\Windows\Minidump\072926-27109-01.dmp",
+    r"C:\Windows\Minidump\080426-24812-01.dmp",
+];
+
+pub(super) fn run_dump_cohort(args: DumpCohortArgs, output: &OutputOptions) -> anyhow::Result<()> {
+    let paths = if args.paths.is_empty() {
+        RETAINED_CRASH_COHORT_PATHS
+            .iter()
+            .map(PathBuf::from)
+            .collect::<Vec<_>>()
+    } else {
+        args.paths
+    };
+    ensure!(
+        !paths.is_empty() && paths.len() <= RETAINED_CRASH_COHORT_PATHS.len(),
+        "dump cohort accepts from one through {} paths",
+        RETAINED_CRASH_COHORT_PATHS.len()
+    );
+    let started = Instant::now();
+    let entries = paths
+        .iter()
+        .map(|path| dump_cohort_entry(path, args.max_frames))
+        .collect::<Vec<_>>();
+    let analyzed = entries
+        .iter()
+        .filter(|entry| entry["status"].as_str() == Some("captured"))
+        .count();
+    let missing = entries
+        .iter()
+        .filter(|entry| entry["status"].as_str() == Some("missing"))
+        .count();
+    print_value(
+        json!({
+            "schema": "windbg-tool.dump-cohort.v1",
+            "status": if analyzed == 0 { "unavailable" } else { "captured" },
+            "offline_requested": args.offline,
+            "symbol_server_used": false,
+            "max_frames_per_dump": args.max_frames,
+            "path_count": paths.len(),
+            "analyzed_dump_count": analyzed,
+            "missing_dump_count": missing,
+            "entries": entries,
+            "recurrence": dump_cohort_recurrence(&entries, analyzed),
+            "bounds": {
+                "per_dump": [
+                    "one DbgEng dump open",
+                    "one ReadBugCheckData query",
+                    "one documented target-exception request group",
+                    "one current stack limited by max_frames",
+                    "at most one fault-address module/parameter/disassembly probe"
+                ],
+                "whole_dump_scan": false,
+                "loaded_module_enumeration": false,
+                "raw_command_execution": false
+            },
+            "detail": "Cohort matches compare only values actually returned for each dump. Missing symbols, missing contexts, and missing files remain unavailable; module load presence is not collected or interpreted as driver involvement.",
+            "telemetry": {
+                "elapsed_ms": started.elapsed().as_millis() as u64
+            }
+        }),
+        output,
+    )
+}
+
+fn dump_cohort_entry(path: &Path, max_frames: u32) -> Value {
+    let metadata = match fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return json!({
+                "path": path,
+                "status": "missing",
+                "detail": "The requested local dump file is not present; it was not searched for elsewhere."
+            });
+        }
+        Err(error) => {
+            return json!({
+                "path": path,
+                "status": "unavailable",
+                "detail": format!("Could not read local dump file metadata: {error}")
+            });
+        }
+    };
+    let opened = Instant::now();
+    let session = match open_dump_session(DumpOpenOptions {
+        path: path.to_path_buf(),
+    }) {
+        Ok(session) => session,
+        Err(error) => {
+            return json!({
+                "path": path,
+                "status": "unavailable",
+                "dump_file_bytes": metadata.len(),
+                "detail": format!("DbgEng could not open the dump: {error:#}")
+            });
+        }
+    };
+    let target = session.summary();
+    let bugcheck = session.bugcheck_data();
+    let fault_address = bugcheck.data.as_ref().and_then(dump_fault_address);
+    let fault = fault_address.map(|address| dump_cohort_fault(&session, address));
+    let stack = session.stack_trace_result(max_frames).map_or_else(
+        |error| {
+            json!({
+                "status": "unavailable",
+                "detail": format!("DbgEng could not capture the bounded current stack: {error}")
+            })
+        },
+        |stack| {
+            serde_json::to_value(stack).unwrap_or_else(|error| {
+                json!({
+                    "status": "serialization_error",
+                    "detail": error.to_string()
+                })
+            })
+        },
+    );
+    let direct_exception = serde_json::to_value(session.target_exception_snapshot(max_frames))
+        .unwrap_or_else(
+            |error| json!({"status": "serialization_error", "detail": error.to_string()}),
+        );
+    let heuristic_context =
+        dump_exception_context(&session, &target, bugcheck.data.as_ref(), max_frames);
+    let context_shape = dump_cohort_context_shape(&direct_exception, &heuristic_context);
+    json!({
+        "path": path,
+        "status": "captured",
+        "dump_file_bytes": metadata.len(),
+        "target": target,
+        "bugcheck": dump_bugcheck_value(&bugcheck),
+        "fault": fault,
+        "target_exception": direct_exception,
+        "context_shape": context_shape,
+        "validated_stack_module_families": dump_cohort_stack_module_families(&stack),
+        "stack": stack,
+        "telemetry": {
+            "dump_open_and_bounded_probe_elapsed_ms": opened.elapsed().as_millis() as u64
+        },
+        "detail": "Only one current stack and at most one fault-address probe were collected. The current stack is included only as a saved snapshot; its modules are not historical causality evidence."
+    })
+}
+
+fn dump_cohort_fault(session: &DebuggerSession, address: u64) -> Value {
+    let observation = dump_address_observation(session, address, 1);
+    let module_parameters = observation["module"]["base_address"]
+        .as_u64()
+        .and_then(|base| session.module_parameters(&[base]).ok())
+        .and_then(|mut parameters| parameters.pop());
+    let instruction_text = observation["disassembly"]["lines"]
+        .as_array()
+        .and_then(|lines| lines.first())
+        .and_then(|line| line["text"].as_str());
+    json!({
+        "address": address,
+        "instruction_text": instruction_text,
+        "instruction_bytes_hex": instruction_text.and_then(cohort_instruction_bytes),
+        "module": observation["module"],
+        "module_parameters": module_parameters,
+        "source": "dbgeng_single_instruction_disassembly_and_module_parameters",
+        "detail": "Instruction bytes are reported only when DbgEng included a contiguous hex token in its one-instruction disassembly text; otherwise they remain unavailable."
+    })
+}
+
+fn cohort_instruction_bytes(text: &str) -> Option<&str> {
+    text.split_ascii_whitespace().find(|token| {
+        token.len() >= 2
+            && token.len().is_multiple_of(2)
+            && token.bytes().all(|byte| byte.is_ascii_hexdigit())
+    })
+}
+
+fn dump_cohort_context_shape(target_exception: &Value, heuristic_context: &Option<Value>) -> Value {
+    let direct = target_exception["context"]["registers"].as_object();
+    let (registers, provenance) = if let Some(registers) = direct {
+        (Some(registers), "direct_context")
+    } else {
+        (
+            heuristic_context
+                .as_ref()
+                .and_then(|context| context["context"]["registers"].as_object()),
+            "heuristic_bugcheck_parameter_context",
+        )
+    };
+    let Some(registers) = registers else {
+        return json!({
+            "status": "unavailable",
+            "provenance": "unavailable",
+            "detail": "Neither a documented target-exception context nor a structurally valid bounded bugcheck-context candidate was available."
+        });
+    };
+    let r8 = registers.get("r8").and_then(Value::as_u64);
+    let r14 = registers.get("r14").and_then(Value::as_u64);
+    json!({
+        "status": "captured",
+        "provenance": provenance,
+        "rip": registers.get("rip").and_then(Value::as_u64),
+        "r8": r8,
+        "r14": r14,
+        "rbp": registers.get("rbp").and_then(Value::as_u64),
+        "effective_address_r8_plus_r14": r8.zip(r14).and_then(|(base, offset)| base.checked_add(offset)),
+        "detail": "The shape preserves only the registers required to compare the observed addressing form. Heuristic contexts are explicitly not used for direct thread or processor attribution."
+    })
+}
+
+fn dump_cohort_stack_module_families(stack: &Value) -> Value {
+    let valid_frames = stack["valid_frames"].as_u64().unwrap_or(0) as usize;
+    let families = stack["frames"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(valid_frames)
+        .filter_map(|frame| frame["symbol"]["name"].as_str())
+        .filter_map(|symbol| {
+            symbol
+                .split_once('!')
+                .map(|(module, _)| module.to_ascii_lowercase())
+        })
+        .collect::<BTreeSet<_>>();
+    json!({
+        "status": if valid_frames == 0 { "unavailable" } else { "captured" },
+        "valid_frame_count": valid_frames,
+        "families": families,
+        "detail": "Only modules named by validated saved stack frames are listed. A module absent from this list is not ruled out, and a listed module is not attributed."
+    })
+}
+
+fn dump_cohort_recurrence(entries: &[Value], analyzed: usize) -> Value {
+    json!({
+        "bugcheck": cohort_common_values(entries, analyzed, |entry| entry.pointer("/bugcheck/code").cloned()),
+        "fault_instruction_address": cohort_common_values(entries, analyzed, |entry| entry.pointer("/fault/address").cloned()),
+        "fault_instruction_bytes": cohort_common_values(entries, analyzed, |entry| entry.pointer("/fault/instruction_bytes_hex").cloned()),
+        "fault_module_identity": cohort_common_values(entries, analyzed, |entry| entry.pointer("/fault/module/module_name").cloned()),
+        "context_addressing_shape": cohort_common_values(entries, analyzed, |entry| {
+            let provenance = entry.pointer("/context_shape/provenance")?;
+            let effective = entry.pointer("/context_shape/effective_address_r8_plus_r14")?;
+            Some(json!({"provenance": provenance, "effective_address": effective}))
+        }),
+        "detail": "A recurrence value is reported only when the same non-null value was returned for every analyzed dump. Unavailable values reduce the observed count and never become a match."
+    })
+}
+
+fn cohort_common_values<F>(entries: &[Value], analyzed: usize, value: F) -> Value
+where
+    F: Fn(&Value) -> Option<Value>,
+{
+    let values = entries
+        .iter()
+        .filter(|entry| entry["status"].as_str() == Some("captured"))
+        .filter_map(value)
+        .filter(|value| !value.is_null())
+        .collect::<Vec<_>>();
+    let observed_count = values.len();
+    let common = values
+        .first()
+        .filter(|first| values.iter().all(|value| value == *first))
+        .filter(|_| observed_count == analyzed)
+        .cloned();
+    json!({
+        "status": if common.is_some() { "consistent_across_analyzed_dumps" } else if observed_count == 0 { "unavailable" } else { "not_consistently_observed" },
+        "analyzed_dump_count": analyzed,
+        "observed_dump_count": observed_count,
+        "value": common,
+    })
+}
+
 pub(super) fn run_dump_inspect(
     args: DumpInspectArgs,
     output: &OutputOptions,
@@ -7750,6 +8021,25 @@ mod tests {
         assert_eq!(snapshot["blackbox_streams"]["status"], "unsupported");
         assert_eq!(snapshot["filter_state"]["status"], "unsupported");
         assert_eq!(snapshot["crash_history"]["status"], "unsupported");
+    }
+
+    #[test]
+    fn cohort_recurrence_requires_every_analyzed_dump_to_match() {
+        let entries = vec![
+            json!({"status": "captured", "bugcheck": {"code": 0x1E}, "fault": {"instruction_bytes_hex": "f04b0fc12c06"}}),
+            json!({"status": "captured", "bugcheck": {"code": 0x3B}, "fault": {"instruction_bytes_hex": "f04b0fc12c06"}}),
+            json!({"status": "missing"}),
+        ];
+
+        let recurrence = dump_cohort_recurrence(&entries, 2);
+
+        assert_eq!(recurrence["bugcheck"]["status"], "not_consistently_observed");
+        assert_eq!(
+            recurrence["fault_instruction_bytes"]["status"],
+            "consistent_across_analyzed_dumps"
+        );
+        assert_eq!(cohort_instruction_bytes("fffff800`1234 f04b0fc12c06 lock xadd"), Some("f04b0fc12c06"));
+        assert_eq!(cohort_instruction_bytes("nt!Foo"), None);
     }
 
     #[test]

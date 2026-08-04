@@ -316,6 +316,10 @@ enum DumpCommand {
         about = "Produce bounded pool-corruption triage with context, tracker, and evidence grades"
     )]
     PoolTriage(DumpInspectArgs),
+    #[command(
+        about = "Compare bounded direct crash evidence across supplied or retained local dump files"
+    )]
+    Cohort(DumpCohortArgs),
     #[command(about = "Create a process dump from a live process id")]
     Create(DumpCreateArgs),
 }
@@ -1310,6 +1314,27 @@ struct DumpInspectArgs {
         help = "Known per-CPU pool-tracker table base used to classify --inspect-address or the captured tracker entry"
     )]
     tracker_table_base: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DumpCohortArgs {
+    #[arg(
+        value_name = "PATH",
+        help = "Dump path to compare; omit all paths to use the retained local crash cohort"
+    )]
+    paths: Vec<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        help = "Maximum frames in each single bounded current/exception stack probe"
+    )]
+    max_frames: u32,
+    #[arg(
+        long,
+        help = "Declare that the cohort run must not download missing symbols; this command never adds a srv* path"
+    )]
+    offline: bool,
 }
 
 #[derive(Debug, Args)]
