@@ -4582,6 +4582,23 @@ pub(super) fn run_dump_inspect(
     let stack_started = Instant::now();
     let stack = session.stack_trace_result(args.max_frames)?;
     let stack_elapsed_ms = stack_started.elapsed().as_millis() as u64;
+    let processors_started = Instant::now();
+    let processor_snapshot = match session.processor_snapshot(args.max_frames) {
+        Ok(snapshot) => serde_json::to_value(snapshot)?,
+        Err(error) => json!({
+            "source": "dbgeng_idebugcontrol_getnumberprocessors_and_idebugsystemobjects_getthreadidbyprocessor",
+            "status": "unavailable",
+            "logical_processor_count": null,
+            "returned": 0,
+            "validated_stack_count": 0,
+            "unwind_limited_stack_count": 0,
+            "max_frames_per_processor": args.max_frames,
+            "processors": [],
+            "current_thread_preserved": true,
+            "detail": format!("DbgEng could not capture the bounded processor snapshot: {error:#}"),
+        }),
+    };
+    let processors_elapsed_ms = processors_started.elapsed().as_millis() as u64;
     let triage_started = Instant::now();
     let triage = dump_triage_value(
         &session,
@@ -4595,6 +4612,7 @@ pub(super) fn run_dump_inspect(
             native_symbols,
             inspected_address,
             tracker_table_base,
+            processor_snapshot: &processor_snapshot,
         },
     );
     let triage_elapsed_ms = triage_started.elapsed().as_millis() as u64;
@@ -4606,6 +4624,7 @@ pub(super) fn run_dump_inspect(
             "threads": threads,
             "registers": registers,
             "frames": stack.frames,
+            "processor_snapshot": processor_snapshot,
             "triage": triage,
             "telemetry": {
                 "source": "host_monotonic_wall_clock",
@@ -4617,10 +4636,12 @@ pub(super) fn run_dump_inspect(
                 "thread_enumeration_elapsed_ms": threads_elapsed_ms,
                 "register_read_elapsed_ms": registers_elapsed_ms,
                 "stack_walk_elapsed_ms": stack_elapsed_ms,
+                "processor_snapshot_elapsed_ms": processors_elapsed_ms,
                 "triage_elapsed_ms": triage_elapsed_ms,
                 "total_elapsed_ms": operation_started.elapsed().as_millis() as u64,
                 "bounded_operations": {
                     "stack_frame_limit": args.max_frames,
+                    "logical_processors_only": true,
                     "whole_dump_scan": false,
                 },
             },
@@ -4889,6 +4910,7 @@ struct DumpTriageInput<'a> {
     native_symbols: Value,
     inspected_address: Option<u64>,
     tracker_table_base: Option<u64>,
+    processor_snapshot: &'a Value,
 }
 
 fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> Value {
@@ -4911,12 +4933,16 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         &exception_context,
         &fault,
         input.tracker_table_base,
+        input.processor_snapshot["logical_processor_count"].as_u64(),
     );
     let address_inspection = input
         .inspected_address
         .map(|address| dump_address_inspection(session, address, input.tracker_table_base));
     let bugcheck_driver = dump_bugcheck_driver(session);
     let evidence = dump_evidence_grades(&driver_evidence, &pool_tracker, &bugcheck_driver);
+    let processor_activity = dump_processor_activity(input.processor_snapshot);
+    let driver_verifier = dump_driver_verifier_snapshot();
+    let write_provenance = dump_write_provenance_feasibility();
 
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
@@ -4928,6 +4954,9 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "driver_evidence": driver_evidence,
         "bugcheck_driver": bugcheck_driver,
         "pool_tracker": pool_tracker,
+        "processor_activity": processor_activity,
+        "driver_verifier": driver_verifier,
+        "write_provenance": write_provenance,
         "address_inspection": address_inspection,
         "evidence": evidence,
         "data_limits": dump_data_limits(
@@ -5167,6 +5196,7 @@ fn dump_pool_tracker_observation(
     exception_context: &Option<Value>,
     fault: &Option<Value>,
     supplied_table_base: Option<u64>,
+    logical_processor_count: Option<u64>,
 ) -> Value {
     const ENTRY_STRIDE: u64 = 0x50;
     let active_table = match evaluate_unsigned(session, "poi(nt!PoolTrackTable)") {
@@ -5272,6 +5302,7 @@ fn dump_pool_tracker_observation(
         entry_address,
         supplied_table_base,
         ENTRY_STRIDE,
+        logical_processor_count,
     );
     json!({
         "status": "captured",
@@ -5283,6 +5314,7 @@ fn dump_pool_tracker_observation(
         "active_table": active_table,
         "active_table_size": table_size,
         "active_table_mask": table_mask,
+        "table_shape": pool_tracker_table_shape(table_size, table_mask),
         "active_table_end_exclusive": table_end,
         "exception_entry_address": entry_address,
         "exception_entry_relation": entry_relation,
@@ -5305,11 +5337,12 @@ fn dump_per_cpu_tracker_topology(
     entry_address: Option<u64>,
     supplied_table_base: Option<u64>,
     entry_stride: u64,
+    logical_processor_count: Option<u64>,
 ) -> Value {
     const KNOWN_NT_TIMESTAMP: u32 = 0x4A63_AF4E;
     const KNOWN_NT_IMAGE_SIZE: u32 = 0x0145_0000;
     const PER_CPU_POINTER_ARRAY_RVA: u64 = 0x00EF_AB00;
-    const MAX_PROCESSOR_SLOTS: usize = 128;
+    const MAX_PROCESSOR_SLOTS: u64 = 128;
     let nt_base = match evaluate_unsigned(session, "nt") {
         Ok(value) => value,
         Err(error) => return json!({"status": "unsupported", "detail": error}),
@@ -5339,7 +5372,25 @@ fn dump_per_cpu_tracker_topology(
     let Some(array_address) = nt_base.checked_add(PER_CPU_POINTER_ARRAY_RVA) else {
         return json!({"status": "unavailable", "detail": "The build-gated per-CPU pointer-array address overflowed."});
     };
-    let pointer_bytes = match session.read_memory(array_address, (MAX_PROCESSOR_SLOTS * 8) as u32) {
+    let Some(logical_processor_count) = logical_processor_count else {
+        return json!({
+            "status": "unavailable",
+            "pointer_array_address": array_address,
+            "detail": "DbgEng did not expose the actual logical processor count, so the inspector did not scan a broad fixed pointer-array range."
+        });
+    };
+    if logical_processor_count == 0 || logical_processor_count > MAX_PROCESSOR_SLOTS {
+        return json!({
+            "status": "unsupported_processor_count",
+            "pointer_array_address": array_address,
+            "logical_processor_count": logical_processor_count,
+            "supported_processor_limit": MAX_PROCESSOR_SLOTS,
+            "detail": "The build-gated tracker array supports only the validated 1 through 128 logical processor slots; no pointer-array read was attempted."
+        });
+    }
+    let pointer_bytes = match session
+        .read_memory(array_address, (logical_processor_count * 8) as u32)
+    {
         Ok(memory) if memory.complete => match decode_hex_bytes(&memory.data) {
             Some(bytes) => bytes,
             None => {
@@ -5401,7 +5452,8 @@ fn dump_per_cpu_tracker_topology(
         "nt_base": nt_base,
         "module_parameters": parameters,
         "pointer_array_address": array_address,
-        "slot_limit": MAX_PROCESSOR_SLOTS,
+        "logical_processor_count": logical_processor_count,
+        "slot_limit": logical_processor_count,
         "table_size": table_size,
         "entry_stride": entry_stride,
         "nonzero_tables": tables,
@@ -5409,7 +5461,7 @@ fn dump_per_cpu_tracker_topology(
             "status": "unavailable",
             "detail": "The saved bugcheck CONTEXT and faulting stack do not carry a documented processor-slot identifier exposed by this dump path. Membership in a supplied slot-19 table validates the table relation, not the faulting CPU identity."
         },
-        "detail": "Each nonzero base is checked only for page alignment and bounded first/last/fault-index reads. Matching tags or differing counters are snapshot observations, not allocation lifetime or race evidence."
+        "detail": "Only slots exposed by the actual DbgEng logical processor count are read. Each nonzero base is checked only for page alignment and bounded first/last/fault-index reads. Matching tags or differing counters are snapshot observations, not allocation lifetime or race evidence."
     })
 }
 
@@ -5420,6 +5472,109 @@ fn is_known_per_cpu_tracker_layout(
     expected_image_size: u32,
 ) -> bool {
     time_date_stamp == expected_time_date_stamp && image_size == expected_image_size
+}
+
+fn pool_tracker_table_shape(table_size: u64, table_mask: Option<u64>) -> Value {
+    let power_of_two = table_size.is_power_of_two();
+    let expected_mask = power_of_two.then(|| table_size - 1);
+    let mask_matches = expected_mask
+        .zip(table_mask)
+        .map(|(expected, mask)| expected == mask);
+    json!({
+        "status": match mask_matches {
+            Some(true) => "consistent",
+            Some(false) => "inconsistent",
+            None => "not_evaluated",
+        },
+        "table_size_is_power_of_two": power_of_two,
+        "expected_mask_when_power_of_two": expected_mask,
+        "observed_mask": table_mask,
+        "detail": "A mask is compared only when the captured table size is a power of two. A mismatch is a direct central-table metadata inconsistency, not proof of an allocation lifetime transition."
+    })
+}
+
+fn dump_processor_activity(processor_snapshot: &Value) -> Value {
+    let Some(processors) = processor_snapshot["processors"].as_array() else {
+        return json!({
+            "status": "unavailable",
+            "observations": [],
+            "detail": "The processor snapshot did not provide an iterable result."
+        });
+    };
+    let mut observations = Vec::new();
+    for processor in processors {
+        let processor_index = processor["processor_index"].as_u64();
+        let mut symbols = processor["current_symbol"]["name"]
+            .as_str()
+            .into_iter()
+            .chain(
+                processor["stack"]["frames"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(processor["stack"]["valid_frames"].as_u64().unwrap_or(0) as usize)
+                    .filter_map(|frame| frame["symbol"]["name"].as_str()),
+            )
+            .collect::<Vec<_>>();
+        symbols.sort_unstable();
+        symbols.dedup();
+        for symbol in symbols {
+            let lowered = symbol.to_ascii_lowercase();
+            let topic = if lowered.contains("pooltrack") {
+                Some("pool_tracker")
+            } else if lowered.contains("verifier") || lowered.starts_with("nt!vi") {
+                Some("driver_verifier")
+            } else if lowered.contains("dpc") {
+                Some("dpc_activity")
+            } else if lowered.contains("exallocatepool")
+                || lowered.contains("exfreepool")
+                || lowered.contains("exppool")
+            {
+                Some("pool_allocator")
+            } else {
+                None
+            };
+            if let Some(topic) = topic {
+                observations.push(json!({
+                    "processor_index": processor_index,
+                    "topic": topic,
+                    "symbol": symbol,
+                    "detail": "This is a captured current instruction or validated stack symbol from a saved processor context. It does not imply a race, recent writer, or causal relationship to the bugcheck."
+                }));
+            }
+        }
+    }
+    json!({
+        "status": if processor_snapshot["status"].as_str() == Some("unavailable") {
+            "unavailable"
+        } else {
+            "captured"
+        },
+        "logical_processor_count": processor_snapshot["logical_processor_count"],
+        "observations": observations,
+        "detail": "Only active threads selected by DbgEng for each exposed logical processor were examined. No process-wide or broad thread scan was performed."
+    })
+}
+
+fn dump_driver_verifier_snapshot() -> Value {
+    json!({
+        "status": "unsupported",
+        "source": "documented_dbgeng_data_apis",
+        "detail": "DbgEng exposes processor/thread, memory, symbol, and bugcheck APIs for this dump, but no documented API returns Driver Verifier configuration, verified-driver lists, counters, special-pool state, or write history. No undocumented verifier structure layout is applied without a build-specific validated contract.",
+        "next_capture_value": "Use a controlled next-capture configuration to record Driver Verifier settings before reproducing the fault; this preserved dump cannot prove that verifier or special pool was enabled."
+    })
+}
+
+fn dump_write_provenance_feasibility() -> Value {
+    json!({
+        "status": "unavailable",
+        "scope": "historical_direct_writers",
+        "detail": "A complete crash dump preserves a memory snapshot and page-table state, not a durable log of stores to an arbitrary physical page. DbgEng's documented offline APIs expose reads and translations but no recent-writer, guard-page, alias-history, or allocation-free-history record for this page.",
+        "supported_snapshot_evidence": [
+            "Current virtual-to-physical mapping and leaf PTE flags when an address is explicitly inspected.",
+            "Build-gated pool-tracker root and bounded table-entry snapshots."
+        ]
+    })
 }
 
 fn dump_address_inspection(
@@ -7290,6 +7445,44 @@ mod tests {
             0x4A63_AF4E,
             0x0145_0000,
         ));
+    }
+
+    #[test]
+    fn pool_tracker_table_shape_requires_a_power_of_two_mask_match() {
+        assert_eq!(
+            pool_tracker_table_shape(1024, Some(1023))["status"],
+            "consistent"
+        );
+        assert_eq!(
+            pool_tracker_table_shape(1024, Some(1024))["status"],
+            "inconsistent"
+        );
+        assert_eq!(
+            pool_tracker_table_shape(1000, Some(999))["status"],
+            "not_evaluated"
+        );
+    }
+
+    #[test]
+    fn processor_activity_keeps_symbols_as_snapshot_observations() {
+        let value = dump_processor_activity(&json!({
+            "status": "captured",
+            "logical_processor_count": 2,
+            "processors": [{
+                "processor_index": 1,
+                "current_symbol": { "name": "nt!KiRetireDpcList" },
+                "stack": {
+                    "valid_frames": 1,
+                    "frames": [{ "symbol": { "name": "nt!ExpPoolTrackerChargeEntry" } }]
+                }
+            }]
+        }));
+
+        assert_eq!(value["status"], "captured");
+        assert_eq!(value["observations"].as_array().unwrap().len(), 2);
+        assert_eq!(value["observations"][0]["processor_index"], 1);
+        assert_eq!(value["observations"][0]["topic"], "pool_tracker");
+        assert_eq!(value["observations"][1]["topic"], "dpc_activity");
     }
 
     #[test]

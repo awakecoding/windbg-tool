@@ -1006,12 +1006,41 @@ pub struct DebuggerEventInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadContext {
     pub thread: ThreadInfo,
+    pub thread_data_offset: Option<u64>,
     pub registers: CoreRegisterState,
     pub current_module: Option<ModuleInfo>,
     pub current_symbol: Option<SymbolInfo>,
     pub stack: Vec<StackFrameInfo>,
     pub disassembly: Option<DisassemblyResult>,
     pub current_thread_preserved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessorSnapshot {
+    pub processor_index: u32,
+    pub status: String,
+    pub engine_thread_id: Option<u32>,
+    pub system_thread_id: Option<u32>,
+    pub thread_data_offset: Option<u64>,
+    pub registers: Option<CoreRegisterState>,
+    pub current_module: Option<ModuleInfo>,
+    pub current_symbol: Option<SymbolInfo>,
+    pub stack: Option<StackTraceResult>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessorSnapshotResult {
+    pub source: String,
+    pub status: String,
+    pub logical_processor_count: Option<u32>,
+    pub returned: usize,
+    pub validated_stack_count: usize,
+    pub unwind_limited_stack_count: usize,
+    pub max_frames_per_processor: u32,
+    pub processors: Vec<ProcessorSnapshot>,
+    pub current_thread_preserved: bool,
+    pub detail: String,
 }
 
 pub fn start_process_server(options: ProcessServerOptions) -> anyhow::Result<ProcessServerResult> {
@@ -2154,6 +2183,118 @@ impl DebuggerSession {
             .collect())
     }
 
+    pub fn processor_snapshot(&self, max_frames: u32) -> anyhow::Result<ProcessorSnapshotResult> {
+        ensure!(
+            max_frames > 0,
+            "DbgEng processor snapshots require at least one stack frame"
+        );
+        let logical_processor_count = unsafe { self.control.GetNumberProcessors()? };
+        let mut processors = Vec::with_capacity(logical_processor_count as usize);
+
+        for processor_index in 0..logical_processor_count {
+            let engine_thread_id = match unsafe {
+                self.system_objects.GetThreadIdByProcessor(processor_index)
+            } {
+                Ok(id) => id,
+                Err(error) => {
+                    processors.push(ProcessorSnapshot {
+                            processor_index,
+                            status: "unavailable".to_string(),
+                            engine_thread_id: None,
+                            system_thread_id: None,
+                            thread_data_offset: None,
+                            registers: None,
+                            current_module: None,
+                            current_symbol: None,
+                            stack: None,
+                            detail: Some(format!(
+                                "DbgEng did not expose an active thread for logical processor {processor_index}: {error}"
+                            )),
+                        });
+                    continue;
+                }
+            };
+            let snapshot = self.with_selected_thread(engine_thread_id, || {
+                let registers = self.core_registers()?;
+                let instruction_offset = registers.instruction_offset;
+                let current_module =
+                    instruction_offset.and_then(|address| self.module_by_offset(address).ok().flatten());
+                let current_symbol =
+                    instruction_offset.and_then(|address| self.symbol_by_offset(address).ok().flatten());
+                let stack = self.stack_trace_result(max_frames)?;
+                Ok(ProcessorSnapshot {
+                    processor_index,
+                    status: "captured".to_string(),
+                    engine_thread_id: Some(engine_thread_id),
+                    system_thread_id: self.current_thread_system_id().ok(),
+                    thread_data_offset: unsafe {
+                        self.system_objects.GetCurrentThreadDataOffset().ok()
+                    },
+                    registers: Some(registers),
+                    current_module,
+                    current_symbol,
+                    stack: Some(stack),
+                    detail: Some(
+                        "The thread data offset is the documented DbgEng current-thread data offset. It is not decoded as a KTHREAD or PRCB layout."
+                            .to_string(),
+                    ),
+                })
+            });
+            processors.push(match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => ProcessorSnapshot {
+                    processor_index,
+                    status: "unavailable".to_string(),
+                    engine_thread_id: Some(engine_thread_id),
+                    system_thread_id: None,
+                    thread_data_offset: None,
+                    registers: None,
+                    current_module: None,
+                    current_symbol: None,
+                    stack: None,
+                    detail: Some(format!(
+                        "DbgEng could not capture the active-thread context for logical processor {processor_index}: {error:#}"
+                    )),
+                },
+            });
+        }
+
+        let unavailable = processors
+            .iter()
+            .filter(|processor| processor.status != "captured")
+            .count();
+        let validated_stack_count = processors
+            .iter()
+            .filter_map(|processor| processor.stack.as_ref())
+            .filter(|stack| stack.valid_frames > 0)
+            .count();
+        let unwind_limited_stack_count = processors
+            .iter()
+            .filter_map(|processor| processor.stack.as_ref())
+            .filter(|stack| stack.valid_frames == 0)
+            .count();
+        Ok(ProcessorSnapshotResult {
+            source: "dbgeng_idebugcontrol_getnumberprocessors_and_idebugsystemobjects_getthreadidbyprocessor"
+                .to_string(),
+            status: if processors.is_empty() || unavailable == processors.len() {
+                "unavailable".to_string()
+            } else if unavailable > 0 {
+                "partial".to_string()
+            } else {
+                "captured".to_string()
+            },
+            logical_processor_count: Some(logical_processor_count),
+            returned: processors.len(),
+            validated_stack_count,
+            unwind_limited_stack_count,
+            max_frames_per_processor: max_frames,
+            processors,
+            current_thread_preserved: true,
+            detail: "Only DbgEng's exposed logical processor count was iterated. Each processor is associated with its active debugger thread by the documented GetThreadIdByProcessor API; the current thread is restored after every capture. The API does not establish that a saved bugcheck CONTEXT belongs to any particular processor."
+                .to_string(),
+        })
+    }
+
     pub fn thread_accounting_snapshot(
         &self,
         max_threads: u32,
@@ -2685,15 +2826,7 @@ impl DebuggerSession {
             "engine_thread_id cannot be DEBUG_ANY_ID"
         );
 
-        let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
-        let changed_thread = previous_thread_id != engine_thread_id;
-        if changed_thread {
-            unsafe {
-                self.system_objects.SetCurrentThreadId(engine_thread_id)?;
-            }
-        }
-
-        let context = (|| {
+        self.with_selected_thread(engine_thread_id, || {
             let registers = self.core_registers()?;
             let instruction_offset = registers.instruction_offset;
             let current_module = instruction_offset
@@ -2714,6 +2847,9 @@ impl DebuggerSession {
                     engine_id: engine_thread_id,
                     system_id,
                 },
+                thread_data_offset: unsafe {
+                    self.system_objects.GetCurrentThreadDataOffset().ok()
+                },
                 registers,
                 current_module,
                 current_symbol,
@@ -2721,7 +2857,23 @@ impl DebuggerSession {
                 disassembly,
                 current_thread_preserved: true,
             })
-        })();
+        })
+    }
+
+    fn with_selected_thread<T>(
+        &self,
+        engine_thread_id: u32,
+        inspect: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
+        let changed_thread = previous_thread_id != engine_thread_id;
+        if changed_thread {
+            unsafe {
+                self.system_objects.SetCurrentThreadId(engine_thread_id)?;
+            }
+        }
+
+        let context = inspect();
 
         let restore = changed_thread
             .then(|| unsafe { self.system_objects.SetCurrentThreadId(previous_thread_id) });
@@ -3186,6 +3338,10 @@ impl DebuggerSession {
     }
 
     pub fn threads(&self) -> anyhow::Result<Vec<ThreadInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn processor_snapshot(&self, _max_frames: u32) -> anyhow::Result<ProcessorSnapshotResult> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
