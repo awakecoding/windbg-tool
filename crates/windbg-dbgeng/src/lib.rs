@@ -722,6 +722,19 @@ pub struct VirtualMemoryMap {
     pub detail: String,
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct VirtualAddressInspection {
+    pub address: u64,
+    pub target_kind: DebuggerSessionKind,
+    pub virtual_to_physical_status: String,
+    pub physical_address: Option<u64>,
+    pub virtual_to_physical_detail: String,
+    pub query_virtual_status: String,
+    pub virtual_region: Option<VirtualMemoryRegion>,
+    pub query_virtual_detail: String,
+    pub detail: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct DebuggerOutputCaptureOptions {
     pub started_at: Instant,
@@ -1753,6 +1766,61 @@ impl DebuggerSession {
                 });
             };
             query_address = next_query_address;
+        }
+    }
+
+    pub fn inspect_virtual_address(&self, address: u64) -> VirtualAddressInspection {
+        use windows::Win32::System::Memory::MEMORY_BASIC_INFORMATION64;
+
+        let (virtual_to_physical_status, physical_address, virtual_to_physical_detail) =
+            match unsafe { self.data_spaces.VirtualToPhysical(address) } {
+                Ok(physical_address) => (
+                    "captured".to_string(),
+                    Some(physical_address),
+                    "DbgEng translated this virtual address to the physical address captured by the target.".to_string(),
+                ),
+                Err(error) => (
+                    "unavailable".to_string(),
+                    None,
+                    format!("DbgEng VirtualToPhysical did not provide a translation: {error}"),
+                ),
+            };
+
+        let mut info = MEMORY_BASIC_INFORMATION64::default();
+        let (query_virtual_status, virtual_region, query_virtual_detail) = match unsafe {
+            self.data_spaces.QueryVirtual(address, &mut info)
+        } {
+            Ok(()) => (
+                "captured".to_string(),
+                Some(VirtualMemoryRegion {
+                    base_address: info.BaseAddress,
+                    allocation_base: info.AllocationBase,
+                    allocation_protection: info.AllocationProtect.0,
+                    region_size: info.RegionSize,
+                    state: info.State.0,
+                    protection: info.Protect.0,
+                    kind: info.Type.0,
+                }),
+                "DbgEng returned one MEMORY_BASIC_INFORMATION64 record for the supplied address."
+                    .to_string(),
+            ),
+            Err(error) => (
+                "unavailable".to_string(),
+                None,
+                format!("DbgEng QueryVirtual did not provide a region: {error}"),
+            ),
+        };
+
+        VirtualAddressInspection {
+            address,
+            target_kind: self.kind,
+            virtual_to_physical_status,
+            physical_address,
+            virtual_to_physical_detail,
+            query_virtual_status,
+            virtual_region,
+            query_virtual_detail,
+            detail: "A captured virtual-to-physical translation proves only that DbgEng can translate the address in this snapshot. QueryVirtual protection fields are reported only when DbgEng supplies them. Neither result reconstructs the PTE state or write permission at the historical fault instant.".to_string(),
         }
     }
 

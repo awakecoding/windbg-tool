@@ -38,8 +38,8 @@ use windows::Win32::System::Threading::{
 
 use super::output::{print_value, OutputOptions};
 use super::{
-    CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs, LiveLaunchArgs,
-    LiveManagedBreakArgs, LiveStartupBreakArgs, LiveStartupProfileArgs,
+    parse_u64_argument, CliDumpKind, DbgEngServerArgs, DumpCreateArgs, DumpInspectArgs,
+    LiveLaunchArgs, LiveManagedBreakArgs, LiveStartupBreakArgs, LiveStartupProfileArgs,
     LiveStartupProfileCompareArgs, LiveStartupProfileReportArgs, StartupProfileContextEvent,
     StartupProfileReportFormat, TraceRecordArgs, TraceRecordProfile, TraceReplayCpuSupport,
     WindbgCommand,
@@ -4538,12 +4538,32 @@ pub(super) fn run_dump_inspect(
     args: DumpInspectArgs,
     output: &OutputOptions,
 ) -> anyhow::Result<()> {
+    let inspected_address = args
+        .inspect_address
+        .as_deref()
+        .map(parse_u64_argument)
+        .transpose()?;
+    let tracker_table_base = args
+        .tracker_table_base
+        .as_deref()
+        .map(parse_u64_argument)
+        .transpose()?;
+    let dump_metadata = fs::metadata(&args.path)
+        .with_context(|| format!("reading dump metadata for {}", args.path.display()))?;
+    let operation_started = Instant::now();
+    let opened_at = Instant::now();
     let session = open_dump_session(DumpOpenOptions {
         path: args.path.clone(),
     })?;
+    let open_elapsed_ms = opened_at.elapsed().as_millis() as u64;
     let target = session.summary();
+    let modules_started = Instant::now();
     let modules = session.modules()?;
+    let modules_elapsed_ms = modules_started.elapsed().as_millis() as u64;
+    let bugcheck_started = Instant::now();
     let bugcheck = session.bugcheck_data();
+    let bugcheck_elapsed_ms = bugcheck_started.elapsed().as_millis() as u64;
+    let symbols_started = Instant::now();
     let native_symbols = prepare_dump_native_symbols(
         &session,
         &modules,
@@ -4552,27 +4572,58 @@ pub(super) fn run_dump_inspect(
         &args.image_path,
         args.offline,
     );
+    let symbols_elapsed_ms = symbols_started.elapsed().as_millis() as u64;
+    let threads_started = Instant::now();
     let threads = session.threads()?;
+    let threads_elapsed_ms = threads_started.elapsed().as_millis() as u64;
+    let registers_started = Instant::now();
     let registers = session.core_registers()?;
+    let registers_elapsed_ms = registers_started.elapsed().as_millis() as u64;
+    let stack_started = Instant::now();
     let stack = session.stack_trace_result(args.max_frames)?;
+    let stack_elapsed_ms = stack_started.elapsed().as_millis() as u64;
+    let triage_started = Instant::now();
     let triage = dump_triage_value(
         &session,
-        &target,
-        &modules,
-        &bugcheck,
-        &stack,
-        args.max_frames,
-        args.refresh_symbols,
-        native_symbols,
+        DumpTriageInput {
+            target: &target,
+            modules: &modules,
+            bugcheck: &bugcheck,
+            current_stack: &stack,
+            max_frames: args.max_frames,
+            refresh_symbols: args.refresh_symbols,
+            native_symbols,
+            inspected_address,
+            tracker_table_base,
+        },
     );
+    let triage_elapsed_ms = triage_started.elapsed().as_millis() as u64;
     print_value(
         json!({
+            "triage_profile": "bounded_pool_corruption",
             "target": target,
             "modules": modules,
             "threads": threads,
             "registers": registers,
             "frames": stack.frames,
             "triage": triage,
+            "telemetry": {
+                "source": "host_monotonic_wall_clock",
+                "dump_file_bytes": dump_metadata.len(),
+                "dump_open_elapsed_ms": open_elapsed_ms,
+                "module_enumeration_elapsed_ms": modules_elapsed_ms,
+                "bugcheck_read_elapsed_ms": bugcheck_elapsed_ms,
+                "native_symbol_preparation_elapsed_ms": symbols_elapsed_ms,
+                "thread_enumeration_elapsed_ms": threads_elapsed_ms,
+                "register_read_elapsed_ms": registers_elapsed_ms,
+                "stack_walk_elapsed_ms": stack_elapsed_ms,
+                "triage_elapsed_ms": triage_elapsed_ms,
+                "total_elapsed_ms": operation_started.elapsed().as_millis() as u64,
+                "bounded_operations": {
+                    "stack_frame_limit": args.max_frames,
+                    "whole_dump_scan": false,
+                },
+            },
         }),
         output,
     )
@@ -4589,7 +4640,7 @@ fn prepare_dump_native_symbols(
     let fault_address = bugcheck
         .data
         .as_ref()
-        .and_then(|data| (data.code == 0x0000_003B).then_some(data.parameters[1]))
+        .and_then(dump_fault_address)
         .or_else(|| {
             session
                 .core_registers()
@@ -4776,8 +4827,10 @@ fn prepare_dump_native_symbols(
         .parent()
         .expect("PDB cache path has a parent")
         .to_path_buf();
-    let configure =
-        session.configure_local_symbol_paths(&[pdb_directory.clone()], &[image_directory.clone()]);
+    let configure = session.configure_local_symbol_paths(
+        std::slice::from_ref(&pdb_directory),
+        std::slice::from_ref(&image_directory),
+    );
     let reload = configure.and_then(|()| {
         module
             .module_name
@@ -4826,68 +4879,135 @@ fn dump_image_roots(extra_image_paths: &[PathBuf]) -> Vec<PathBuf> {
     deduplicated
 }
 
-fn dump_triage_value(
-    session: &DebuggerSession,
-    target: &windbg_dbgeng::DebuggerSessionSummary,
-    modules: &[ModuleInfo],
-    bugcheck: &windbg_dbgeng::BugCheckDataResult,
-    current_stack: &windbg_dbgeng::StackTraceResult,
+struct DumpTriageInput<'a> {
+    target: &'a windbg_dbgeng::DebuggerSessionSummary,
+    modules: &'a [ModuleInfo],
+    bugcheck: &'a windbg_dbgeng::BugCheckDataResult,
+    current_stack: &'a windbg_dbgeng::StackTraceResult,
     max_frames: u32,
     refresh_symbols: bool,
     native_symbols: Value,
-) -> Value {
-    let bugcheck_data = bugcheck.data.as_ref();
-    let fault_address = bugcheck_data.and_then(|data| match data.code {
-        0x0000_003B => Some(data.parameters[1]),
-        _ => None,
-    });
-    let exception_context_address = bugcheck_data.and_then(|data| match data.code {
-        0x0000_003B => Some(data.parameters[2]),
-        _ => None,
-    });
+    inspected_address: Option<u64>,
+    tracker_table_base: Option<u64>,
+}
+
+fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> Value {
+    let bugcheck_data = input.bugcheck.data.as_ref();
+    let fault_address = bugcheck_data.and_then(dump_fault_address);
     let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
-    let exception_context = match (
-        target.processor_type,
-        exception_context_address,
-        bugcheck_data.map(|data| data.code),
-    ) {
-        (Some(0x8664), Some(address), Some(0x0000_003B)) => {
-            Some(serde_json::to_value(session.x64_exception_context(address, max_frames))
-                .unwrap_or_else(|error| {
-                    json!({
-                        "status": "serialization_error",
-                        "detail": format!("Could not serialize decoded x64 exception context: {error}"),
-                    })
-                }))
-        }
-        (_, Some(address), Some(0x0000_003B)) => Some(json!({
-            "status": "architecture_unsupported",
-            "context_record_address": address,
-            "detail": "The exception context is present, but x64 decoding is only implemented for AMD64 dump targets.",
-        })),
-        _ => None,
-    };
+    let exception_context =
+        dump_exception_context(session, input.target, bugcheck_data, input.max_frames);
     let symbol_modules = dump_symbol_modules(session, fault_address, &exception_context);
-    let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, refresh_symbols);
+    let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, input.refresh_symbols);
     let driver_evidence = dump_driver_evidence(
         session,
-        modules,
+        input.modules,
         fault_address,
-        current_stack,
+        input.current_stack,
         &exception_context,
     );
+    let pool_tracker = dump_pool_tracker_observation(
+        session,
+        &exception_context,
+        &fault,
+        input.tracker_table_base,
+    );
+    let address_inspection = input
+        .inspected_address
+        .map(|address| dump_address_inspection(session, address, input.tracker_table_base));
+    let bugcheck_driver = dump_bugcheck_driver(session);
+    let evidence = dump_evidence_grades(&driver_evidence, &pool_tracker, &bugcheck_driver);
 
     json!({
-        "bugcheck": dump_bugcheck_value(bugcheck),
+        "bugcheck": dump_bugcheck_value(input.bugcheck),
         "fault": fault,
         "exception_context": exception_context,
-        "current_stack": current_stack,
+        "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
-        "native_symbol_prefetch": native_symbols,
+        "native_symbol_prefetch": input.native_symbols,
         "driver_evidence": driver_evidence,
-        "data_limits": dump_data_limits(target, current_stack, bugcheck, &fault, &exception_context),
-        "recommendations": dump_recommendations(bugcheck),
+        "bugcheck_driver": bugcheck_driver,
+        "pool_tracker": pool_tracker,
+        "address_inspection": address_inspection,
+        "evidence": evidence,
+        "data_limits": dump_data_limits(
+            input.target,
+            input.current_stack,
+            input.bugcheck,
+            &fault,
+            &exception_context,
+        ),
+        "recommendations": dump_recommendations(input.bugcheck),
     })
+}
+
+fn dump_fault_address(data: &windbg_dbgeng::BugCheckData) -> Option<u64> {
+    match data.code {
+        0x0000_001E | 0x0000_003B => Some(data.parameters[1]),
+        _ => None,
+    }
+}
+
+fn dump_exception_context(
+    session: &DebuggerSession,
+    target: &windbg_dbgeng::DebuggerSessionSummary,
+    bugcheck: Option<&windbg_dbgeng::BugCheckData>,
+    max_frames: u32,
+) -> Option<Value> {
+    let data = bugcheck?;
+    let candidates = match data.code {
+        0x0000_003B => vec![("parameter_3_exception_context", data.parameters[2])],
+        // KMODE_EXCEPTION_NOT_HANDLED does not promise a CONTEXT parameter. Some
+        // contemporary kernel builds preserve one in parameter four, so probe only
+        // the documented-size record and report the result as a heuristic.
+        0x0000_001E => vec![
+            ("heuristic_parameter_4_context", data.parameters[3]),
+            ("heuristic_parameter_3_context", data.parameters[2]),
+        ],
+        _ => return None,
+    };
+    if target.processor_type != Some(0x8664) {
+        return Some(json!({
+            "status": "architecture_unsupported",
+            "candidates": candidates.into_iter().map(|(source, address)| json!({
+                "source": source,
+                "context_record_address": address,
+            })).collect::<Vec<_>>(),
+            "detail": "The bugcheck supplied or suggested a context address, but x64 decoding is only implemented for AMD64 dump targets.",
+        }));
+    }
+
+    let decoded = candidates
+        .into_iter()
+        .map(|(source, address)| {
+            let context = session.x64_exception_context(address, max_frames);
+            json!({
+                "source": source,
+                "context": context,
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected = decoded.iter().find(|candidate| {
+        matches!(
+            candidate["context"]["status"].as_str(),
+            Some("captured" | "context_captured_stack_unavailable")
+        )
+    });
+    Some(json!({
+        "status": selected
+            .and_then(|candidate| candidate["context"]["status"].as_str())
+            .unwrap_or("unavailable"),
+        "selection": selected
+            .and_then(|candidate| candidate["source"].as_str())
+            .unwrap_or("none"),
+        "context": selected.map(|candidate| candidate["context"].clone()),
+        "candidates": decoded,
+        "detail": if data.code == 0x0000_001E {
+            "For bugcheck 0x1E, context candidates are bounded structural probes rather than a documented parameter contract."
+        } else {
+            "The decoded context comes from the documented SYSTEM_SERVICE_EXCEPTION context-record parameter."
+        },
+    }))
 }
 
 fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
@@ -4898,11 +5018,18 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         });
     };
     let name = match data.code {
+        0x0000_001E => "KMODE_EXCEPTION_NOT_HANDLED",
         0x0000_003B => "SYSTEM_SERVICE_EXCEPTION",
         0x0000_0051 => "REGISTRY_ERROR",
         _ => "UNKNOWN",
     };
     let parameter_roles = match data.code {
+        0x0000_001E => json!([
+            "exception_code",
+            "fault_instruction_address",
+            "exception_parameter_0",
+            "exception_parameter_1_or_build_specific_context_candidate",
+        ]),
         0x0000_003B => json!([
             "exception_code",
             "fault_instruction_address",
@@ -4963,6 +5090,461 @@ fn dump_address_observation(
     })
 }
 
+fn selected_exception_register(exception_context: &Option<Value>, name: &str) -> Option<u64> {
+    exception_context
+        .as_ref()?
+        .get("context")?
+        .get("registers")?
+        .get(name)?
+        .as_u64()
+}
+
+fn dump_bugcheck_driver(session: &DebuggerSession) -> Value {
+    let pointer = match session.evaluate("poi(nt!KiBugCheckDriver)") {
+        Ok(result) => match result.unsigned_value {
+            Some(0) => {
+                return json!({
+                    "status": "not_set",
+                    "pointer": 0,
+                    "detail": "KiBugCheckDriver is null in this snapshot.",
+                });
+            }
+            Some(pointer) => pointer,
+            None => {
+                return json!({
+                    "status": "unavailable",
+                    "detail": "DbgEng evaluated KiBugCheckDriver without an integer pointer result.",
+                });
+            }
+        },
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "detail": format!("DbgEng could not evaluate KiBugCheckDriver: {error}"),
+            });
+        }
+    };
+    match session.read_memory(pointer, 260) {
+        Ok(memory) => {
+            let bytes = decode_hex_bytes(&memory.data);
+            let driver_name = bytes
+                .as_deref()
+                .map(|bytes| {
+                    let end = bytes
+                        .iter()
+                        .position(|byte| *byte == 0)
+                        .unwrap_or(bytes.len());
+                    bytes[..end]
+                        .iter()
+                        .map(|byte| {
+                            if byte.is_ascii_graphic() || *byte == b' ' {
+                                char::from(*byte)
+                            } else {
+                                '\u{FFFD}'
+                            }
+                        })
+                        .collect::<String>()
+                })
+                .filter(|name| !name.is_empty());
+            json!({
+                "status": if driver_name.is_some() { "captured" } else { "pointer_present_name_unavailable" },
+                "pointer": pointer,
+                "driver_name": driver_name,
+                "memory": memory,
+                "detail": "KiBugCheckDriver is direct crash evidence only when the kernel recorded a non-null driver name.",
+            })
+        }
+        Err(error) => json!({
+            "status": "unavailable",
+            "pointer": pointer,
+            "detail": format!("DbgEng could not read the KiBugCheckDriver string: {error}"),
+        }),
+    }
+}
+
+fn dump_pool_tracker_observation(
+    session: &DebuggerSession,
+    exception_context: &Option<Value>,
+    fault: &Option<Value>,
+    supplied_table_base: Option<u64>,
+) -> Value {
+    const ENTRY_STRIDE: u64 = 0x50;
+    let active_table = match evaluate_unsigned(session, "poi(nt!PoolTrackTable)") {
+        Ok(value) if value != 0 => value,
+        Ok(_) => {
+            return json!({
+                "status": "not_initialized",
+                "detail": "nt!PoolTrackTable is null in this snapshot.",
+            });
+        }
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "detail": error,
+            });
+        }
+    };
+    let table_size = match evaluate_unsigned(session, "poi(nt!PoolTrackTableSize)") {
+        Ok(value) if (1..=1_048_576).contains(&value) => value,
+        Ok(value) => {
+            return json!({
+                "status": "unavailable",
+                "active_table": active_table,
+                "detail": format!("nt!PoolTrackTableSize has unsupported value {value}; bounded entry inspection was skipped."),
+            });
+        }
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "active_table": active_table,
+                "detail": error,
+            });
+        }
+    };
+    let table_mask = evaluate_unsigned(session, "poi(nt!PoolTrackTableMask)").ok();
+    let table_bytes = match table_size.checked_mul(ENTRY_STRIDE) {
+        Some(value) => value,
+        None => {
+            return json!({
+                "status": "unavailable",
+                "active_table": active_table,
+                "table_size": table_size,
+                "detail": "Pool tracker table range overflowed while calculating its bounded address range.",
+            });
+        }
+    };
+    let table_end = match active_table.checked_add(table_bytes) {
+        Some(value) => value,
+        None => {
+            return json!({
+                "status": "unavailable",
+                "active_table": active_table,
+                "table_size": table_size,
+                "detail": "Pool tracker table end overflowed while calculating its bounded address range.",
+            });
+        }
+    };
+    let entry_address = selected_exception_register(exception_context, "r8");
+    let r14 = selected_exception_register(exception_context, "r14");
+    let rax = selected_exception_register(exception_context, "rax");
+    let entry_provenance = pool_tracker_entry_provenance(fault, entry_address, r14);
+    let supplied_table =
+        pool_tracker_table_relation(entry_address, supplied_table_base, table_size, ENTRY_STRIDE);
+    let entry_relation = entry_address.map(|address| {
+        if (active_table..table_end).contains(&address) {
+            "within_active_table"
+        } else {
+            "outside_active_table"
+        }
+    });
+    let nearby_entries = entry_address
+        .map(|address| {
+            [
+                address.checked_sub(ENTRY_STRIDE),
+                Some(address),
+                address.checked_add(ENTRY_STRIDE),
+            ]
+            .into_iter()
+            .flatten()
+            .map(|address| pool_tracker_entry_snapshot(session, address))
+            .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let observed_tag = nearby_entries
+        .iter()
+        .find(|entry| entry["address"].as_u64() == entry_address)
+        .and_then(|entry| entry["tag"]["printable"].as_bool())
+        .unwrap_or(false);
+    let classification = match (supplied_table["relation"].as_str(), observed_tag) {
+        (Some("within_supplied_table"), true) => "supplied_tracker_table_entry",
+        _ => match (entry_relation, observed_tag) {
+            (Some("outside_active_table"), true) => {
+                "outside_central_table_tracker_like_unclassified"
+            }
+            (Some("outside_active_table"), false) => "outside_central_table_unclassified",
+            (Some("within_active_table"), _) => "active_tracker_table_entry",
+            _ => "no_validated_exception_entry_available",
+        },
+    };
+    json!({
+        "status": "captured",
+        "layout": {
+            "entry_stride_bytes": ENTRY_STRIDE,
+            "source": "build-observed bounded layout",
+            "detail": "The inspector reads raw fields at stable offsets and does not infer an allocation owner or free history from an entry.",
+        },
+        "active_table": active_table,
+        "active_table_size": table_size,
+        "active_table_mask": table_mask,
+        "active_table_end_exclusive": table_end,
+        "exception_entry_address": entry_address,
+        "exception_entry_relation": entry_relation,
+        "exception_entry_provenance": entry_provenance,
+        "supplied_table": supplied_table,
+        "register_derived_addresses": {
+            "r8_plus_r14": entry_address.zip(r14).and_then(|(r8, r14)| r8.checked_add(r14)),
+            "r8_plus_rax": entry_address.zip(rax).and_then(|(r8, rax)| r8.checked_add(rax)),
+            "detail": "These are arithmetic observations from the selected exception context; fault-instruction interpretation remains in the disassembly evidence.",
+        },
+        "nearby_entries": nearby_entries,
+        "classification": classification,
+    })
+}
+
+fn dump_address_inspection(
+    session: &DebuggerSession,
+    address: u64,
+    supplied_table_base: Option<u64>,
+) -> Value {
+    const ENTRY_STRIDE: u64 = 0x50;
+    let mapping = session.inspect_virtual_address(address);
+    let table_size = evaluate_unsigned(session, "poi(nt!PoolTrackTableSize)").ok();
+    let supplied_table = table_size.map(|size| {
+        pool_tracker_table_relation(Some(address), supplied_table_base, size, ENTRY_STRIDE)
+    });
+    json!({
+        "address": address,
+        "mapping": mapping,
+        "bounded_raw_window": pool_tracker_entry_snapshot(session, address),
+        "supplied_table": supplied_table,
+        "allocation_header": {
+            "status": "unsupported",
+            "detail": "DbgEng exposes no stable typed pool-header/owner API for this offline kernel dump. The raw 0x50-byte record is preserved, but no allocation lifetime, owner, or pool-header interpretation is inferred."
+        },
+        "detail": "The address probe is bounded and read-only. A successful dump read or virtual-to-physical translation does not establish write permission or the historical PTE state at the fault instant."
+    })
+}
+
+fn pool_tracker_table_relation(
+    address: Option<u64>,
+    table_base: Option<u64>,
+    table_size: u64,
+    entry_stride: u64,
+) -> Value {
+    let Some(address) = address else {
+        return json!({
+            "status": "not_applicable",
+            "relation": "no_address",
+        });
+    };
+    let Some(table_base) = table_base else {
+        return json!({
+            "status": "not_provided",
+            "relation": "table_base_not_provided",
+        });
+    };
+    let Some(table_bytes) = table_size.checked_mul(entry_stride) else {
+        return json!({
+            "status": "unavailable",
+            "relation": "range_overflow",
+        });
+    };
+    let Some(table_end) = table_base.checked_add(table_bytes) else {
+        return json!({
+            "status": "unavailable",
+            "relation": "range_overflow",
+        });
+    };
+    if !(table_base..table_end).contains(&address) {
+        return json!({
+            "status": "captured",
+            "relation": "outside_supplied_table",
+            "table_base": table_base,
+            "table_end_exclusive": table_end,
+        });
+    }
+    let offset = address - table_base;
+    let entry_aligned = offset % entry_stride == 0;
+    json!({
+        "status": "captured",
+        "relation": if entry_aligned { "within_supplied_table" } else { "within_supplied_table_unaligned" },
+        "table_base": table_base,
+        "table_end_exclusive": table_end,
+        "entry_offset": offset,
+        "entry_index": offset / entry_stride,
+        "entry_aligned": entry_aligned,
+        "detail": "The supplied base is caller evidence. This range check establishes address membership only; it does not prove the table's allocation ownership or lifetime."
+    })
+}
+
+fn pool_tracker_entry_provenance(
+    fault: &Option<Value>,
+    entry_address: Option<u64>,
+    r14: Option<u64>,
+) -> Value {
+    let fault_symbol = fault
+        .as_ref()
+        .and_then(|value| value["disassembly"]["lines"].as_array())
+        .and_then(|lines| lines.first())
+        .and_then(|line| line["symbol"]["name"].as_str());
+    let fault_instruction = fault
+        .as_ref()
+        .and_then(|value| value["disassembly"]["lines"].as_array())
+        .and_then(|lines| lines.first())
+        .and_then(|line| line["text"].as_str());
+    let instruction_uses_r8 =
+        fault_instruction
+            .map(str::to_ascii_lowercase)
+            .is_some_and(|instruction| {
+                instruction.contains("[r14+r8]") || instruction.contains("[r8+r14]")
+            });
+    let tracker_charge_function = fault_symbol
+        .map(str::to_ascii_lowercase)
+        .is_some_and(|symbol| symbol.contains("exppooltrackerchargeentry"));
+    json!({
+        "status": if entry_address.is_some() && r14.is_some() && instruction_uses_r8 && tracker_charge_function {
+            "validated"
+        } else {
+            "unvalidated"
+        },
+        "source": "fault_instruction_and_decoded_registers",
+        "fault_symbol": fault_symbol,
+        "fault_instruction": fault_instruction,
+        "instruction_uses_r8_memory_operand": instruction_uses_r8,
+        "tracker_charge_function": tracker_charge_function,
+        "detail": "A validated result requires a captured R8/R14 context plus a fault instruction in ExpPoolTrackerChargeEntry that uses R8 as a memory operand. It establishes register-to-instruction provenance, not allocation ownership or free history.",
+    })
+}
+
+fn evaluate_unsigned(session: &DebuggerSession, expression: &str) -> Result<u64, String> {
+    session
+        .evaluate(expression)
+        .map_err(|error| format!("DbgEng could not evaluate {expression}: {error}"))?
+        .unsigned_value
+        .ok_or_else(|| format!("DbgEng evaluated {expression} without an unsigned integer result."))
+}
+
+fn pool_tracker_entry_snapshot(session: &DebuggerSession, address: u64) -> Value {
+    const READ_SIZE: u32 = 0x50;
+    match session.read_memory(address, READ_SIZE) {
+        Ok(memory) => {
+            let Some(bytes) = decode_hex_bytes(&memory.data) else {
+                return json!({
+                    "address": address,
+                    "status": "invalid_hex",
+                    "memory": memory,
+                });
+            };
+            let read_u64 = |offset: usize| {
+                bytes
+                    .get(offset..offset + std::mem::size_of::<u64>())
+                    .and_then(|value| value.try_into().ok())
+                    .map(u64::from_le_bytes)
+            };
+            let tag = read_u64(0).map(|value| (value & u32::MAX as u64) as u32);
+            json!({
+                "address": address,
+                "status": if memory.complete { "captured" } else { "partial" },
+                "tag": tag.map(pool_tag_value),
+                "raw_qwords": {
+                    "offset_00": read_u64(0),
+                    "offset_08": read_u64(8),
+                    "offset_10": read_u64(16),
+                    "offset_18": read_u64(24),
+                    "offset_20": read_u64(32),
+                    "offset_28": read_u64(40),
+                    "offset_30": read_u64(48),
+                    "offset_38": read_u64(56),
+                    "offset_40": read_u64(64),
+                    "offset_48": read_u64(72),
+                },
+                "memory": memory,
+            })
+        }
+        Err(error) => json!({
+            "address": address,
+            "status": "unavailable",
+            "detail": format!("DbgEng could not read the bounded pool tracker entry: {error}"),
+        }),
+    }
+}
+
+fn pool_tag_value(tag: u32) -> Value {
+    let bytes = tag.to_le_bytes();
+    let printable = bytes
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ');
+    let text = bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '.'
+            }
+        })
+        .collect::<String>();
+    json!({
+        "raw": tag,
+        "text": text,
+        "printable": printable,
+    })
+}
+
+fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            std::str::from_utf8(pair)
+                .ok()
+                .and_then(|pair| u8::from_str_radix(pair, 16).ok())
+        })
+        .collect()
+}
+
+fn dump_evidence_grades(
+    driver_evidence: &Value,
+    pool_tracker: &Value,
+    bugcheck_driver: &Value,
+) -> Value {
+    let tracker_classification = pool_tracker["classification"].as_str();
+    let tracker_grade = match tracker_classification {
+        Some("active_tracker_table_entry" | "supplied_tracker_table_entry") => "observed",
+        Some(_) => "possible",
+        None => "not_established",
+    };
+    let driver_grade = match bugcheck_driver["status"].as_str() {
+        Some("captured") => "observed",
+        Some("not_set") => "not_established",
+        _ => "not_established",
+    };
+    let external_driver_grade =
+        if driver_evidence["status"].as_str() == Some("direct_evidence_present") {
+            "observed"
+        } else {
+            "not_established"
+        };
+    json!({
+        "grading_scale": {
+            "observed": "Captured directly from the dump.",
+            "strongly_consistent": "The observed facts match this explanation, but do not establish the initiating write or lifetime transition.",
+            "possible": "The dump neither establishes nor excludes this explanation.",
+            "not_established": "The dump contains no direct evidence for this explanation.",
+        },
+        "observations": [
+            {
+                "topic": "pool_tracker_entry_lifetime",
+                "grade": tracker_grade,
+                "detail": "Central-table range membership alone does not classify per-CPU tracker replicas. A supplied per-CPU base can establish bounded table membership, but not allocation ownership, free history, or a lifetime transition.",
+            },
+            {
+                "topic": "bugcheck_driver",
+                "grade": driver_grade,
+                "detail": "KiBugCheckDriver is meaningful only when the kernel populated a non-null driver string.",
+            },
+            {
+                "topic": "third_party_driver_causation",
+                "grade": external_driver_grade,
+                "detail": "Loaded modules are inventory only. Attribution requires a fault, validated stack, or populated bugcheck-driver observation.",
+            },
+        ],
+    })
+}
+
 fn dump_symbol_modules(
     session: &DebuggerSession,
     fault_address: Option<u64>,
@@ -4974,7 +5556,7 @@ fn dump_symbol_modules(
         fault_address,
         exception_context
             .as_ref()
-            .and_then(|context| context["registers"]["rip"].as_u64()),
+            .and_then(|context| context["context"]["registers"]["rip"].as_u64()),
     ]
     .into_iter()
     .flatten()
@@ -5106,8 +5688,10 @@ fn dump_driver_evidence(
         }
     }
     if let Some(context) = exception_context.as_ref() {
-        let valid_frames = context["stack"]["valid_frames"].as_u64().unwrap_or(0) as usize;
-        if let Some(context_stack) = context["stack"]["frames"].as_array() {
+        let valid_frames = context["context"]["stack"]["valid_frames"]
+            .as_u64()
+            .unwrap_or(0) as usize;
+        if let Some(context_stack) = context["context"]["stack"]["frames"].as_array() {
             for frame in context_stack.iter().take(valid_frames) {
                 if let Some(address) = frame["instruction_offset"].as_u64() {
                     if let Ok(Some(module)) = session.module_by_offset(address) {
@@ -5233,6 +5817,8 @@ pub(super) fn live_capabilities() -> Value {
             "live attach --process-id <pid>",
             "dump create --process-id <pid> --output <path>",
             "dump inspect <path>",
+            "dump triage <path>",
+            "dump pool-triage <path>",
             "target dump --target <id> --output <path>",
             "target list/status/wait/continue/continue-wait/step/step-over for live targets",
             "target threads/modules/registers/memory/stack/disasm/symbol/source for live targets"
@@ -6502,6 +7088,80 @@ mod tests {
                 detail: "fixture".to_string(),
             })[0]["priority"],
             "high"
+        );
+    }
+
+    #[test]
+    fn dump_triage_describes_kmode_exception_parameters_and_fault_address() {
+        let data = windbg_dbgeng::BugCheckData {
+            code: 0x1E,
+            parameters: [0xC000_0005, 0xFFFF_F800_E439_70B0, 0, 0xFFFF_8581_BD06_8CC0],
+        };
+        let value = dump_bugcheck_value(&windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(data.clone()),
+            detail: "fixture".to_string(),
+        });
+
+        assert_eq!(value["name"], "KMODE_EXCEPTION_NOT_HANDLED");
+        assert_eq!(value["parameter_roles"][1], "fault_instruction_address");
+        assert_eq!(
+            value["parameter_roles"][3],
+            "exception_parameter_1_or_build_specific_context_candidate"
+        );
+        assert_eq!(dump_fault_address(&data), Some(0xFFFF_F800_E439_70B0));
+    }
+
+    #[test]
+    fn pool_tracker_helpers_preserve_raw_evidence() {
+        assert_eq!(
+            decode_hex_bytes("4B65792000000000"),
+            Some(b"Key \0\0\0\0".to_vec())
+        );
+        assert_eq!(decode_hex_bytes("F"), None);
+        assert_eq!(pool_tag_value(u32::from_le_bytes(*b"Key "))["text"], "Key ");
+        assert_eq!(pool_tag_value(0)["printable"], false);
+
+        let grades = dump_evidence_grades(
+            &json!({"status": "inventory_only"}),
+            &json!({"classification": "outside_central_table_tracker_like_unclassified"}),
+            &json!({"status": "not_set"}),
+        );
+        assert_eq!(grades["observations"][0]["grade"], "possible");
+        assert_eq!(grades["observations"][1]["grade"], "not_established");
+        assert_eq!(grades["observations"][2]["grade"], "not_established");
+    }
+
+    #[test]
+    fn pool_tracker_table_relation_requires_a_supplied_aligned_base() {
+        let within = pool_tracker_table_relation(Some(0x150), Some(0x100), 4, 0x50);
+        assert_eq!(within["relation"], "within_supplied_table");
+        assert_eq!(within["entry_index"], 1);
+
+        let unaligned = pool_tracker_table_relation(Some(0x151), Some(0x100), 4, 0x50);
+        assert_eq!(unaligned["relation"], "within_supplied_table_unaligned");
+
+        let missing = pool_tracker_table_relation(Some(0x150), None, 4, 0x50);
+        assert_eq!(missing["relation"], "table_base_not_provided");
+    }
+
+    #[test]
+    fn pool_tracker_provenance_requires_matching_fault_instruction() {
+        let fault = Some(json!({
+            "disassembly": {
+                "lines": [{
+                    "symbol": { "name": "nt!ExpPoolTrackerChargeEntry" },
+                    "text": "lock xadd qword ptr [r14+r8], rbp"
+                }]
+            }
+        }));
+        assert_eq!(
+            pool_tracker_entry_provenance(&fault, Some(0x1000), Some(0x20))["status"],
+            "validated"
+        );
+        assert_eq!(
+            pool_tracker_entry_provenance(&fault, Some(0x1000), None)["status"],
+            "unvalidated"
         );
     }
 
