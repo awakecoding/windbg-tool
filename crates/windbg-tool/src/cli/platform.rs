@@ -4943,11 +4943,16 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let processor_activity = dump_processor_activity(input.processor_snapshot);
     let driver_verifier = dump_driver_verifier_snapshot();
     let write_provenance = dump_write_provenance_feasibility();
+    let fault_mechanics =
+        dump_fault_mechanics_audit(input.bugcheck, &exception_context, &fault, &pool_tracker);
+    let kernel_integrity = dump_kernel_integrity_snapshot(input.modules);
+    let physical_page_provenance = dump_physical_page_provenance_feasibility();
 
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
         "fault": fault,
         "exception_context": exception_context,
+        "fault_mechanics": fault_mechanics,
         "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
         "native_symbol_prefetch": input.native_symbols,
@@ -4957,6 +4962,8 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "processor_activity": processor_activity,
         "driver_verifier": driver_verifier,
         "write_provenance": write_provenance,
+        "kernel_integrity": kernel_integrity,
+        "physical_page_provenance": physical_page_provenance,
         "address_inspection": address_inspection,
         "evidence": evidence,
         "data_limits": dump_data_limits(
@@ -5574,6 +5581,117 @@ fn dump_write_provenance_feasibility() -> Value {
             "Current virtual-to-physical mapping and leaf PTE flags when an address is explicitly inspected.",
             "Build-gated pool-tracker root and bounded table-entry snapshots."
         ]
+    })
+}
+
+fn dump_fault_mechanics_audit(
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    exception_context: &Option<Value>,
+    fault: &Option<Value>,
+    pool_tracker: &Value,
+) -> Value {
+    let bugcheck_data = bugcheck.data.as_ref();
+    let fault_instruction_address = bugcheck_data.and_then(dump_fault_address);
+    let context_rip = selected_exception_register(exception_context, "rip");
+    let r8 = selected_exception_register(exception_context, "r8");
+    let r14 = selected_exception_register(exception_context, "r14");
+    let rbp = selected_exception_register(exception_context, "rbp");
+    let eflags = selected_exception_register(exception_context, "eflags");
+    let effective_address = r8
+        .zip(r14)
+        .and_then(|(base, offset)| base.checked_add(offset));
+    let instruction = fault
+        .as_ref()
+        .and_then(|value| value["disassembly"]["lines"].as_array())
+        .and_then(|lines| lines.first())
+        .and_then(|line| line["text"].as_str());
+    let lower_instruction = instruction.map(str::to_ascii_lowercase);
+    let is_r8_r14_xadd = lower_instruction.as_deref().is_some_and(|text| {
+        text.contains("lock xadd")
+            && (text.contains("[r14+r8]") || text.contains("[r8+r14]"))
+            && text.contains("rbp")
+    });
+    let counter_raw_qword = r8.and_then(|entry_address| {
+        pool_tracker["nearby_entries"]
+            .as_array()?
+            .iter()
+            .find(|entry| entry["address"].as_u64() == Some(entry_address))?["raw_qwords"]
+            ["offset_20"]
+            .as_u64()
+    });
+    let context_source = exception_context
+        .as_ref()
+        .and_then(|value| value["selection"].as_str());
+    let access_kind = if is_r8_r14_xadd {
+        "atomic_read_modify_write"
+    } else {
+        "unavailable"
+    };
+    json!({
+        "status": if is_r8_r14_xadd && effective_address.is_some() {
+            "captured"
+        } else {
+            "incomplete"
+        },
+        "fault_instruction_address": fault_instruction_address,
+        "context_rip": context_rip,
+        "fault_instruction_matches_context_rip": fault_instruction_address.zip(context_rip).map(|(fault, rip)| fault == rip),
+        "context_source": context_source,
+        "instruction": instruction,
+        "memory_access": {
+            "kind": access_kind,
+            "write_completion": "unknown",
+            "detail": "On x64, LOCK XADD reads and writes its memory destination atomically. A fault at this instruction establishes an attempted read-modify-write, not that its write completed or that a prior writer corrupted the destination."
+        },
+        "register_dataflow": {
+            "entry_base_r8": r8,
+            "observed_displacement_r14": r14,
+            "effective_address": effective_address,
+            "attempted_delta_rbp": rbp,
+            "effective_address_matches_r8_plus_r14": effective_address.zip(r8.zip(r14).and_then(|(base, offset)| base.checked_add(offset))).map(|(left, right)| left == right),
+            "bounded_record_offset_20_raw_qword": counter_raw_qword,
+            "detail": "The offset and delta are direct register/instruction observations. The raw qword is preserved only when the existing bounded tracker-entry snapshot covers R8."
+        },
+        "counter_field_semantics": {
+            "status": "unsupported",
+            "detail": "No public typed layout identifies the qword at this build-observed offset as a named counter or defines its valid range. The inspector therefore does not classify the 0x110 delta or current qword as normal, malformed, overflowed, or corrupt."
+        },
+        "exception_provenance": {
+            "status": if bugcheck_data.is_some_and(|data| data.code == 0x0000_001E) {
+                "partial"
+            } else {
+                "not_applicable"
+            },
+            "exception_code": bugcheck_data.map(|data| data.parameters[0] as u32),
+            "detail": "Bugcheck 0x1E preserves an exception code and fault instruction address, but this dump path does not expose a separate documented EXCEPTION_RECORD/trap frame binding. The decoded x64 CONTEXT is selected only by a bounded structural probe, so it is not used to assign a faulting CPU/thread, IRQL, or historical access type."
+        },
+        "interrupt_state": {
+            "context_eflags": eflags,
+            "interrupt_enable_flag": eflags.map(|value| value & 0x200 != 0),
+            "status": if eflags.is_some() { "heuristic_context_only" } else { "unavailable" },
+            "detail": "EFLAGS comes from the heuristic context candidate. It is not an IRQL, interrupt-request, or processor identity record."
+        },
+        "machine_check_whea": {
+            "status": "unsupported",
+            "detail": "The documented offline DbgEng APIs used here do not expose a typed WHEA/machine-check record enumeration. Bugcheck 0x1E alone is not treated as hardware evidence."
+        }
+    })
+}
+
+fn dump_kernel_integrity_snapshot(modules: &[ModuleInfo]) -> Value {
+    json!({
+        "status": "unsupported",
+        "loaded_module_count": modules.len(),
+        "loaded_module_inventory": "captured_separately",
+        "detail": "DbgEng's documented module enumeration exposes dump-supplied names, bases, and image metadata, but not Authenticode verification, Code Integrity policy decisions, PatchGuard state, or code-page hash validation for this offline dump. Module presence and symbol readiness are not reported as integrity evidence."
+    })
+}
+
+fn dump_physical_page_provenance_feasibility() -> Value {
+    json!({
+        "status": "unsupported",
+        "scope": "pfn_database_and_alias_mappings",
+        "detail": "The documented offline DbgEng APIs expose a virtual-to-physical translation for an explicit virtual address, but no typed PFN database record or reverse physical-alias enumeration. No PFN layout or page-state bit is decoded without a build-validated public type contract."
     })
 }
 
@@ -7483,6 +7601,62 @@ mod tests {
         assert_eq!(value["observations"][0]["processor_index"], 1);
         assert_eq!(value["observations"][0]["topic"], "pool_tracker");
         assert_eq!(value["observations"][1]["topic"], "dpc_activity");
+    }
+
+    #[test]
+    fn fault_mechanics_audit_requires_the_exact_xadd_addressing_form() {
+        let bugcheck = windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(windbg_dbgeng::BugCheckData {
+                code: 0x1E,
+                parameters: [0xC000_0005, 0x1000, 0, 0],
+            }),
+            detail: "fixture".to_string(),
+        };
+        let context = Some(json!({
+            "selection": "heuristic_parameter_4_context",
+            "context": {
+                "registers": {
+                    "rip": 0x1000,
+                    "r8": 0x2000,
+                    "r14": 0x20,
+                    "rbp": 0x110,
+                    "eflags": 0x202,
+                }
+            }
+        }));
+        let fault = Some(json!({
+            "disassembly": {
+                "lines": [{
+                    "text": "lock xadd qword ptr [r14+r8],rbp"
+                }]
+            }
+        }));
+        let tracker = json!({
+            "nearby_entries": [{
+                "address": 0x2000,
+                "raw_qwords": { "offset_20": 0x55 }
+            }]
+        });
+
+        let audit = dump_fault_mechanics_audit(&bugcheck, &context, &fault, &tracker);
+        assert_eq!(audit["status"], "captured");
+        assert_eq!(audit["memory_access"]["kind"], "atomic_read_modify_write");
+        assert_eq!(audit["register_dataflow"]["effective_address"], 0x2020);
+        assert_eq!(
+            audit["register_dataflow"]["bounded_record_offset_20_raw_qword"],
+            0x55
+        );
+        assert_eq!(audit["interrupt_state"]["interrupt_enable_flag"], true);
+
+        let incompatible_fault = Some(json!({
+            "disassembly": { "lines": [{ "text": "add qword ptr [r14+r8],rbp" }] }
+        }));
+        assert_eq!(
+            dump_fault_mechanics_audit(&bugcheck, &context, &incompatible_fault, &tracker)
+                ["status"],
+            "incomplete"
+        );
     }
 
     #[test]
