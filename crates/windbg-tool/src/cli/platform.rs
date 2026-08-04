@@ -5266,6 +5266,13 @@ fn dump_pool_tracker_observation(
             _ => "no_validated_exception_entry_available",
         },
     };
+    let per_cpu_topology = dump_per_cpu_tracker_topology(
+        session,
+        table_size,
+        entry_address,
+        supplied_table_base,
+        ENTRY_STRIDE,
+    );
     json!({
         "status": "captured",
         "layout": {
@@ -5287,8 +5294,132 @@ fn dump_pool_tracker_observation(
             "detail": "These are arithmetic observations from the selected exception context; fault-instruction interpretation remains in the disassembly evidence.",
         },
         "nearby_entries": nearby_entries,
+        "per_cpu_topology": per_cpu_topology,
         "classification": classification,
     })
+}
+
+fn dump_per_cpu_tracker_topology(
+    session: &DebuggerSession,
+    table_size: u64,
+    entry_address: Option<u64>,
+    supplied_table_base: Option<u64>,
+    entry_stride: u64,
+) -> Value {
+    const KNOWN_NT_TIMESTAMP: u32 = 0x4A63_AF4E;
+    const KNOWN_NT_IMAGE_SIZE: u32 = 0x0145_0000;
+    const PER_CPU_POINTER_ARRAY_RVA: u64 = 0x00EF_AB00;
+    const MAX_PROCESSOR_SLOTS: usize = 128;
+    let nt_base = match evaluate_unsigned(session, "nt") {
+        Ok(value) => value,
+        Err(error) => return json!({"status": "unsupported", "detail": error}),
+    };
+    let parameters = match session.module_parameters(&[nt_base]) {
+        Ok(mut parameters) => parameters.pop(),
+        Err(error) => {
+            return json!({"status": "unavailable", "detail": format!("DbgEng could not read nt module parameters: {error}")})
+        }
+    };
+    let Some(parameters) = parameters else {
+        return json!({"status": "unavailable", "detail": "DbgEng returned no nt module parameters."});
+    };
+    if !is_known_per_cpu_tracker_layout(
+        parameters.time_date_stamp,
+        parameters.image_size,
+        KNOWN_NT_TIMESTAMP,
+        KNOWN_NT_IMAGE_SIZE,
+    ) {
+        return json!({
+            "status": "unsupported_build",
+            "nt_base": nt_base,
+            "module_parameters": parameters,
+            "detail": "The build-gated per-CPU pointer-array RVA is not validated for this nt image; no pointer-array read was attempted."
+        });
+    }
+    let Some(array_address) = nt_base.checked_add(PER_CPU_POINTER_ARRAY_RVA) else {
+        return json!({"status": "unavailable", "detail": "The build-gated per-CPU pointer-array address overflowed."});
+    };
+    let pointer_bytes = match session.read_memory(array_address, (MAX_PROCESSOR_SLOTS * 8) as u32) {
+        Ok(memory) if memory.complete => match decode_hex_bytes(&memory.data) {
+            Some(bytes) => bytes,
+            None => {
+                return json!({"status": "unavailable", "detail": "DbgEng returned invalid hexadecimal for the per-CPU pointer array."})
+            }
+        },
+        Ok(memory) => {
+            return json!({"status": "partial", "pointer_array": memory, "detail": "The bounded per-CPU pointer-array read was incomplete."})
+        }
+        Err(error) => {
+            return json!({"status": "unavailable", "detail": format!("DbgEng could not read the build-gated per-CPU pointer array: {error}")})
+        }
+    };
+    let entry_index = entry_address
+        .zip(supplied_table_base)
+        .and_then(|(entry, base)| entry.checked_sub(base))
+        .filter(|offset| offset % entry_stride == 0)
+        .map(|offset| offset / entry_stride)
+        .filter(|index| *index < table_size);
+    let table_bytes = match table_size.checked_mul(entry_stride) {
+        Some(bytes) => bytes,
+        None => {
+            return json!({"status": "unavailable", "detail": "The tracker table extent overflowed."})
+        }
+    };
+    let mut tables = Vec::new();
+    for (slot, chunk) in pointer_bytes.chunks_exact(8).enumerate() {
+        let base = u64::from_le_bytes(chunk.try_into().expect("exact pointer chunk"));
+        if base == 0 {
+            continue;
+        }
+        let Some(end) = base.checked_add(table_bytes) else {
+            tables.push(json!({"slot": slot, "base": base, "status": "invalid_extent"}));
+            continue;
+        };
+        let first = pool_tracker_entry_snapshot(session, base);
+        let last = pool_tracker_entry_snapshot(session, end - entry_stride);
+        let fault_index_record = entry_index.and_then(|index| {
+            base.checked_add(index * entry_stride)
+                .map(|address| pool_tracker_entry_snapshot(session, address))
+        });
+        let extent_readable = first["status"].as_str() == Some("captured")
+            && last["status"].as_str() == Some("captured");
+        tables.push(json!({
+            "slot": slot,
+            "base": base,
+            "end_exclusive": end,
+            "base_alignment": base % 0x1000 == 0,
+            "extent_boundary_readable": extent_readable,
+            "first_entry": first,
+            "last_entry": last,
+            "fault_index": entry_index,
+            "fault_index_entry": fault_index_record,
+        }));
+    }
+    json!({
+        "status": "captured",
+        "source": "build_gated_nt_rva_and_bounded_reads",
+        "nt_base": nt_base,
+        "module_parameters": parameters,
+        "pointer_array_address": array_address,
+        "slot_limit": MAX_PROCESSOR_SLOTS,
+        "table_size": table_size,
+        "entry_stride": entry_stride,
+        "nonzero_tables": tables,
+        "crash_cpu_correlation": {
+            "status": "unavailable",
+            "detail": "The saved bugcheck CONTEXT and faulting stack do not carry a documented processor-slot identifier exposed by this dump path. Membership in a supplied slot-19 table validates the table relation, not the faulting CPU identity."
+        },
+        "detail": "Each nonzero base is checked only for page alignment and bounded first/last/fault-index reads. Matching tags or differing counters are snapshot observations, not allocation lifetime or race evidence."
+    })
+}
+
+fn is_known_per_cpu_tracker_layout(
+    time_date_stamp: u32,
+    image_size: u32,
+    expected_time_date_stamp: u32,
+    expected_image_size: u32,
+) -> bool {
+    time_date_stamp == expected_time_date_stamp && image_size == expected_image_size
 }
 
 fn dump_address_inspection(
@@ -7143,6 +7274,22 @@ mod tests {
 
         let missing = pool_tracker_table_relation(Some(0x150), None, 4, 0x50);
         assert_eq!(missing["relation"], "table_base_not_provided");
+    }
+
+    #[test]
+    fn per_cpu_tracker_layout_requires_exact_module_fingerprint() {
+        assert!(is_known_per_cpu_tracker_layout(
+            0x4A63_AF4E,
+            0x0145_0000,
+            0x4A63_AF4E,
+            0x0145_0000,
+        ));
+        assert!(!is_known_per_cpu_tracker_layout(
+            0x4A63_AF4F,
+            0x0145_0000,
+            0x4A63_AF4E,
+            0x0145_0000,
+        ));
     }
 
     #[test]

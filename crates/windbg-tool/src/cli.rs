@@ -4985,6 +4985,7 @@ fn discover_manifest() -> Value {
                 "target thread --target <id> --engine-thread-id <id>",
                 "target memory --target <id> --address <addr> --size <n>",
                 "target memory-map --target <id> [--region-limit <n>]",
+                "target address --target <id> --address <addr>",
                 "target dump --target <id> --output <path>",
                 "target stack --target <id>",
                 "target disasm --target <id>",
@@ -5374,6 +5375,7 @@ fn tool_command_map() -> Value {
         { "tool": "target_last_event", "commands": ["target event", "debug snapshot --include event"] },
         { "tool": "target_read_memory", "commands": ["target memory"] },
         { "tool": "target_memory_map", "commands": ["target memory-map"] },
+        { "tool": "target_inspect_address", "commands": ["target address"] },
         { "tool": "target_list_threads", "commands": ["target threads"] },
         { "tool": "target_thread_accounting", "commands": ["target thread-accounting"] },
         { "tool": "target_module_parameters", "commands": ["target module-parameters"] },
@@ -5751,6 +5753,16 @@ fn command_metadata() -> Value {
             "safety": "read_only_dbgeng_data_space",
             "bounds": ["--region-limit 1..4096"],
             "limitations": ["Live user-mode targets only; bounded, partial, or unavailable coverage is explicit."]
+        },
+        {
+            "command": "target address",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_dbgeng_address_translation",
+            "safety": "read_only_dbgeng_data_space",
+            "bounds": ["one canonical virtual address", "at most five physical page-table entry reads"],
+            "limitations": ["Captured page-table state is post-bugcheck snapshot evidence, not fault-time transition proof."]
         },
         {
             "command": "target dump",

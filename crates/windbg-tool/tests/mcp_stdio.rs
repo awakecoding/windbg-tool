@@ -996,6 +996,7 @@ fn required_args_for_tool(name: &str) -> anyhow::Result<&'static [&'static str]>
         "target_wait" | "target_continue_wait" => Ok(&["target_id"]),
         "target_read_memory" => Ok(&["target_id", "address", "size"]),
         "target_memory_map" => Ok(&["target_id"]),
+        "target_inspect_address" => Ok(&["target_id", "address"]),
         "target_thread_accounting" => Ok(&["target_id"]),
         "target_module_parameters" => Ok(&["target_id", "module_base_addresses"]),
         "target_symbol_entry_range" => Ok(&["target_id", "address"]),
