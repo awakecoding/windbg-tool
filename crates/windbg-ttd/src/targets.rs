@@ -15,8 +15,8 @@ use windbg_dbgeng::{
     DumpOpenOptions, DumpWriteOptions, DumpWriteResult, EvaluationResult, LiveAttachOptions,
     LiveInitialStop, LiveLaunchSessionOptions, MemoryReadResult, ModuleDebugParameters, ModuleInfo,
     SourceLocation, StackFrameInfo, SymbolEntryRange, SymbolInfo, ThreadAccountingSnapshot,
-    ThreadContext, ThreadInfo, VirtualMemoryMap, MAX_MODULE_PARAMETER_QUERIES,
-    MAX_THREAD_ACCOUNTING_THREADS, MAX_VIRTUAL_MEMORY_MAP_REGIONS,
+    ThreadContext, ThreadInfo, VirtualAddressInspection, VirtualMemoryMap,
+    MAX_MODULE_PARAMETER_QUERIES, MAX_THREAD_ACCOUNTING_THREADS, MAX_VIRTUAL_MEMORY_MAP_REGIONS,
 };
 use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
@@ -410,6 +410,12 @@ pub struct TargetMemoryMapResponse {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct TargetAddressInspectionResponse {
+    pub target_id: TargetId,
+    pub inspection: VirtualAddressInspection,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct TargetThreadAccountingResponse {
     pub target_id: TargetId,
     pub thread_accounting: ThreadAccountingSnapshot,
@@ -729,6 +735,22 @@ impl TargetRegistry {
             memory_map: target.worker.call("virtual_memory_map", move |session| {
                 session.virtual_memory_map(region_limit)
             })?,
+        })
+    }
+
+    pub fn inspect_address(
+        &self,
+        request: TargetAddressRequest,
+    ) -> anyhow::Result<TargetAddressInspectionResponse> {
+        let target = self.target(request.target_id)?;
+        let address = request.address;
+        Ok(TargetAddressInspectionResponse {
+            target_id: request.target_id,
+            inspection: target
+                .worker
+                .call("inspect_virtual_address", move |session| {
+                    Ok(session.inspect_virtual_address(address))
+                })?,
         })
     }
 

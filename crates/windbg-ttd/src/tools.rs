@@ -229,6 +229,10 @@ pub fn definitions() -> Vec<Tool> {
             "target_memory_map",
             "Return a bounded user-mode virtual-memory region map through DbgEng IDebugDataSpaces4::QueryVirtual.",
         ),
+        tool::<TargetAddressRequest>(
+            "target_inspect_address",
+            "Inspect one target address through bounded DbgEng virtual-to-physical and QueryVirtual probes; unavailable mapping or protection evidence is reported explicitly.",
+        ),
         tool::<TargetThreadAccountingRequest>(
             "target_thread_accounting",
             "Return bounded read-only DbgEng per-thread accounting from IDebugAdvanced2.",
@@ -547,6 +551,12 @@ pub async fn call(state: &mut ServiceState, call: ToolCall) -> anyhow::Result<Va
         "target_memory_map" => {
             let request = parse::<TargetMemoryMapRequest>(call.arguments)?;
             Ok(serde_json::to_value(state.targets.memory_map(request)?)?)
+        }
+        "target_inspect_address" => {
+            let request = parse::<TargetAddressRequest>(call.arguments)?;
+            Ok(serde_json::to_value(
+                state.targets.inspect_address(request)?,
+            )?)
         }
         "target_thread_accounting" => {
             let request = parse::<TargetThreadAccountingRequest>(call.arguments)?;

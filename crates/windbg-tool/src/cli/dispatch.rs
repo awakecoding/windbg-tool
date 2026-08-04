@@ -58,6 +58,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             DumpCommand::Open(args) => dump_open_and_print(pipe, args, &output).await,
             DumpCommand::Inspect(args) => platform::run_dump_inspect(args, &output),
             DumpCommand::Triage(args) => platform::run_dump_inspect(args, &output),
+            DumpCommand::PoolTriage(args) => platform::run_dump_inspect(args, &output),
             DumpCommand::Create(args) => platform::run_dump_create(args, &output),
         },
         Some(Commands::DbgSrv(args)) => platform::run_dbgeng_server(args, &output),
@@ -332,6 +333,9 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             }
             TargetCommand::MemoryMap(args) => {
                 call_and_print(pipe, target_memory_map_call(args), &output).await
+            }
+            TargetCommand::Address(args) => {
+                call_and_print(pipe, target_address_inspect_call(args)?, &output).await
             }
             TargetCommand::ThreadAccounting(args) => {
                 call_and_print(pipe, target_thread_accounting_call(args), &output).await

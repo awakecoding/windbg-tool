@@ -312,6 +312,10 @@ enum DumpCommand {
         about = "Produce structured bugcheck, context, stack, symbol, and driver triage for a dump"
     )]
     Triage(DumpInspectArgs),
+    #[command(
+        about = "Produce bounded pool-corruption triage with context, tracker, and evidence grades"
+    )]
+    PoolTriage(DumpInspectArgs),
     #[command(about = "Create a process dump from a live process id")]
     Create(DumpCreateArgs),
 }
@@ -515,6 +519,10 @@ enum TargetCommand {
     Memory(TargetMemoryReadArgs),
     #[command(about = "Return a bounded live user-mode virtual-memory map through DbgEng")]
     MemoryMap(TargetMemoryMapArgs),
+    #[command(
+        about = "Inspect one address through bounded DbgEng translation and virtual-region probes"
+    )]
+    Address(TargetAddressArgs),
     #[command(about = "Walk the current stack for a daemon-owned target")]
     Stack(TargetStackTraceArgs),
     #[command(
@@ -1260,7 +1268,12 @@ struct DumpCreateArgs {
 #[derive(Debug, Args)]
 struct DumpInspectArgs {
     path: PathBuf,
-    #[arg(long, default_value_t = 8)]
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=128),
+        help = "Maximum stack frames per bounded dump stack/context walk"
+    )]
     max_frames: u32,
     #[arg(
         long,
@@ -1285,6 +1298,18 @@ struct DumpInspectArgs {
         help = "Do not download missing symbols; report cache misses explicitly"
     )]
     offline: bool,
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        help = "Inspect one virtual address through bounded DbgEng mapping and pool-record probes"
+    )]
+    inspect_address: Option<String>,
+    #[arg(
+        long,
+        value_name = "ADDRESS",
+        help = "Known per-CPU pool-tracker table base used to classify --inspect-address or the captured tracker entry"
+    )]
+    tracker_table_base: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -4924,7 +4949,7 @@ fn discover_manifest() -> Value {
                 "live start --command-line <cmd> [--create-process-stop]",
                 "live attach --process-id <pid>"
             ],
-            "dump": ["dump open <path>", "dump inspect <path>", "dump create --process-id <pid> --output <path>"],
+            "dump": ["dump open <path>", "dump inspect <path>", "dump triage <path>", "dump pool-triage <path>", "dump create --process-id <pid> --output <path>"],
             "job": [
                 "job list",
                 "job status --job <id>",
@@ -4960,6 +4985,7 @@ fn discover_manifest() -> Value {
                 "target thread --target <id> --engine-thread-id <id>",
                 "target memory --target <id> --address <addr> --size <n>",
                 "target memory-map --target <id> [--region-limit <n>]",
+                "target address --target <id> --address <addr>",
                 "target dump --target <id> --output <path>",
                 "target stack --target <id>",
                 "target disasm --target <id>",
@@ -5349,6 +5375,7 @@ fn tool_command_map() -> Value {
         { "tool": "target_last_event", "commands": ["target event", "debug snapshot --include event"] },
         { "tool": "target_read_memory", "commands": ["target memory"] },
         { "tool": "target_memory_map", "commands": ["target memory-map"] },
+        { "tool": "target_inspect_address", "commands": ["target address"] },
         { "tool": "target_list_threads", "commands": ["target threads"] },
         { "tool": "target_thread_accounting", "commands": ["target thread-accounting"] },
         { "tool": "target_module_parameters", "commands": ["target module-parameters"] },
@@ -5658,6 +5685,24 @@ fn command_metadata() -> Value {
             "bounds": ["--max-frames"]
         },
         {
+            "command": "dump triage",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "opens_dump_and_performs_bounded_triage",
+            "safety": "read_only_dump_analysis",
+            "bounds": ["--max-frames"]
+        },
+        {
+            "command": "dump pool-triage",
+            "requires_daemon": false,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "opens_dump_and_performs_bounded_pool_tracker_triage",
+            "safety": "read_only_dump_analysis",
+            "bounds": ["--max-frames"]
+        },
+        {
             "command": "dump create",
             "requires_daemon": false,
             "requires_native_ttd": false,
@@ -5708,6 +5753,16 @@ fn command_metadata() -> Value {
             "safety": "read_only_dbgeng_data_space",
             "bounds": ["--region-limit 1..4096"],
             "limitations": ["Live user-mode targets only; bounded, partial, or unavailable coverage is explicit."]
+        },
+        {
+            "command": "target address",
+            "requires_daemon": true,
+            "requires_native_ttd": false,
+            "session_required": false,
+            "cost": "bounded_dbgeng_address_translation",
+            "safety": "read_only_dbgeng_data_space",
+            "bounds": ["one canonical virtual address", "at most five physical page-table entry reads"],
+            "limitations": ["Captured page-table state is post-bugcheck snapshot evidence, not fault-time transition proof."]
         },
         {
             "command": "target dump",
@@ -5974,6 +6029,16 @@ fn target_memory_map_call(args: TargetMemoryMapArgs) -> ToolCall {
             "region_limit": args.region_limit,
         }),
     }
+}
+
+fn target_address_inspect_call(args: TargetAddressArgs) -> anyhow::Result<ToolCall> {
+    Ok(ToolCall {
+        name: "target_inspect_address".to_string(),
+        arguments: json!({
+            "target_id": args.target,
+            "address": parse_u64_argument(&args.address)?,
+        }),
+    })
 }
 
 fn target_thread_accounting_call(args: TargetThreadAccountingArgs) -> ToolCall {
