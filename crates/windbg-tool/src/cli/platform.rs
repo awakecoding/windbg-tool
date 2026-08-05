@@ -5259,6 +5259,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     );
     let kernel_integrity = dump_kernel_integrity_snapshot(input.modules);
     let physical_page_provenance = dump_physical_page_provenance_feasibility();
+    let allocation_adjacent_metadata = dump_allocation_adjacent_metadata_feasibility();
 
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
@@ -5280,6 +5281,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "kernel_integrity": kernel_integrity,
         "physical_page_provenance": physical_page_provenance,
         "address_space_consistency": address_space_consistency,
+        "allocation_adjacent_metadata": allocation_adjacent_metadata,
         "address_inspection": address_inspection,
         "evidence": evidence,
         "data_limits": dump_data_limits(
@@ -6034,6 +6036,26 @@ fn dump_physical_page_provenance_feasibility() -> Value {
         "status": "unsupported",
         "scope": "pfn_database_and_alias_mappings",
         "detail": "The documented offline DbgEng APIs expose a virtual-to-physical translation for an explicit virtual address, but no typed PFN database record or reverse physical-alias enumeration. No PFN layout or page-state bit is decoded without a build-validated public type contract."
+    })
+}
+
+fn dump_allocation_adjacent_metadata_feasibility() -> Value {
+    json!({
+        "status": "unsupported",
+        "scope": "allocation_owner_lifetime_and_pool_or_segment_metadata",
+        "type_metadata": {
+            "status": "insufficient",
+            "detail": "DbgEng's documented type APIs can validate a named type and field offsets when symbols expose them, but they do not map an arbitrary virtual address or physical page to its containing allocation, allocation header, segment, or lifetime record."
+        },
+        "raw_bytes": {
+            "status": "not_decoded",
+            "detail": "The bounded tracker-record and page reads are retained as snapshot bytes only. Without a build-validated allocation-instance association, interpreting adjacent bytes as a pool header, segment-heap metadata, special-pool marker, or verifier record would be an undocumented layout guess."
+        },
+        "special_pool_and_verifier": {
+            "status": "unsupported",
+            "detail": "No documented offline DbgEng API locates special-pool or Driver Verifier allocation metadata for a supplied address in this dump."
+        },
+        "detail": "No allocation ownership, boundary, guard-page, freed-state, corruption signature, or historical allocation provenance is reported from raw memory."
     })
 }
 
@@ -8128,6 +8150,19 @@ mod tests {
 
         assert_eq!(address_mapping_physical_page(&mapping), Some(0x1363_BD000));
         assert_eq!(address_mapping_physical_page(&json!({})), None);
+    }
+
+    #[test]
+    fn allocation_adjacent_metadata_refuses_unvalidated_raw_layouts() {
+        let metadata = dump_allocation_adjacent_metadata_feasibility();
+
+        assert_eq!(metadata["status"], "unsupported");
+        assert_eq!(metadata["type_metadata"]["status"], "insufficient");
+        assert_eq!(metadata["raw_bytes"]["status"], "not_decoded");
+        assert_eq!(
+            metadata["special_pool_and_verifier"]["status"],
+            "unsupported"
+        );
     }
 
     #[test]
