@@ -28,6 +28,7 @@ pub const DBGENG_RUNTIME_DIR_ENV: &str = "WINDBG_DBGENG_RUNTIME_DIR";
 pub const MAX_VIRTUAL_MEMORY_MAP_REGIONS: u32 = 4096;
 pub const MAX_THREAD_ACCOUNTING_THREADS: u32 = 128;
 pub const MAX_MODULE_PARAMETER_QUERIES: usize = 128;
+pub const MAX_BOUNDED_MODULE_ENUMERATION: u32 = 512;
 pub const MAX_SYMBOL_ENTRY_OFFSET_REGIONS: usize = 16;
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
 const DBGENG_DLL_NAME: &str = "dbgeng.dll";
@@ -613,6 +614,89 @@ pub struct BugCheckDataResult {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct DumpHeaderSnapshot {
+    pub status: String,
+    pub source: String,
+    pub bytes_returned: u32,
+    pub tail_status: String,
+    pub signature: Option<u32>,
+    pub valid_dump: Option<u32>,
+    pub major_version: Option<u32>,
+    pub minor_version: Option<u32>,
+    pub directory_table_base: Option<u64>,
+    pub pfn_database: Option<u64>,
+    pub loaded_module_list: Option<u64>,
+    pub active_process_head: Option<u64>,
+    pub machine_image_type: Option<u32>,
+    pub processor_count: Option<u32>,
+    pub bugcheck_code: Option<u32>,
+    pub bugcheck_parameters: Option<[u64; 4]>,
+    pub version_user: Option<String>,
+    pub dump_type: Option<u32>,
+    pub dump_type_name: Option<String>,
+    pub required_dump_space_bytes: Option<u64>,
+    pub system_time_filetime: Option<u64>,
+    pub system_uptime_100ns: Option<u64>,
+    pub comment: Option<String>,
+    pub mini_dump_fields: Option<u32>,
+    pub secondary_data_state: Option<u32>,
+    pub product_type: Option<u32>,
+    pub suite_mask: Option<u32>,
+    pub writer_status: Option<u32>,
+    pub kd_secondary_version: Option<u8>,
+    pub attributes_raw: Option<u32>,
+    pub attributes: Vec<String>,
+    pub boot_id: Option<u32>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetExceptionRecord {
+    pub code: u32,
+    pub flags: u32,
+    pub previous_record: u64,
+    pub address: u64,
+    pub parameter_count: u32,
+    pub parameters: Vec<u64>,
+    pub access_violation: Option<TargetAccessViolation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetAccessViolation {
+    pub operation_raw: u64,
+    pub operation: String,
+    pub address: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetExceptionSnapshot {
+    pub status: String,
+    pub source: String,
+    pub stored_event: StoredEventInformation,
+    pub thread_system_id: Option<u32>,
+    pub thread_status: String,
+    pub record: Option<TargetExceptionRecord>,
+    pub record_status: String,
+    pub context: Option<X64ExceptionContext>,
+    pub context_status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredEventInformation {
+    pub status: String,
+    pub source: String,
+    pub event_type: Option<u32>,
+    pub process_system_id: Option<u32>,
+    pub thread_system_id: Option<u32>,
+    pub context: Option<X64ExceptionContext>,
+    pub context_status: String,
+    pub extra_information_bytes_returned: Option<u32>,
+    pub extra_information_status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct StackTraceResult {
     pub requested_frames: u32,
     pub returned_frames: u32,
@@ -645,30 +729,93 @@ pub struct X64ExceptionRegisters {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct X64ContextSegmentSelectors {
+    pub cs: u16,
+    pub ds: u16,
+    pub es: u16,
+    pub fs: u16,
+    pub gs: u16,
+    pub ss: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64ContextValidation {
+    pub amd64_flag_present: bool,
+    pub control_register_group_present: bool,
+    pub integer_register_group_present: bool,
+    pub raw_layout_offset_cross_check: bool,
+    pub segment_selectors: X64ContextSegmentSelectors,
+    pub cs_nonzero: bool,
+    pub ss_nonzero: bool,
+    pub eflags_reserved_bit_1_set: bool,
+    pub interrupt_enable_flag: bool,
+    pub rsp_mod_16: u8,
+    pub selected_debugger_context_cr4: Option<u64>,
+    pub selected_debugger_context_virtual_address_bits: Option<u8>,
+    pub rip_canonical_for_selected_address_width: Option<bool>,
+    pub rsp_canonical_for_selected_address_width: Option<bool>,
+    pub control_registers_in_amd64_context: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct X64ExceptionContext {
     pub status: String,
-    pub context_record_address: u64,
+    pub context_record_address: Option<u64>,
     pub requested_size: u32,
     pub bytes_read: u32,
     pub complete: bool,
     pub context_flags: Option<u32>,
+    pub validation: Option<X64ContextValidation>,
     pub registers: Option<X64ExceptionRegisters>,
     pub stack: Option<StackTraceResult>,
+    pub unwind_contexts: Option<X64ContextStackTrace>,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64ContextStackTrace {
+    pub status: String,
+    pub source: String,
+    pub requested_frames: u32,
+    pub returned_frames: u32,
+    pub frame_zero_matches_start_context: Option<bool>,
+    pub frames: Vec<X64UnwindContextFrame>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64UnwindContextFrame {
+    pub frame_number: u32,
+    pub instruction_offset: u64,
+    pub context_rip: Option<u64>,
+    pub context_flags: Option<u32>,
+    pub required_register_groups_present: bool,
+    pub r8: Option<u64>,
+    pub r14: Option<u64>,
+    pub structural_effective_address: Option<u64>,
 }
 
 const X64_CONTEXT_SIZE: u32 = 0x4D0;
 const CONTEXT_AMD64_FLAG: u32 = 0x0010_0000;
 const CONTEXT_X64_REQUIRED_REGISTER_FLAGS: u32 = CONTEXT_AMD64_FLAG | 0x0000_0003;
+const DUMP_HEADER64_SIZE: usize = 0x2000;
+const EXCEPTION_RECORD64_SIZE: usize = 0x98;
 
 // The dump target's architecture can differ from the host build architecture. Keep this prefix
 // independent of windows::CONTEXT so ARM64 builds can decode an AMD64 dump safely.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct X64ContextPrefix {
     _homes: [u64; 6],
     context_flags: u32,
     _mxcsr: u32,
-    _segments: [u16; 6],
+    seg_cs: u16,
+    seg_ds: u16,
+    seg_es: u16,
+    seg_fs: u16,
+    seg_gs: u16,
+    seg_ss: u16,
     eflags: u32,
     _debug_registers: [u64; 6],
     rax: u64,
@@ -688,6 +835,108 @@ struct X64ContextPrefix {
     r14: u64,
     r15: u64,
     rip: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct X64ContextCriticalFields {
+    context_flags: u32,
+    seg_cs: u16,
+    seg_ss: u16,
+    eflags: u32,
+    rsp: u64,
+    r8: u64,
+    r14: u64,
+    rip: u64,
+}
+
+fn x64_context_prefix_from_bytes(bytes: &[u8]) -> Option<X64ContextPrefix> {
+    (bytes.len() >= std::mem::size_of::<X64ContextPrefix>())
+        // The source byte buffer is not guaranteed to be naturally aligned.
+        .then(|| unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<X64ContextPrefix>()) })
+}
+
+fn x64_context_critical_fields_from_bytes(bytes: &[u8]) -> Option<X64ContextCriticalFields> {
+    fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            bytes.get(offset..offset + 2)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(
+            bytes.get(offset..offset + 8)?.try_into().ok()?,
+        ))
+    }
+
+    Some(X64ContextCriticalFields {
+        context_flags: read_u32(bytes, 0x30)?,
+        seg_cs: read_u16(bytes, 0x38)?,
+        seg_ss: read_u16(bytes, 0x42)?,
+        eflags: read_u32(bytes, 0x44)?,
+        rsp: read_u64(bytes, 0x98)?,
+        r8: read_u64(bytes, 0xb8)?,
+        r14: read_u64(bytes, 0xe8)?,
+        rip: read_u64(bytes, 0xf8)?,
+    })
+}
+
+fn x64_context_validation(
+    context: &X64ContextPrefix,
+    bytes: &[u8],
+    selected_address_width: Option<(u64, u8)>,
+) -> X64ContextValidation {
+    let raw_layout_offset_cross_check =
+        x64_context_critical_fields_from_bytes(bytes).is_some_and(|raw| {
+            raw.context_flags == context.context_flags
+                && raw.seg_cs == context.seg_cs
+                && raw.seg_ss == context.seg_ss
+                && raw.eflags == context.eflags
+                && raw.rsp == context.rsp
+                && raw.r8 == context.r8
+                && raw.r14 == context.r14
+                && raw.rip == context.rip
+        });
+    let (selected_debugger_context_cr4, selected_debugger_context_virtual_address_bits) =
+        selected_address_width
+            .map(|(cr4, bits)| (Some(cr4), Some(bits)))
+            .unwrap_or((None, None));
+    let canonicality = selected_debugger_context_virtual_address_bits.map(|bits| {
+        (
+            x64_virtual_address_is_canonical(context.rip, bits),
+            x64_virtual_address_is_canonical(context.rsp, bits),
+        )
+    });
+    X64ContextValidation {
+        amd64_flag_present: context.context_flags & CONTEXT_AMD64_FLAG != 0,
+        control_register_group_present: context.context_flags & 0x1 != 0,
+        integer_register_group_present: context.context_flags & 0x2 != 0,
+        raw_layout_offset_cross_check,
+        segment_selectors: X64ContextSegmentSelectors {
+            cs: context.seg_cs,
+            ds: context.seg_ds,
+            es: context.seg_es,
+            fs: context.seg_fs,
+            gs: context.seg_gs,
+            ss: context.seg_ss,
+        },
+        cs_nonzero: context.seg_cs != 0,
+        ss_nonzero: context.seg_ss != 0,
+        eflags_reserved_bit_1_set: context.eflags & 0x2 != 0,
+        interrupt_enable_flag: context.eflags & 0x200 != 0,
+        rsp_mod_16: (context.rsp & 0xf) as u8,
+        selected_debugger_context_cr4,
+        selected_debugger_context_virtual_address_bits,
+        rip_canonical_for_selected_address_width: canonicality.map(|value| value.0),
+        rsp_canonical_for_selected_address_width: canonicality.map(|value| value.1),
+        control_registers_in_amd64_context: false,
+        detail: "The fixed AMD64 CONTEXT offsets were independently decoded from the bounded byte buffer and compared with the C-compatible prefix. CS/SS and EFLAGS checks are structural sanity observations, not thread or CPU attribution. AMD64 CONTEXT does not contain CR3 or CR4; any selected-debugger CR4 is used only for canonical-address checks and does not establish the saved context's paging root.".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -733,7 +982,32 @@ pub struct VirtualAddressInspection {
     pub virtual_region: Option<VirtualMemoryRegion>,
     pub query_virtual_detail: String,
     pub page_table_walk: X64PageTableWalk,
+    pub translation_physical_offsets: VirtualTranslationPhysicalOffsets,
+    pub page_table_walk_cross_check: VirtualAddressTranslationCrossCheck,
     pub extension_command_bridge: ExtensionCommandBridgeStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VirtualAddressTranslationCrossCheck {
+    pub status: String,
+    pub virtual_to_physical_address: Option<u64>,
+    pub translation_physical_offsets_address: Option<u64>,
+    pub page_table_walk_address: Option<u64>,
+    pub virtual_to_physical_matches_page_table_walk: Option<bool>,
+    pub translation_physical_offsets_matches_page_table_walk: Option<bool>,
+    pub virtual_to_physical_matches_translation_physical_offsets: Option<bool>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VirtualTranslationPhysicalOffsets {
+    pub status: String,
+    pub reported_level_count: Option<u32>,
+    pub physical_offsets: Vec<u64>,
+    pub last_physical_offset: Option<u64>,
+    pub final_physical_address: Option<u64>,
+    pub final_physical_address_validation: String,
     pub detail: String,
 }
 
@@ -754,6 +1028,17 @@ pub struct X64PageTableWalk {
     pub root_physical_address: Option<u64>,
     pub entries: Vec<X64PageTableEntry>,
     pub final_mapping: Option<X64PageTableMapping>,
+    pub provenance: X64PageTableProvenance,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64PageTableProvenance {
+    pub selected_debugger_context_cr3: Option<u64>,
+    pub selected_debugger_context_cr4: Option<u64>,
+    pub la57_enabled_in_selected_debugger_context: Option<bool>,
+    pub dump_header_directory_table_base: Option<u64>,
+    pub selected_root_matches_dump_header: Option<bool>,
     pub detail: String,
 }
 
@@ -1006,12 +1291,41 @@ pub struct DebuggerEventInfo {
 #[derive(Debug, Clone, Serialize)]
 pub struct ThreadContext {
     pub thread: ThreadInfo,
+    pub thread_data_offset: Option<u64>,
     pub registers: CoreRegisterState,
     pub current_module: Option<ModuleInfo>,
     pub current_symbol: Option<SymbolInfo>,
     pub stack: Vec<StackFrameInfo>,
     pub disassembly: Option<DisassemblyResult>,
     pub current_thread_preserved: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessorSnapshot {
+    pub processor_index: u32,
+    pub status: String,
+    pub engine_thread_id: Option<u32>,
+    pub system_thread_id: Option<u32>,
+    pub thread_data_offset: Option<u64>,
+    pub registers: Option<CoreRegisterState>,
+    pub current_module: Option<ModuleInfo>,
+    pub current_symbol: Option<SymbolInfo>,
+    pub stack: Option<StackTraceResult>,
+    pub detail: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ProcessorSnapshotResult {
+    pub source: String,
+    pub status: String,
+    pub logical_processor_count: Option<u32>,
+    pub returned: usize,
+    pub nonempty_saved_stack_count: usize,
+    pub unwind_limited_stack_count: usize,
+    pub max_frames_per_processor: u32,
+    pub processors: Vec<ProcessorSnapshot>,
+    pub current_thread_preserved: bool,
+    pub detail: String,
 }
 
 pub fn start_process_server(options: ProcessServerOptions) -> anyhow::Result<ProcessServerResult> {
@@ -1277,6 +1591,130 @@ fn x64_page_table_entry(
     }
 }
 
+fn x64_large_page_physical_address(raw_value: u64, address: u64, page_size: u64) -> u64 {
+    let page_base_mask = X64_PHYSICAL_ADDRESS_MASK & !(page_size - 1);
+    (raw_value & page_base_mask) | (address & (page_size - 1))
+}
+
+fn unavailable_x64_page_table_provenance() -> X64PageTableProvenance {
+    X64PageTableProvenance {
+        selected_debugger_context_cr3: None,
+        selected_debugger_context_cr4: None,
+        la57_enabled_in_selected_debugger_context: None,
+        dump_header_directory_table_base: None,
+        selected_root_matches_dump_header: None,
+        detail: "The page-table walk did not obtain the selected debugger context's CR3/CR4. An AMD64 CONTEXT record does not contain CR3 or CR4, so it cannot independently provide this paging root.".to_string(),
+    }
+}
+
+fn x64_page_table_provenance(
+    selected_debugger_context_cr3: Option<u64>,
+    selected_debugger_context_cr4: Option<u64>,
+    dump_header_directory_table_base: Option<u64>,
+) -> X64PageTableProvenance {
+    let selected_root =
+        selected_debugger_context_cr3.map(|value| value & X64_PHYSICAL_ADDRESS_MASK);
+    let dump_header_root =
+        dump_header_directory_table_base.map(|value| value & X64_PHYSICAL_ADDRESS_MASK);
+    let selected_root_matches_dump_header = selected_root
+        .zip(dump_header_root)
+        .map(|(left, right)| left == right);
+    let detail = match selected_root_matches_dump_header {
+        Some(true) => "CR3 and CR4 come from DbgEng's currently selected captured context. The selected CR3 root matches the dump-header DirectoryTableBase after masking address-space identifiers, so this bounded manual walk is also rooted at the recorded header base. AMD64 CONTEXT does not preserve CR3/CR4, so that root match does not prove it was the P4 context's paging root at the fault instant.",
+        Some(false) => "CR3 and CR4 come from DbgEng's currently selected captured context. The selected CR3 root differs from the dump-header DirectoryTableBase after masking address-space identifiers; this walk reports the selected-context root and must not be treated as a header-root or P4-context walk. AMD64 CONTEXT does not preserve CR3/CR4.",
+        None => "CR3 and CR4 come from DbgEng's currently selected captured context. The dump header did not expose a comparable DirectoryTableBase. AMD64 CONTEXT does not preserve CR3/CR4, so this walk cannot establish the P4 context's paging root.",
+    };
+    X64PageTableProvenance {
+        selected_debugger_context_cr3,
+        selected_debugger_context_cr4,
+        la57_enabled_in_selected_debugger_context: selected_debugger_context_cr4
+            .map(|value| value & (1 << 12) != 0),
+        dump_header_directory_table_base,
+        selected_root_matches_dump_header,
+        detail: detail.to_string(),
+    }
+}
+
+fn virtual_address_translation_cross_check(
+    virtual_to_physical_address: Option<u64>,
+    translation_physical_offsets: &VirtualTranslationPhysicalOffsets,
+    page_table_walk: &X64PageTableWalk,
+) -> VirtualAddressTranslationCrossCheck {
+    let page_table_walk_address = page_table_walk
+        .final_mapping
+        .as_ref()
+        .map(|mapping| mapping.physical_address);
+    let translation_physical_offsets_address = translation_physical_offsets.final_physical_address;
+    let virtual_to_physical_matches_page_table_walk = virtual_to_physical_address
+        .zip(page_table_walk_address)
+        .map(|(left, right)| left == right);
+    let translation_physical_offsets_matches_page_table_walk = translation_physical_offsets_address
+        .zip(page_table_walk_address)
+        .map(|(left, right)| left == right);
+    let virtual_to_physical_matches_translation_physical_offsets = virtual_to_physical_address
+        .zip(translation_physical_offsets_address)
+        .map(|(left, right)| left == right);
+    let comparisons = [
+        virtual_to_physical_matches_page_table_walk,
+        translation_physical_offsets_matches_page_table_walk,
+        virtual_to_physical_matches_translation_physical_offsets,
+    ];
+    let status = if comparisons.iter().flatten().any(|matches| !matches) {
+        "mismatch"
+    } else if comparisons.iter().flatten().next().is_some() {
+        "matched"
+    } else {
+        "unavailable"
+    };
+    VirtualAddressTranslationCrossCheck {
+        status: status.to_string(),
+        virtual_to_physical_address,
+        translation_physical_offsets_address,
+        page_table_walk_address,
+        virtual_to_physical_matches_page_table_walk,
+        translation_physical_offsets_matches_page_table_walk,
+        virtual_to_physical_matches_translation_physical_offsets,
+        detail: "DbgEng VirtualToPhysical, IDebugDataSpaces2 translation physical offsets when available, and the bounded raw physical page-table walk were compared for this preserved snapshot. Any agreement is a snapshot consistency check, not reconstruction of historical mapping state.".to_string(),
+    }
+}
+
+fn validate_translation_physical_offsets(
+    translation_physical_offsets: &mut VirtualTranslationPhysicalOffsets,
+    virtual_to_physical_address: Option<u64>,
+    page_table_walk: &X64PageTableWalk,
+) {
+    let Some(last_physical_offset) = translation_physical_offsets.last_physical_offset else {
+        translation_physical_offsets.final_physical_address_validation =
+            "no_offsets_returned".to_string();
+        return;
+    };
+    let page_table_walk_address = page_table_walk
+        .final_mapping
+        .as_ref()
+        .map(|mapping| mapping.physical_address);
+    let matches_virtual_to_physical = virtual_to_physical_address
+        .map(|address| address == last_physical_offset)
+        .unwrap_or(false);
+    let matches_page_table_walk = page_table_walk_address
+        .map(|address| address == last_physical_offset)
+        .unwrap_or(false);
+    if matches_virtual_to_physical || matches_page_table_walk {
+        translation_physical_offsets.final_physical_address = Some(last_physical_offset);
+        translation_physical_offsets.final_physical_address_validation =
+            match (matches_virtual_to_physical, matches_page_table_walk) {
+                (true, true) => {
+                    "validated_by_virtual_to_physical_and_manual_page_table_walk".to_string()
+                }
+                (true, false) => "validated_by_virtual_to_physical".to_string(),
+                (false, true) => "validated_by_manual_page_table_walk".to_string(),
+                (false, false) => unreachable!("the condition above requires a validation"),
+            };
+    } else {
+        translation_physical_offsets.final_physical_address_validation =
+            "unvalidated_raw_hierarchy_offset".to_string();
+    }
+}
+
 fn unavailable_x64_page_table_walk(address: u64, detail: String) -> X64PageTableWalk {
     X64PageTableWalk {
         status: "unavailable".to_string(),
@@ -1287,6 +1725,7 @@ fn unavailable_x64_page_table_walk(address: u64, detail: String) -> X64PageTable
         root_physical_address: None,
         entries: Vec::new(),
         final_mapping: None,
+        provenance: unavailable_x64_page_table_provenance(),
         detail,
     }
 }
@@ -1654,6 +2093,266 @@ impl DebuggerSession {
         }
     }
 
+    pub fn dump_header(&self) -> DumpHeaderSnapshot {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugAdvanced2;
+
+        let advanced: IDebugAdvanced2 = match self.client.cast() {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                return unavailable_dump_header(format!(
+                    "DbgEng did not expose IDebugAdvanced2 for the documented dump-header request: {error}"
+                ));
+            }
+        };
+        let mut buffer = [0u8; DUMP_HEADER64_SIZE];
+        let mut bytes_returned = 0u32;
+        let result = unsafe {
+            advanced.Request(
+                21, // DEBUG_REQUEST_GET_DUMP_HEADER
+                None,
+                0,
+                Some(buffer.as_mut_ptr().cast()),
+                buffer.len() as u32,
+                Some(&mut bytes_returned),
+            )
+        };
+        match result {
+            Ok(()) => {
+                let usable_bytes = if bytes_returned == 0 {
+                    buffer.len()
+                } else {
+                    (bytes_returned as usize).min(buffer.len())
+                };
+                dump_header_from_bytes(&buffer[..usable_bytes], bytes_returned)
+            }
+            Err(error) => unavailable_dump_header(format!(
+                "DbgEng DEBUG_REQUEST_GET_DUMP_HEADER failed: {error}"
+            )),
+        }
+    }
+
+    fn stored_event_information(&self, max_frames: u32) -> StoredEventInformation {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl4;
+
+        const MAX_STORED_EVENT_EXTRA_BYTES: usize = 512;
+
+        let control: IDebugControl4 = match self.client.cast() {
+            Ok(control) => control,
+            Err(error) => {
+                return StoredEventInformation {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+                    event_type: None,
+                    process_system_id: None,
+                    thread_system_id: None,
+                    context: None,
+                    context_status: "unavailable".to_string(),
+                    extra_information_bytes_returned: None,
+                    extra_information_status: "not_returned".to_string(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugControl4 for the bounded stored-event probe: {error}"
+                    ),
+                };
+            }
+        };
+        let mut event_type = 0u32;
+        let mut process_system_id = 0u32;
+        let mut thread_system_id = 0u32;
+        let mut context_bytes = [0u8; X64_CONTEXT_SIZE as usize];
+        let mut context_used = 0u32;
+        let mut extra_information = [0u8; MAX_STORED_EVENT_EXTRA_BYTES];
+        let mut extra_information_used = 0u32;
+        let result = unsafe {
+            control.GetStoredEventInformation(
+                &mut event_type,
+                &mut process_system_id,
+                &mut thread_system_id,
+                Some(context_bytes.as_mut_ptr().cast()),
+                context_bytes.len() as u32,
+                Some(&mut context_used),
+                Some(extra_information.as_mut_ptr().cast()),
+                extra_information.len() as u32,
+                Some(&mut extra_information_used),
+            )
+        };
+        let Err(error) = result else {
+            let context_status = match (
+                self.processor_type().ok(),
+                context_used.min(context_bytes.len() as u32),
+            ) {
+                (Some(0x8664), 0) => "not_returned".to_string(),
+                (Some(0x8664), used) if used < X64_CONTEXT_SIZE => {
+                    format!("partial: {used} of {X64_CONTEXT_SIZE} bytes")
+                }
+                (Some(0x8664), _) => "captured".to_string(),
+                _ => "architecture_unsupported".to_string(),
+            };
+            let context = (context_status == "captured").then(|| {
+                self.decode_x64_exception_context(
+                    None,
+                    &context_bytes,
+                    context_used.min(context_bytes.len() as u32),
+                    max_frames,
+                )
+            });
+            return StoredEventInformation {
+                status: "captured".to_string(),
+                source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+                event_type: Some(event_type),
+                process_system_id: Some(process_system_id),
+                thread_system_id: Some(thread_system_id),
+                context,
+                context_status,
+                extra_information_bytes_returned: Some(extra_information_used),
+                extra_information_status: if extra_information_used == 0 {
+                    "not_returned".to_string()
+                } else if extra_information_used <= extra_information.len() as u32 {
+                    "present_not_decoded".to_string()
+                } else {
+                    format!(
+                        "truncated_not_decoded: {extra_information_used} bytes exceed the {} byte limit",
+                        extra_information.len()
+                    )
+                },
+                detail: "DbgEng documents stored-event data as optional and typically present in user-mode minidumps. This bounded probe retains only returned identifiers, a complete AMD64 CONTEXT when present, and the extra-data byte count; unknown extra bytes are never decoded or treated as kernel exception provenance.".to_string(),
+            };
+        };
+        StoredEventInformation {
+            status: "unavailable".to_string(),
+            source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+            event_type: None,
+            process_system_id: None,
+            thread_system_id: None,
+            context: None,
+            context_status: "unavailable".to_string(),
+            extra_information_bytes_returned: None,
+            extra_information_status: "not_returned".to_string(),
+            detail: format!(
+                "DbgEng GetStoredEventInformation did not expose a stored event for this target: {error}"
+            ),
+        }
+    }
+
+    pub fn target_exception_snapshot(&self, max_frames: u32) -> TargetExceptionSnapshot {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugAdvanced2;
+
+        let stored_event = self.stored_event_information(max_frames);
+        let advanced: IDebugAdvanced2 = match self.client.cast() {
+            Ok(advanced) => advanced,
+            Err(error) => {
+                return TargetExceptionSnapshot {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+                    stored_event,
+                    thread_system_id: None,
+                    thread_status: "unavailable".to_string(),
+                    record: None,
+                    record_status: "unavailable".to_string(),
+                    context: None,
+                    context_status: "unavailable".to_string(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugAdvanced2 for target-exception requests: {error}"
+                    ),
+                };
+            }
+        };
+
+        let mut thread_system_id = 0u32;
+        let thread_status = match unsafe {
+            advanced.Request(
+                2, // DEBUG_REQUEST_TARGET_EXCEPTION_THREAD
+                None,
+                0,
+                Some((&mut thread_system_id as *mut u32).cast()),
+                std::mem::size_of::<u32>() as u32,
+                None,
+            )
+        } {
+            Ok(()) => "captured".to_string(),
+            Err(error) => format!("unavailable: {error}"),
+        };
+
+        let mut record_bytes = [0u8; EXCEPTION_RECORD64_SIZE];
+        let record_status = match unsafe {
+            advanced.Request(
+                3, // DEBUG_REQUEST_TARGET_EXCEPTION_RECORD
+                None,
+                0,
+                Some(record_bytes.as_mut_ptr().cast()),
+                record_bytes.len() as u32,
+                None,
+            )
+        } {
+            Ok(()) => "captured".to_string(),
+            Err(error) => format!("unavailable: {error}"),
+        };
+        let record = (record_status == "captured")
+            .then(|| target_exception_record_from_bytes(&record_bytes))
+            .flatten();
+
+        let mut context_bytes = [0u8; X64_CONTEXT_SIZE as usize];
+        let mut context_size = 0u32;
+        let context_status = if self.processor_type().ok() != Some(0x8664) {
+            "architecture_unsupported".to_string()
+        } else {
+            match unsafe {
+                advanced.Request(
+                    1, // DEBUG_REQUEST_TARGET_EXCEPTION_CONTEXT
+                    None,
+                    0,
+                    Some(context_bytes.as_mut_ptr().cast()),
+                    context_bytes.len() as u32,
+                    Some(&mut context_size),
+                )
+            } {
+                Ok(()) => "captured".to_string(),
+                Err(error) => format!("unavailable: {error}"),
+            }
+        };
+        let context = if context_status == "captured" {
+            let bytes_returned = if context_size == 0 {
+                context_bytes.len() as u32
+            } else {
+                context_size.min(context_bytes.len() as u32)
+            };
+            Some(self.decode_x64_exception_context(
+                None,
+                &context_bytes[..bytes_returned as usize],
+                bytes_returned,
+                max_frames,
+            ))
+        } else {
+            None
+        };
+        let captured_parts = [
+            thread_status == "captured",
+            record_status == "captured",
+            context_status == "captured",
+        ]
+        .into_iter()
+        .filter(|captured| *captured)
+        .count();
+        TargetExceptionSnapshot {
+            status: match captured_parts {
+                3 => "captured".to_string(),
+                0 => "unavailable".to_string(),
+                _ => "partial".to_string(),
+            },
+            source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+            stored_event,
+            thread_system_id: (thread_status == "captured").then_some(thread_system_id),
+            thread_status,
+            record,
+            record_status,
+            context,
+            context_status,
+            detail: "DbgEng documents the target-exception requests for a stored event in a user-mode minidump. They are invoked here only as bounded capability probes; a returned thread identifies DbgEng's recorded exception thread, not a logical processor or historical writer. Their unavailability does not disprove the bounded structural P3/P4 candidates.".to_string(),
+        }
+    }
+
     pub fn read_memory(&self, address: u64, size: u32) -> anyhow::Result<MemoryReadResult> {
         let mut buffer = vec![0u8; size as usize];
         let mut bytes_read = 0u32;
@@ -1694,13 +2393,15 @@ impl DebuggerSession {
         if let Err(error) = read_result {
             return X64ExceptionContext {
                 status: "unavailable".to_string(),
-                context_record_address,
+                context_record_address: Some(context_record_address),
                 requested_size,
                 bytes_read,
                 complete: false,
                 context_flags: None,
+                validation: None,
                 registers: None,
                 stack: None,
+                unwind_contexts: None,
                 detail: format!(
                     "DbgEng could not read the x64 exception context at 0x{context_record_address:X}: {error}"
                 ),
@@ -1709,22 +2410,209 @@ impl DebuggerSession {
         if bytes_read < requested_size {
             return X64ExceptionContext {
                 status: "partial".to_string(),
-                context_record_address,
+                context_record_address: Some(context_record_address),
                 requested_size,
                 bytes_read,
                 complete: false,
                 context_flags: None,
+                validation: None,
                 registers: None,
                 stack: None,
+                unwind_contexts: None,
                 detail: format!(
                     "The dump contains only {bytes_read} of {requested_size} bytes for the x64 CONTEXT record."
                 ),
             };
         }
 
-        // The target CONTEXT is read from a byte buffer, which is not guaranteed to be naturally aligned.
-        let context =
-            unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<X64ContextPrefix>()) };
+        self.decode_x64_exception_context(
+            Some(context_record_address),
+            &buffer,
+            bytes_read,
+            max_frames,
+        )
+    }
+
+    pub fn x64_exception_record(
+        &self,
+        exception_record_address: u64,
+    ) -> anyhow::Result<TargetExceptionRecord> {
+        let mut buffer = [0u8; EXCEPTION_RECORD64_SIZE];
+        let mut bytes_read = 0u32;
+        unsafe {
+            self.data_spaces.ReadVirtual(
+                exception_record_address,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                Some(&mut bytes_read),
+            )?;
+        }
+        ensure!(
+            bytes_read == buffer.len() as u32,
+            "DbgEng returned only {bytes_read} of {} bytes for the x64 EXCEPTION_RECORD",
+            buffer.len()
+        );
+        target_exception_record_from_bytes(&buffer).context(
+            "The complete x64 EXCEPTION_RECORD has an unsupported parameter count or layout",
+        )
+    }
+
+    fn context_stack_trace(&self, start_context: &[u8], max_frames: u32) -> X64ContextStackTrace {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            IDebugControl4, DEBUG_STACK_FRAME,
+        };
+
+        if start_context.len() < X64_CONTEXT_SIZE as usize {
+            return X64ContextStackTrace {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                requested_frames: max_frames,
+                returned_frames: 0,
+                frame_zero_matches_start_context: None,
+                frames: Vec::new(),
+                detail: format!(
+                    "The bounded start context contains only {} of {X64_CONTEXT_SIZE} AMD64 CONTEXT bytes.",
+                    start_context.len()
+                ),
+            };
+        }
+        if max_frames == 0 {
+            return X64ContextStackTrace {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                requested_frames: max_frames,
+                returned_frames: 0,
+                frame_zero_matches_start_context: None,
+                frames: Vec::new(),
+                detail: "A positive frame limit is required for the bounded context stack trace."
+                    .to_string(),
+            };
+        }
+        let control: IDebugControl4 = match self.client.cast() {
+            Ok(control) => control,
+            Err(error) => {
+                return X64ContextStackTrace {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                    requested_frames: max_frames,
+                    returned_frames: 0,
+                    frame_zero_matches_start_context: None,
+                    frames: Vec::new(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugControl4 for the bounded context stack trace: {error}"
+                    ),
+                };
+            }
+        };
+        let mut stack_frames = vec![DEBUG_STACK_FRAME::default(); max_frames as usize];
+        let mut frame_context_bytes = vec![0u8; max_frames as usize * X64_CONTEXT_SIZE as usize];
+        let mut filled = 0u32;
+        let result = unsafe {
+            control.GetContextStackTrace(
+                Some(start_context.as_ptr().cast()),
+                X64_CONTEXT_SIZE,
+                Some(&mut stack_frames),
+                Some(frame_context_bytes.as_mut_ptr().cast()),
+                frame_context_bytes.len() as u32,
+                X64_CONTEXT_SIZE,
+                Some(&mut filled),
+            )
+        };
+        let Err(error) = result else {
+            let returned_frames = filled.min(max_frames) as usize;
+            stack_frames.truncate(returned_frames);
+            let frames = stack_frames
+                .iter()
+                .enumerate()
+                .map(|(index, frame)| {
+                    let start = index * X64_CONTEXT_SIZE as usize;
+                    let end = start + X64_CONTEXT_SIZE as usize;
+                    let context = x64_context_prefix_from_bytes(&frame_context_bytes[start..end]);
+                    let required_register_groups_present = context.is_some_and(|context| {
+                        context.context_flags & CONTEXT_X64_REQUIRED_REGISTER_FLAGS
+                            == CONTEXT_X64_REQUIRED_REGISTER_FLAGS
+                    });
+                    let (context_rip, context_flags, r8, r14) = context
+                        .map(|context| {
+                            (
+                                Some(context.rip),
+                                Some(context.context_flags),
+                                Some(context.r8),
+                                Some(context.r14),
+                            )
+                        })
+                        .unwrap_or((None, None, None, None));
+                    X64UnwindContextFrame {
+                        frame_number: frame.FrameNumber,
+                        instruction_offset: frame.InstructionOffset,
+                        context_rip,
+                        context_flags,
+                        required_register_groups_present,
+                        r8,
+                        r14,
+                        structural_effective_address: r8
+                            .zip(r14)
+                            .and_then(|(r8, r14)| r8.checked_add(r14)),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let start = x64_context_prefix_from_bytes(start_context);
+            let frame_zero_matches_start_context =
+                start.zip(frames.first()).map(|(start, frame)| {
+                    frame.context_rip == Some(start.rip)
+                        && frame.r8 == Some(start.r8)
+                        && frame.r14 == Some(start.r14)
+                });
+            return X64ContextStackTrace {
+                status: "captured".to_string(),
+                source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                requested_frames: max_frames,
+                returned_frames: returned_frames as u32,
+                frame_zero_matches_start_context,
+                frames,
+                detail: "DbgEng reconstructed these contexts by unwinding from the supplied saved CONTEXT. They are derived from that input, not an independent exception/trap-frame capture. Microsoft documents that volatile registers need not be restored by stack unwinding, so R8/R14 values after frame zero are never used as fault-time evidence.".to_string(),
+            };
+        };
+        X64ContextStackTrace {
+            status: "unavailable".to_string(),
+            source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+            requested_frames: max_frames,
+            returned_frames: 0,
+            frame_zero_matches_start_context: None,
+            frames: Vec::new(),
+            detail: format!("DbgEng GetContextStackTrace failed: {error}"),
+        }
+    }
+
+    fn decode_x64_exception_context(
+        &self,
+        context_record_address: Option<u64>,
+        buffer: &[u8],
+        bytes_read: u32,
+        max_frames: u32,
+    ) -> X64ExceptionContext {
+        let requested_size = X64_CONTEXT_SIZE;
+        if buffer.len() < requested_size as usize {
+            return X64ExceptionContext {
+                status: "partial".to_string(),
+                context_record_address,
+                requested_size,
+                bytes_read,
+                complete: false,
+                context_flags: None,
+                validation: None,
+                registers: None,
+                stack: None,
+                unwind_contexts: None,
+                detail: format!(
+                    "DbgEng returned only {} of {requested_size} bytes for the x64 CONTEXT record.",
+                    buffer.len()
+                ),
+            };
+        }
+        let context = x64_context_prefix_from_bytes(buffer)
+            .expect("the complete x64 CONTEXT buffer must contain its documented prefix");
         let context_flags = context.context_flags;
         if context_flags & CONTEXT_X64_REQUIRED_REGISTER_FLAGS
             != CONTEXT_X64_REQUIRED_REGISTER_FLAGS
@@ -1736,8 +2624,10 @@ impl DebuggerSession {
                 bytes_read,
                 complete: true,
                 context_flags: Some(context_flags),
+                validation: None,
                 registers: None,
                 stack: None,
+                unwind_contexts: None,
                 detail: "The complete context record does not contain the AMD64 control and integer register groups required for register or stack decoding.".to_string(),
             };
         }
@@ -1761,8 +2651,11 @@ impl DebuggerSession {
             rip: context.rip,
             eflags: context.eflags,
         };
+        let selected_address_width = self.selected_x64_address_width().ok();
+        let validation = x64_context_validation(&context, buffer, selected_address_width);
         let stack =
             self.stack_trace_from_offsets(registers.rbp, registers.rsp, registers.rip, max_frames);
+        let unwind_contexts = self.context_stack_trace(buffer, max_frames);
         let (status, detail) = match &stack {
             Ok(result) => (
                 "captured".to_string(),
@@ -1785,8 +2678,10 @@ impl DebuggerSession {
             bytes_read,
             complete: true,
             context_flags: Some(context_flags),
+            validation: Some(validation),
             registers: Some(registers),
             stack: stack.ok(),
+            unwind_contexts: Some(unwind_contexts),
             detail,
         }
     }
@@ -1916,6 +2811,18 @@ impl DebuggerSession {
             ),
         };
 
+        let page_table_walk = self.walk_x64_page_tables(address);
+        let mut translation_physical_offsets = self.virtual_translation_physical_offsets(address);
+        validate_translation_physical_offsets(
+            &mut translation_physical_offsets,
+            physical_address,
+            &page_table_walk,
+        );
+        let page_table_walk_cross_check = virtual_address_translation_cross_check(
+            physical_address,
+            &translation_physical_offsets,
+            &page_table_walk,
+        );
         VirtualAddressInspection {
             address,
             target_kind: self.kind,
@@ -1925,7 +2832,9 @@ impl DebuggerSession {
             query_virtual_status,
             virtual_region,
             query_virtual_detail,
-            page_table_walk: self.walk_x64_page_tables(address),
+            page_table_walk,
+            translation_physical_offsets,
+            page_table_walk_cross_check,
             extension_command_bridge: ExtensionCommandBridgeStatus {
                 status: "unsupported".to_string(),
                 allowed_forms: vec![
@@ -1934,16 +2843,106 @@ impl DebuggerSession {
                 ],
                 detail: "DbgEng IDebugControl::ExecuteWide executes synchronously on the owning debugger session. This wrapper has no safe, enforceable cancellation or timeout mechanism that can prevent a hung extension query without leaving the dump session in an indeterminate state. To preserve bounded, read-only analysis, no extension command is executed and no command output is claimed. The structured x64 page-table walker is the supported PTE diagnostic.".to_string(),
             },
-            detail: "A captured virtual-to-physical translation proves only that DbgEng can translate the address in this snapshot. QueryVirtual protection fields are reported only when DbgEng supplies them. Neither result reconstructs the PTE state or write permission at the historical fault instant.".to_string(),
+            detail: "A captured virtual-to-physical translation proves only that DbgEng can translate the address in this snapshot. The bounded raw page-table walk separately reports the stored leaf R/W bit when it reaches a present leaf. Neither result reconstructs the PTE state, paging root, or write permission at the historical fault instant.".to_string(),
         }
     }
 
-    fn walk_x64_page_tables(&self, address: u64) -> X64PageTableWalk {
-        let cr4 = match self.evaluate("@cr4").and_then(|value| {
+    fn virtual_translation_physical_offsets(
+        &self,
+        address: u64,
+    ) -> VirtualTranslationPhysicalOffsets {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugDataSpaces2;
+
+        const MAX_TRANSLATION_LEVELS: usize = 8;
+        let data_spaces: IDebugDataSpaces2 = match self.data_spaces.cast() {
+            Ok(data_spaces) => data_spaces,
+            Err(error) => {
+                return VirtualTranslationPhysicalOffsets {
+                    status: "unavailable".to_string(),
+                    reported_level_count: None,
+                    physical_offsets: Vec::new(),
+                    last_physical_offset: None,
+                    final_physical_address: None,
+                    final_physical_address_validation: "unavailable".to_string(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugDataSpaces2 for translation physical offsets: {error}"
+                    ),
+                };
+            }
+        };
+        let mut physical_offsets = [0u64; MAX_TRANSLATION_LEVELS];
+        let mut reported_level_count = 0u32;
+        let result = unsafe {
+            data_spaces.GetVirtualTranslationPhysicalOffsets(
+                address,
+                Some(&mut physical_offsets),
+                Some(&mut reported_level_count),
+            )
+        };
+        match result {
+            Ok(()) if reported_level_count == 0 => VirtualTranslationPhysicalOffsets {
+                status: "invalid".to_string(),
+                reported_level_count: Some(reported_level_count),
+                physical_offsets: Vec::new(),
+                last_physical_offset: None,
+                final_physical_address: None,
+                final_physical_address_validation: "unavailable".to_string(),
+                detail: "DbgEng reported a successful translation-offset request with zero levels."
+                    .to_string(),
+            },
+            Ok(()) if reported_level_count as usize > MAX_TRANSLATION_LEVELS => {
+                VirtualTranslationPhysicalOffsets {
+                    status: "partial".to_string(),
+                    reported_level_count: Some(reported_level_count),
+                    physical_offsets: physical_offsets.to_vec(),
+                    last_physical_offset: physical_offsets.last().copied(),
+                    final_physical_address: None,
+                    final_physical_address_validation: "unavailable".to_string(),
+                    detail: format!(
+                        "DbgEng reported {reported_level_count} translation levels, exceeding the fixed bounded buffer of {MAX_TRANSLATION_LEVELS}; no final address is inferred."
+                    ),
+                }
+            }
+            Ok(()) => {
+                let offsets = physical_offsets[..reported_level_count as usize].to_vec();
+                VirtualTranslationPhysicalOffsets {
+                    status: "captured".to_string(),
+                    reported_level_count: Some(reported_level_count),
+                    last_physical_offset: offsets.last().copied(),
+                    final_physical_address: None,
+                    final_physical_address_validation: "unvalidated_raw_hierarchy_offset"
+                        .to_string(),
+                    physical_offsets: offsets,
+                    detail: "DbgEng IDebugDataSpaces2 returned raw physical paging-hierarchy offsets for this address. The final raw offset is not called a translated physical address unless it independently matches VirtualToPhysical or a completed bounded manual page-table walk.".to_string(),
+                }
+            }
+            Err(error) => VirtualTranslationPhysicalOffsets {
+                status: "unavailable".to_string(),
+                reported_level_count: None,
+                physical_offsets: Vec::new(),
+                last_physical_offset: None,
+                final_physical_address: None,
+                final_physical_address_validation: "unavailable".to_string(),
+                detail: format!(
+                    "DbgEng GetVirtualTranslationPhysicalOffsets did not provide a translation: {error}"
+                ),
+            },
+        }
+    }
+
+    fn selected_x64_address_width(&self) -> anyhow::Result<(u64, u8)> {
+        let cr4 = self.evaluate("@cr4").and_then(|value| {
             value
                 .unsigned_value
                 .context("DbgEng evaluated @cr4 without an unsigned integer result")
-        }) {
+        })?;
+        Ok((cr4, if cr4 & (1 << 12) != 0 { 57 } else { 48 }))
+    }
+
+    fn walk_x64_page_tables(&self, address: u64) -> X64PageTableWalk {
+        let dump_header_directory_table_base = self.dump_header().directory_table_base;
+        let (cr4, virtual_address_bits) = match self.selected_x64_address_width() {
             Ok(value) => value,
             Err(error) => {
                 return unavailable_x64_page_table_walk(
@@ -1952,7 +2951,6 @@ impl DebuggerSession {
                 )
             }
         };
-        let virtual_address_bits = if cr4 & (1 << 12) != 0 { 57 } else { 48 };
         let canonical = x64_virtual_address_is_canonical(address, virtual_address_bits);
         if !canonical {
             return X64PageTableWalk {
@@ -1964,6 +2962,11 @@ impl DebuggerSession {
                 root_physical_address: None,
                 entries: Vec::new(),
                 final_mapping: None,
+                provenance: x64_page_table_provenance(
+                    None,
+                    Some(cr4),
+                    dump_header_directory_table_base,
+                ),
                 detail: "The supplied virtual address is not canonical for the captured CR4.LA57 state; no physical page-table reads were attempted.".to_string(),
             };
         }
@@ -1980,6 +2983,11 @@ impl DebuggerSession {
                 )
             }
         };
+        let provenance = x64_page_table_provenance(
+            Some(directory_table_base),
+            Some(cr4),
+            dump_header_directory_table_base,
+        );
         let root_physical_address = directory_table_base & X64_PHYSICAL_ADDRESS_MASK;
         if root_physical_address == 0 {
             return X64PageTableWalk {
@@ -1991,6 +2999,7 @@ impl DebuggerSession {
                 root_physical_address: Some(root_physical_address),
                 entries: Vec::new(),
                 final_mapping: None,
+                provenance,
                 detail: "The captured CR3 does not contain a nonzero page-table physical base."
                     .to_string(),
             };
@@ -2031,6 +3040,7 @@ impl DebuggerSession {
                         root_physical_address: Some(root_physical_address),
                         entries,
                         final_mapping: None,
+                        provenance: provenance.clone(),
                         detail: format!(
                             "DbgEng could not read the {level} physical entry at 0x{entry_physical_address:X}: {error}"
                         ),
@@ -2049,6 +3059,7 @@ impl DebuggerSession {
                     root_physical_address: Some(root_physical_address),
                     entries,
                     final_mapping: None,
+                    provenance: provenance.clone(),
                     detail: format!("The captured {level} is not present. This is post-bugcheck snapshot evidence and does not establish an earlier transition."),
                 };
             }
@@ -2057,8 +3068,8 @@ impl DebuggerSession {
             let is_pd = *level == "PDE";
             if entry.large_page && (is_pdpt || is_pd) {
                 let page_size = if is_pdpt { 1u64 << 30 } else { 1u64 << 21 };
-                let page_mask = !(page_size - 1);
-                let physical_address = (raw_value & page_mask) | (address & (page_size - 1));
+                let physical_address =
+                    x64_large_page_physical_address(raw_value, address, page_size);
                 entries.push(entry);
                 return X64PageTableWalk {
                     status: "captured".to_string(),
@@ -2073,6 +3084,7 @@ impl DebuggerSession {
                         page_size,
                         page_size_name: if is_pdpt { "1_gib" } else { "2_mib" }.to_string(),
                     }),
+                    provenance: provenance.clone(),
                     detail: "The walker reached a present large-page mapping. Entries are preserved post-bugcheck state, not proof of the permission or lifetime state at the earlier fault instant.".to_string(),
                 };
             }
@@ -2092,6 +3104,7 @@ impl DebuggerSession {
                         page_size: 4096,
                         page_size_name: "4_kib".to_string(),
                     }),
+                    provenance: provenance.clone(),
                     detail: "The walker reached a present 4 KiB mapping. Entries are preserved post-bugcheck state, not proof of the permission or lifetime state at the earlier fault instant.".to_string(),
                 };
             }
@@ -2106,6 +3119,7 @@ impl DebuggerSession {
                     root_physical_address: Some(root_physical_address),
                     entries,
                     final_mapping: None,
+                    provenance,
                     detail: format!("The present {level} has a zero next-table physical base."),
                 };
             }
@@ -2152,6 +3166,148 @@ impl DebuggerSession {
                 system_id,
             })
             .collect())
+    }
+
+    pub fn processor_snapshot(&self, max_frames: u32) -> anyhow::Result<ProcessorSnapshotResult> {
+        ensure!(
+            max_frames > 0,
+            "DbgEng processor snapshots require at least one stack frame"
+        );
+        let logical_processor_count = unsafe { self.control.GetNumberProcessors()? };
+        let mut processors = Vec::with_capacity(logical_processor_count as usize);
+        let original_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
+        let mut current_thread_preserved = true;
+
+        for processor_index in 0..logical_processor_count {
+            if !current_thread_preserved {
+                processors.push(ProcessorSnapshot {
+                    processor_index,
+                    status: "not_attempted".to_string(),
+                    engine_thread_id: None,
+                    system_thread_id: None,
+                    thread_data_offset: None,
+                    registers: None,
+                    current_module: None,
+                    current_symbol: None,
+                    stack: None,
+                    detail: Some(
+                        "The snapshot stopped selecting threads after DbgEng did not preserve the original current thread."
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
+            let engine_thread_id = match unsafe {
+                self.system_objects.GetThreadIdByProcessor(processor_index)
+            } {
+                Ok(id) => id,
+                Err(error) => {
+                    processors.push(ProcessorSnapshot {
+                            processor_index,
+                            status: "unavailable".to_string(),
+                            engine_thread_id: None,
+                            system_thread_id: None,
+                            thread_data_offset: None,
+                            registers: None,
+                            current_module: None,
+                            current_symbol: None,
+                            stack: None,
+                            detail: Some(format!(
+                                "DbgEng did not expose an active thread for logical processor {processor_index}: {error}"
+                            )),
+                        });
+                    continue;
+                }
+            };
+            let snapshot = self.with_selected_thread(engine_thread_id, || {
+                let registers = self.core_registers()?;
+                let instruction_offset = registers.instruction_offset;
+                let current_module =
+                    instruction_offset.and_then(|address| self.module_by_offset(address).ok().flatten());
+                let current_symbol =
+                    instruction_offset.and_then(|address| self.symbol_by_offset(address).ok().flatten());
+                let stack = self.stack_trace_result(max_frames)?;
+                Ok(ProcessorSnapshot {
+                    processor_index,
+                    status: "captured".to_string(),
+                    engine_thread_id: Some(engine_thread_id),
+                    system_thread_id: self.current_thread_system_id().ok(),
+                    thread_data_offset: unsafe {
+                        self.system_objects.GetCurrentThreadDataOffset().ok()
+                    },
+                    registers: Some(registers),
+                    current_module,
+                    current_symbol,
+                    stack: Some(stack),
+                    detail: Some(
+                        "The thread data offset is the documented DbgEng current-thread data offset. It is not decoded as a KTHREAD or PRCB layout."
+                            .to_string(),
+                    ),
+                })
+            });
+            processors.push(match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(error) => ProcessorSnapshot {
+                    processor_index,
+                    status: "unavailable".to_string(),
+                    engine_thread_id: Some(engine_thread_id),
+                    system_thread_id: None,
+                    thread_data_offset: None,
+                    registers: None,
+                    current_module: None,
+                    current_symbol: None,
+                    stack: None,
+                    detail: Some(format!(
+                        "DbgEng could not capture the active-thread context for logical processor {processor_index}: {error:#}"
+                    )),
+                },
+            });
+            current_thread_preserved = unsafe {
+                self.system_objects
+                    .GetCurrentThreadId()
+                    .map(|current| current == original_thread_id)
+                    .unwrap_or(false)
+            };
+        }
+
+        let unavailable = processors
+            .iter()
+            .filter(|processor| processor.status != "captured")
+            .count();
+        let nonempty_saved_stack_count = processors
+            .iter()
+            .filter_map(|processor| processor.stack.as_ref())
+            .filter(|stack| stack.valid_frames > 0)
+            .count();
+        let unwind_limited_stack_count = processors
+            .iter()
+            .filter_map(|processor| processor.stack.as_ref())
+            .filter(|stack| stack.valid_frames == 0)
+            .count();
+        Ok(ProcessorSnapshotResult {
+            source: "dbgeng_idebugcontrol_getnumberprocessors_and_idebugsystemobjects_getthreadidbyprocessor"
+                .to_string(),
+            status: if processors.is_empty() || unavailable == processors.len() {
+                "unavailable".to_string()
+            } else if unavailable > 0 {
+                "partial".to_string()
+            } else {
+                "captured".to_string()
+            },
+            logical_processor_count: Some(logical_processor_count),
+            returned: processors.len(),
+            nonempty_saved_stack_count,
+            unwind_limited_stack_count,
+            max_frames_per_processor: max_frames,
+            processors,
+            current_thread_preserved,
+            detail: if current_thread_preserved {
+                "Only DbgEng's exposed logical processor count was iterated. Each processor is associated with its active debugger thread by the documented GetThreadIdByProcessor API. The API does not establish that a saved bugcheck CONTEXT belongs to any particular processor. Any returned function name is DbgEng symbol resolution and is not itself proof of an identity-validated PDB.".to_string()
+            } else {
+                "The processor snapshot stopped selecting threads after its current-thread restoration check failed. Captured entries remain bounded observations, but the debugger's final thread selection was not preserved.".to_string()
+            }
+                .to_string(),
+        })
     }
 
     pub fn thread_accounting_snapshot(
@@ -2321,6 +3477,27 @@ impl DebuggerSession {
         unsafe {
             self.symbols.GetNumberModules(&mut loaded, &mut unloaded)?;
         }
+        self.modules_by_loaded_count(loaded)
+    }
+
+    pub fn modules_bounded(&self, max_modules: u32) -> anyhow::Result<Vec<ModuleInfo>> {
+        ensure!(
+            max_modules > 0 && max_modules <= MAX_BOUNDED_MODULE_ENUMERATION,
+            "DbgEng bounded module enumeration limit must be from one through {MAX_BOUNDED_MODULE_ENUMERATION}"
+        );
+        let mut loaded = 0u32;
+        let mut unloaded = 0u32;
+        unsafe {
+            self.symbols.GetNumberModules(&mut loaded, &mut unloaded)?;
+        }
+        ensure!(
+            loaded <= max_modules,
+            "DbgEng target exposes {loaded} loaded modules, exceeding the bounded enumeration limit of {max_modules}"
+        );
+        self.modules_by_loaded_count(loaded)
+    }
+
+    fn modules_by_loaded_count(&self, loaded: u32) -> anyhow::Result<Vec<ModuleInfo>> {
         let mut modules = Vec::with_capacity(loaded as usize);
         for index in 0..loaded {
             let base_address = unsafe { self.symbols.GetModuleByIndex(index)? };
@@ -2685,15 +3862,7 @@ impl DebuggerSession {
             "engine_thread_id cannot be DEBUG_ANY_ID"
         );
 
-        let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
-        let changed_thread = previous_thread_id != engine_thread_id;
-        if changed_thread {
-            unsafe {
-                self.system_objects.SetCurrentThreadId(engine_thread_id)?;
-            }
-        }
-
-        let context = (|| {
+        self.with_selected_thread(engine_thread_id, || {
             let registers = self.core_registers()?;
             let instruction_offset = registers.instruction_offset;
             let current_module = instruction_offset
@@ -2714,6 +3883,9 @@ impl DebuggerSession {
                     engine_id: engine_thread_id,
                     system_id,
                 },
+                thread_data_offset: unsafe {
+                    self.system_objects.GetCurrentThreadDataOffset().ok()
+                },
                 registers,
                 current_module,
                 current_symbol,
@@ -2721,7 +3893,23 @@ impl DebuggerSession {
                 disassembly,
                 current_thread_preserved: true,
             })
-        })();
+        })
+    }
+
+    fn with_selected_thread<T>(
+        &self,
+        engine_thread_id: u32,
+        inspect: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let previous_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
+        let changed_thread = previous_thread_id != engine_thread_id;
+        if changed_thread {
+            unsafe {
+                self.system_objects.SetCurrentThreadId(engine_thread_id)?;
+            }
+        }
+
+        let context = inspect();
 
         let restore = changed_thread
             .then(|| unsafe { self.system_objects.SetCurrentThreadId(previous_thread_id) });
@@ -3181,6 +4369,36 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn dump_header(&self) -> DumpHeaderSnapshot {
+        unavailable_dump_header("DbgEng sessions are only supported on Windows".to_string())
+    }
+
+    pub fn target_exception_snapshot(&self, _max_frames: u32) -> TargetExceptionSnapshot {
+        TargetExceptionSnapshot {
+            status: "unavailable".to_string(),
+            source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+            stored_event: StoredEventInformation {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+                event_type: None,
+                process_system_id: None,
+                thread_system_id: None,
+                context: None,
+                context_status: "unavailable".to_string(),
+                extra_information_bytes_returned: None,
+                extra_information_status: "not_returned".to_string(),
+                detail: "DbgEng sessions are only supported on Windows".to_string(),
+            },
+            thread_system_id: None,
+            thread_status: "unavailable".to_string(),
+            record: None,
+            record_status: "unavailable".to_string(),
+            context: None,
+            context_status: "unavailable".to_string(),
+            detail: "DbgEng sessions are only supported on Windows".to_string(),
+        }
+    }
+
     pub fn read_memory(&self, _address: u64, _size: u32) -> anyhow::Result<MemoryReadResult> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
@@ -3189,7 +4407,15 @@ impl DebuggerSession {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
+    pub fn processor_snapshot(&self, _max_frames: u32) -> anyhow::Result<ProcessorSnapshotResult> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
     pub fn modules(&self) -> anyhow::Result<Vec<ModuleInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn modules_bounded(&self, _max_modules: u32) -> anyhow::Result<Vec<ModuleInfo>> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
@@ -3572,6 +4798,210 @@ fn decode_utf16(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..end])
 }
 
+fn unavailable_dump_header(detail: String) -> DumpHeaderSnapshot {
+    DumpHeaderSnapshot {
+        status: "unavailable".to_string(),
+        source: "dbgeng_idebugadvanced2_debug_request_get_dump_header".to_string(),
+        bytes_returned: 0,
+        tail_status: "unavailable".to_string(),
+        signature: None,
+        valid_dump: None,
+        major_version: None,
+        minor_version: None,
+        directory_table_base: None,
+        pfn_database: None,
+        loaded_module_list: None,
+        active_process_head: None,
+        machine_image_type: None,
+        processor_count: None,
+        bugcheck_code: None,
+        bugcheck_parameters: None,
+        version_user: None,
+        dump_type: None,
+        dump_type_name: None,
+        required_dump_space_bytes: None,
+        system_time_filetime: None,
+        system_uptime_100ns: None,
+        comment: None,
+        mini_dump_fields: None,
+        secondary_data_state: None,
+        product_type: None,
+        suite_mask: None,
+        writer_status: None,
+        kd_secondary_version: None,
+        attributes_raw: None,
+        attributes: Vec::new(),
+        boot_id: None,
+        detail,
+    }
+}
+
+fn dump_header_from_bytes(bytes: &[u8], bytes_returned: u32) -> DumpHeaderSnapshot {
+    const HEADER_PREFIX_SIZE: usize = 0x1050;
+    if bytes.len() < HEADER_PREFIX_SIZE {
+        return unavailable_dump_header(format!(
+            "DbgEng returned only {} bytes; the documented DUMP_HEADER64 fields through BootId require {HEADER_PREFIX_SIZE} bytes.",
+            bytes.len()
+        ));
+    }
+    let dump_type = read_u32_le(bytes, 0xf94);
+    let tail_valid = dump_type.and_then(dump_type_name).is_some();
+    let attributes_raw = tail_valid.then(|| read_u32_le(bytes, 0x1048)).flatten();
+    DumpHeaderSnapshot {
+        status: if tail_valid {
+            "captured".to_string()
+        } else {
+            "captured_prefix_only".to_string()
+        },
+        source: "dbgeng_idebugadvanced2_debug_request_get_dump_header".to_string(),
+        bytes_returned,
+        tail_status: if tail_valid {
+            "validated".to_string()
+        } else {
+            "unvalidated".to_string()
+        },
+        signature: read_u32_le(bytes, 0),
+        valid_dump: read_u32_le(bytes, 4),
+        major_version: read_u32_le(bytes, 8),
+        minor_version: read_u32_le(bytes, 12),
+        directory_table_base: read_u64_le(bytes, 0x10),
+        pfn_database: read_u64_le(bytes, 0x18),
+        loaded_module_list: read_u64_le(bytes, 0x20),
+        active_process_head: read_u64_le(bytes, 0x28),
+        machine_image_type: read_u32_le(bytes, 0x30),
+        processor_count: read_u32_le(bytes, 0x34),
+        bugcheck_code: read_u32_le(bytes, 0x38),
+        bugcheck_parameters: [
+            read_u64_le(bytes, 0x40),
+            read_u64_le(bytes, 0x48),
+            read_u64_le(bytes, 0x50),
+            read_u64_le(bytes, 0x58),
+        ]
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .and_then(|values| values.try_into().ok()),
+        version_user: header_ascii(&bytes[0x60..0x80]),
+        dump_type: tail_valid.then_some(dump_type).flatten(),
+        dump_type_name: dump_type.and_then(dump_type_name).map(str::to_string),
+        required_dump_space_bytes: tail_valid.then(|| read_u64_le(bytes, 0xf98)).flatten(),
+        system_time_filetime: tail_valid.then(|| read_u64_le(bytes, 0xfa0)).flatten(),
+        comment: tail_valid
+            .then(|| header_ascii(&bytes[0xfa8..0x1028]))
+            .flatten(),
+        system_uptime_100ns: tail_valid.then(|| read_u64_le(bytes, 0x1028)).flatten(),
+        mini_dump_fields: tail_valid.then(|| read_u32_le(bytes, 0x1030)).flatten(),
+        secondary_data_state: tail_valid.then(|| read_u32_le(bytes, 0x1034)).flatten(),
+        product_type: tail_valid.then(|| read_u32_le(bytes, 0x1038)).flatten(),
+        suite_mask: tail_valid.then(|| read_u32_le(bytes, 0x103c)).flatten(),
+        writer_status: tail_valid.then(|| read_u32_le(bytes, 0x1040)).flatten(),
+        kd_secondary_version: tail_valid.then(|| bytes.get(0x1045).copied()).flatten(),
+        attributes_raw,
+        attributes: attributes_raw.map(dump_attribute_names).unwrap_or_default(),
+        boot_id: tail_valid.then(|| read_u32_le(bytes, 0x104c)).flatten(),
+        detail: if tail_valid {
+            "The documented DUMP_HEADER64 bytes are a static dump-capture record. SecondaryDataState is reported verbatim because the documented DbgEng request does not enumerate or define individual kernel blackbox stream identifiers or payload layouts.".to_string()
+        } else {
+            "DbgEng returned a header prefix whose signature and basic fields can be decoded, but the purported DUMP_HEADER64 tail did not contain a documented DUMP_TYPE value. Tail fields are withheld rather than interpreting unvalidated bytes or assuming a dump-layout variant.".to_string()
+        },
+    }
+}
+
+fn read_u32_le(bytes: &[u8], offset: usize) -> Option<u32> {
+    bytes
+        .get(offset..offset.checked_add(std::mem::size_of::<u32>())?)
+        .and_then(|value| value.try_into().ok())
+        .map(u32::from_le_bytes)
+}
+
+fn read_u64_le(bytes: &[u8], offset: usize) -> Option<u64> {
+    bytes
+        .get(offset..offset.checked_add(std::mem::size_of::<u64>())?)
+        .and_then(|value| value.try_into().ok())
+        .map(u64::from_le_bytes)
+}
+
+fn header_ascii(bytes: &[u8]) -> Option<String> {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    let value = &bytes[..end];
+    value
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() || *byte == b' ')
+        .then(|| String::from_utf8_lossy(value).trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn dump_type_name(value: u32) -> Option<&'static str> {
+    match value {
+        0 => Some("unknown"),
+        1 => Some("full"),
+        2 => Some("summary"),
+        3 => Some("header"),
+        4 => Some("triage"),
+        5 => Some("bitmap_full"),
+        6 => Some("bitmap_kernel"),
+        7 => Some("automatic"),
+        _ => None,
+    }
+}
+
+fn dump_attribute_names(attributes: u32) -> Vec<String> {
+    [
+        (0, "hiber_crash"),
+        (1, "dump_device_power_off"),
+        (2, "insufficient_dumpfile_size"),
+        (3, "kernel_generated_triage_dump"),
+        (4, "live_dump_generated_dump"),
+        (5, "generated_offline"),
+        (6, "filter_dump_file"),
+        (7, "early_boot_crash"),
+        (8, "encrypted_dump_data"),
+        (9, "decrypted_dump"),
+    ]
+    .into_iter()
+    .filter_map(|(bit, name)| (attributes & (1 << bit) != 0).then_some(name.to_string()))
+    .collect()
+}
+
+fn target_exception_record_from_bytes(bytes: &[u8]) -> Option<TargetExceptionRecord> {
+    if bytes.len() < EXCEPTION_RECORD64_SIZE {
+        return None;
+    }
+    let parameter_count = read_u32_le(bytes, 24)?;
+    if parameter_count > 15 {
+        return None;
+    }
+    let parameters = (0..parameter_count as usize)
+        .map(|index| read_u64_le(bytes, 32 + index * std::mem::size_of::<u64>()))
+        .collect::<Option<Vec<_>>>()?;
+    let code = read_u32_le(bytes, 0)?;
+    let access_violation = (code == 0xc000_0005 && parameters.len() >= 2).then(|| {
+        let operation_raw = parameters[0];
+        TargetAccessViolation {
+            operation: match operation_raw {
+                0 => "read",
+                1 => "write",
+                8 => "execute",
+                _ => "unknown",
+            }
+            .to_string(),
+            operation_raw,
+            address: parameters[1],
+        }
+    });
+    Some(TargetExceptionRecord {
+        code,
+        flags: read_u32_le(bytes, 4)?,
+        previous_record: read_u64_le(bytes, 8)?,
+        address: read_u64_le(bytes, 16)?,
+        parameter_count,
+        parameters,
+        access_violation,
+    })
+}
+
 fn debug_value_type_name(value_type: u32) -> &'static str {
     #[cfg(windows)]
     {
@@ -3887,8 +5317,136 @@ mod tests {
     #[test]
     fn x64_context_prefix_matches_the_documented_register_offset() {
         assert_eq!(std::mem::size_of::<X64ContextPrefix>(), 0x100);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, context_flags), 0x30);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, seg_cs), 0x38);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, seg_ss), 0x42);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, eflags), 0x44);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, rsp), 0x98);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, r8), 0xb8);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, r14), 0xe8);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, rip), 0xf8);
         assert_eq!(X64_CONTEXT_SIZE, 0x4D0);
         assert_eq!(CONTEXT_X64_REQUIRED_REGISTER_FLAGS, 0x0010_0003);
+    }
+
+    #[test]
+    fn validates_serialized_amd64_context_offsets_independently() {
+        let mut bytes = vec![0u8; X64_CONTEXT_SIZE as usize];
+        bytes[0x30..0x34].copy_from_slice(&0x0010_001f_u32.to_le_bytes());
+        bytes[0x38..0x3a].copy_from_slice(&0x10_u16.to_le_bytes());
+        bytes[0x42..0x44].copy_from_slice(&0x18_u16.to_le_bytes());
+        bytes[0x44..0x48].copy_from_slice(&0x202_u32.to_le_bytes());
+        bytes[0x98..0xa0].copy_from_slice(&0xffff_f800_0000_1000_u64.to_le_bytes());
+        bytes[0xb8..0xc0].copy_from_slice(&0xffff_8581_bd06_8cf0_u64.to_le_bytes());
+        bytes[0xe8..0xf0].copy_from_slice(&0x20_u64.to_le_bytes());
+        bytes[0xf8..0x100].copy_from_slice(&0xffff_f800_e439_70b0_u64.to_le_bytes());
+
+        let context = x64_context_prefix_from_bytes(&bytes).unwrap();
+        let validation = x64_context_validation(&context, &bytes, Some((0, 48)));
+
+        assert_eq!(context.r8, 0xffff_8581_bd06_8cf0);
+        assert_eq!(context.r14, 0x20);
+        assert_eq!(context.rip, 0xffff_f800_e439_70b0);
+        assert!(validation.raw_layout_offset_cross_check);
+        assert!(validation.amd64_flag_present);
+        assert!(validation.control_register_group_present);
+        assert!(validation.integer_register_group_present);
+        assert!(validation.cs_nonzero);
+        assert!(validation.ss_nonzero);
+        assert!(validation.eflags_reserved_bit_1_set);
+        assert_eq!(validation.rsp_mod_16, 0);
+        assert_eq!(
+            validation.rip_canonical_for_selected_address_width,
+            Some(true)
+        );
+        assert_eq!(
+            validation.rsp_canonical_for_selected_address_width,
+            Some(true)
+        );
+        assert!(!validation.control_registers_in_amd64_context);
+    }
+
+    #[test]
+    fn decodes_documented_dump_header64_fields_at_fixed_offsets() {
+        let mut bytes = vec![0u8; DUMP_HEADER64_SIZE];
+        bytes[0..4].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x3436_5544u32.to_le_bytes());
+        bytes[0x30..0x34].copy_from_slice(&0x8664u32.to_le_bytes());
+        bytes[0x34..0x38].copy_from_slice(&24u32.to_le_bytes());
+        bytes[0x38..0x3c].copy_from_slice(&0x1eu32.to_le_bytes());
+        bytes[0x40..0x48].copy_from_slice(&0xc000_0005u64.to_le_bytes());
+        bytes[0x48..0x50].copy_from_slice(&0xffff_f800_e439_70b0u64.to_le_bytes());
+        bytes[0x60..0x60 + 11].copy_from_slice(b"test build\0");
+        bytes[0xf94..0xf98].copy_from_slice(&1u32.to_le_bytes());
+        bytes[0xfa0..0xfa8].copy_from_slice(&123u64.to_le_bytes());
+        bytes[0xfa8..0xfa8 + 14].copy_from_slice(b"captured dump\0");
+        bytes[0x1028..0x1030].copy_from_slice(&456u64.to_le_bytes());
+        bytes[0x1034..0x1038].copy_from_slice(&7u32.to_le_bytes());
+        bytes[0x1048..0x104c].copy_from_slice(&((1u32 << 5) | (1 << 8)).to_le_bytes());
+        bytes[0x104c..0x1050].copy_from_slice(&9u32.to_le_bytes());
+
+        let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_SIZE as u32);
+
+        assert_eq!(header.status, "captured");
+        assert_eq!(header.processor_count, Some(24));
+        assert_eq!(header.bugcheck_code, Some(0x1e));
+        assert_eq!(
+            header.bugcheck_parameters,
+            Some([0xc000_0005, 0xffff_f800_e439_70b0, 0, 0])
+        );
+        assert_eq!(header.version_user.as_deref(), Some("test build"));
+        assert_eq!(header.dump_type_name.as_deref(), Some("full"));
+        assert_eq!(header.system_time_filetime, Some(123));
+        assert_eq!(header.system_uptime_100ns, Some(456));
+        assert_eq!(header.comment.as_deref(), Some("captured dump"));
+        assert_eq!(header.secondary_data_state, Some(7));
+        assert_eq!(
+            header.attributes,
+            vec!["generated_offline", "encrypted_dump_data"]
+        );
+        assert_eq!(header.boot_id, Some(9));
+    }
+
+    #[test]
+    fn decodes_documented_access_violation_record_without_guessing_operation() {
+        let mut bytes = [0u8; EXCEPTION_RECORD64_SIZE];
+        bytes[0..4].copy_from_slice(&0xc000_0005u32.to_le_bytes());
+        bytes[16..24].copy_from_slice(&0xffff_f800_e439_70b0u64.to_le_bytes());
+        bytes[24..28].copy_from_slice(&2u32.to_le_bytes());
+        bytes[32..40].copy_from_slice(&1u64.to_le_bytes());
+        bytes[40..48].copy_from_slice(&0xffff_8581_bd06_8d10u64.to_le_bytes());
+
+        let record = target_exception_record_from_bytes(&bytes).unwrap();
+
+        assert_eq!(record.parameter_count, 2);
+        assert_eq!(record.access_violation.as_ref().unwrap().operation, "write");
+        assert_eq!(
+            record.access_violation.as_ref().unwrap().address,
+            0xffff_8581_bd06_8d10
+        );
+        bytes[32..40].copy_from_slice(&7u64.to_le_bytes());
+        assert_eq!(
+            target_exception_record_from_bytes(&bytes)
+                .unwrap()
+                .access_violation
+                .unwrap()
+                .operation,
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn withholds_unvalidated_dump_header_tail() {
+        let mut bytes = vec![0u8; DUMP_HEADER64_SIZE];
+        bytes[0xf94..0xf98].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[0x1034..0x1038].copy_from_slice(&7u32.to_le_bytes());
+
+        let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_SIZE as u32);
+
+        assert_eq!(header.status, "captured_prefix_only");
+        assert_eq!(header.tail_status, "unvalidated");
+        assert_eq!(header.dump_type, None);
+        assert_eq!(header.secondary_data_state, None);
     }
 
     #[test]
@@ -4078,5 +5636,85 @@ mod tests {
         assert_eq!(entry.global, Some(true));
         assert!(entry.no_execute);
         assert_eq!(entry.page_frame_number, 0x12345);
+    }
+
+    #[test]
+    fn large_page_address_masks_nx_and_page_offset_bits() {
+        let address = 0xffff_8000_1234_5678;
+        let raw_2mib_pde = 0x8000_0000_1234_5083;
+        let raw_1gib_pdpte = 0x8000_0000_4000_0083;
+
+        assert_eq!(
+            x64_large_page_physical_address(raw_2mib_pde, address, 1 << 21),
+            0x1220_0000 + (address & ((1 << 21) - 1))
+        );
+        assert_eq!(
+            x64_large_page_physical_address(raw_1gib_pdpte, address, 1 << 30),
+            0x4000_0000 + (address & ((1 << 30) - 1))
+        );
+    }
+
+    #[test]
+    fn reports_translation_match_and_mismatch_explicitly() {
+        let mut walk = unavailable_x64_page_table_walk(0xffff_8000_0000_1000, "test".to_string());
+        walk.final_mapping = Some(X64PageTableMapping {
+            physical_address: 0x1234_5000,
+            page_size: 4096,
+            page_size_name: "4_kib".to_string(),
+        });
+        let offsets = VirtualTranslationPhysicalOffsets {
+            status: "captured".to_string(),
+            reported_level_count: Some(4),
+            physical_offsets: vec![0x1000, 0x2000, 0x3000, 0x1234_5000],
+            last_physical_offset: Some(0x1234_5000),
+            final_physical_address: Some(0x1234_5000),
+            final_physical_address_validation: "test".to_string(),
+            detail: "test".to_string(),
+        };
+
+        let matched = virtual_address_translation_cross_check(Some(0x1234_5000), &offsets, &walk);
+        assert_eq!(matched.status, "matched");
+        assert_eq!(
+            matched.virtual_to_physical_matches_page_table_walk,
+            Some(true)
+        );
+        assert_eq!(
+            matched.translation_physical_offsets_matches_page_table_walk,
+            Some(true)
+        );
+
+        let mismatched =
+            virtual_address_translation_cross_check(Some(0x1234_6000), &offsets, &walk);
+        assert_eq!(mismatched.status, "mismatch");
+        assert_eq!(
+            mismatched.virtual_to_physical_matches_page_table_walk,
+            Some(false)
+        );
+        assert_eq!(
+            mismatched.virtual_to_physical_matches_translation_physical_offsets,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn does_not_promote_an_unvalidated_translation_hierarchy_offset() {
+        let walk = unavailable_x64_page_table_walk(0xffff_ffff_ffff_ffff, "test".to_string());
+        let mut offsets = VirtualTranslationPhysicalOffsets {
+            status: "captured".to_string(),
+            reported_level_count: Some(5),
+            physical_offsets: vec![0x1000, 0x1ff8, 0x2ff8, 0x3ff8, 0x4ff8],
+            last_physical_offset: Some(0x4ff8),
+            final_physical_address: None,
+            final_physical_address_validation: "unvalidated_raw_hierarchy_offset".to_string(),
+            detail: "test".to_string(),
+        };
+
+        validate_translation_physical_offsets(&mut offsets, None, &walk);
+
+        assert_eq!(offsets.final_physical_address, None);
+        assert_eq!(
+            offsets.final_physical_address_validation,
+            "unvalidated_raw_hierarchy_offset"
+        );
     }
 }

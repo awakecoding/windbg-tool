@@ -316,6 +316,10 @@ enum DumpCommand {
         about = "Produce bounded pool-corruption triage with context, tracker, and evidence grades"
     )]
     PoolTriage(DumpInspectArgs),
+    #[command(
+        about = "Compare bounded direct crash evidence across supplied or retained local dump files"
+    )]
+    Cohort(DumpCohortArgs),
     #[command(about = "Create a process dump from a live process id")]
     Create(DumpCreateArgs),
 }
@@ -1282,6 +1286,12 @@ struct DumpInspectArgs {
     refresh_symbols: bool,
     #[arg(
         long,
+        requires = "refresh_symbols",
+        help = "Permit DbgEng to attempt a cached PDB whose MSF GUID or age does not match the PE CodeView record; output remains explicitly unvalidated"
+    )]
+    allow_pdb_identity_mismatch: bool,
+    #[arg(
+        long,
         value_name = "PATH",
         default_value = ".windbg-symbol-cache",
         help = "Rust-native symbol cache; DbgEng never treats this as an srv* path"
@@ -1307,9 +1317,30 @@ struct DumpInspectArgs {
     #[arg(
         long,
         value_name = "ADDRESS",
-        help = "Known per-CPU pool-tracker table base used to classify --inspect-address or the captured tracker entry"
+        help = "Additional caller-supplied address whose preserved mapping can be compared with --inspect-address; no private pool-tracker layout is decoded"
     )]
     tracker_table_base: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct DumpCohortArgs {
+    #[arg(
+        value_name = "PATH",
+        help = "Dump path to compare; omit all paths to use the retained local crash cohort"
+    )]
+    paths: Vec<PathBuf>,
+    #[arg(
+        long,
+        default_value_t = 8,
+        value_parser = clap::value_parser!(u32).range(1..=32),
+        help = "Maximum frames in each single bounded current/exception stack probe"
+    )]
+    max_frames: u32,
+    #[arg(
+        long,
+        help = "Declare that the cohort run must not download missing symbols; this command never adds a srv* path"
+    )]
+    offline: bool,
 }
 
 #[derive(Debug, Args)]

@@ -20,7 +20,7 @@ use windbg_dbgeng::{
 };
 use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
-    NativeSymbolStatus, PeImageIdentity,
+    NativeSymbolStatus, PdbIdentityValidation, PeImageIdentity,
 };
 
 pub type TargetId = u64;
@@ -1148,7 +1148,6 @@ fn prefetch_dump_symbols(
     for name in [
         module.image_name.as_deref(),
         module.loaded_image_name.as_deref(),
-        module.symbol_file.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -1287,6 +1286,18 @@ fn prefetch_dump_symbols(
             });
         }
     };
+    if prefetch.pdb_identity_validation() == PdbIdentityValidation::Unverified {
+        return json!({
+            "status": "pdb_identity_unverified",
+            "module": module,
+            "image_path": image_path,
+            "image_prefetch": image_prefetch,
+            "prefetch": prefetch,
+            "pdb_identity_validation": "unverified",
+            "offline": offline,
+            "detail": "A PDB was available at the CodeView-derived symbol-server path, but its embedded GUID and age were not validated. It was not configured for symbol resolution."
+        });
+    }
     let Some(pdb_path) = prefetch.pdb_path.as_ref() else {
         return json!({
             "status": prefetch.status,
@@ -1310,10 +1321,10 @@ fn prefetch_dump_symbols(
                 .context("DbgEng did not provide a fault-module name")
                 .and_then(|name| session.refresh_symbols(name))
         });
+    let pdb_identity_validation = prefetch.pdb_identity_validation();
     json!({
         "status": match prefetch.status {
-            NativeSymbolStatus::Cached => "configured_from_cache",
-            NativeSymbolStatus::Downloaded => "downloaded_and_configured",
+            NativeSymbolStatus::Cached | NativeSymbolStatus::Downloaded => "pdb_identity_unverified",
             NativeSymbolStatus::OfflineMissing => "offline_missing",
             NativeSymbolStatus::Unavailable => "unavailable",
         },
@@ -1323,6 +1334,7 @@ fn prefetch_dump_symbols(
         "image_prefetch": image_prefetch,
         "pdb_directory": pdb_dir,
         "prefetch": prefetch,
+        "pdb_identity_validation": pdb_identity_validation,
         "forced_reload": match reload {
             Ok(()) => json!({"status": "loaded"}),
             Err(error) => json!({"status": "failed", "detail": format!("{error:#}")}),

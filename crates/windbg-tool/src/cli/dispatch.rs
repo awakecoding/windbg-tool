@@ -59,6 +59,7 @@ pub(super) async fn run_cli() -> anyhow::Result<()> {
             DumpCommand::Inspect(args) => platform::run_dump_inspect(args, &output),
             DumpCommand::Triage(args) => platform::run_dump_inspect(args, &output),
             DumpCommand::PoolTriage(args) => platform::run_dump_inspect(args, &output),
+            DumpCommand::Cohort(args) => platform::run_dump_cohort(args, &output),
             DumpCommand::Create(args) => platform::run_dump_create(args, &output),
         },
         Some(Commands::DbgSrv(args)) => platform::run_dbgeng_server(args, &output),
