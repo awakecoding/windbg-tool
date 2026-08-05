@@ -4572,6 +4572,10 @@ pub(super) fn run_dump_cohort(args: DumpCohortArgs, output: &OutputOptions) -> a
         .iter()
         .filter(|entry| entry["status"].as_str() == Some("missing"))
         .count();
+    let recurrence = dump_cohort_recurrence(&entries, analyzed);
+    let driver_filter_lifecycle = dump_cohort_driver_filter_lifecycle(&entries, analyzed);
+    let evidence_synthesis =
+        dump_cohort_evidence_synthesis(&recurrence, &driver_filter_lifecycle, analyzed);
     print_value(
         json!({
             "schema": "windbg-tool.dump-cohort.v2",
@@ -4583,8 +4587,9 @@ pub(super) fn run_dump_cohort(args: DumpCohortArgs, output: &OutputOptions) -> a
             "analyzed_dump_count": analyzed,
             "missing_dump_count": missing,
             "entries": entries,
-            "recurrence": dump_cohort_recurrence(&entries, analyzed),
-            "driver_filter_lifecycle": dump_cohort_driver_filter_lifecycle(&entries, analyzed),
+            "recurrence": recurrence,
+            "driver_filter_lifecycle": driver_filter_lifecycle,
+            "evidence_synthesis": evidence_synthesis,
             "bounds": {
                 "per_dump": [
                     "one DbgEng dump open",
@@ -4893,6 +4898,70 @@ fn dump_cohort_driver_filter_lifecycle(entries: &[Value], analyzed: usize) -> Va
             "detail": "No documented DbgEng dump API exposes a bounded public filter-instance or current-I/O traversal. Loaded filter modules are not presented as filter-stack participation."
         },
         "detail": "Always-loaded is an image-identity intersection only. It does not imply execution, stack participation, verification, signature validity, or causation. Validated stack participation and direct KiBugCheckDriver attribution are reported independently."
+    })
+}
+
+fn dump_cohort_evidence_synthesis(
+    recurrence: &Value,
+    driver_filter_lifecycle: &Value,
+    analyzed_dump_count: usize,
+) -> Value {
+    json!({
+        "schema": "windbg-tool.dump-cohort-evidence.v1",
+        "analyzed_dump_count": analyzed_dump_count,
+        "evidence": [
+            {
+                "category": "recurring_fault_instruction_bytes",
+                "provenance": "symbolized-and-validated",
+                "status": recurrence["fault_instruction_bytes"]["status"],
+                "source_pointer": "/recurrence/fault_instruction_bytes",
+                "detail": "Consistency requires the same non-null one-instruction byte token from every analyzed dump."
+            },
+            {
+                "category": "loaded_module_identity_intersection",
+                "provenance": "structural-snapshot",
+                "status": driver_filter_lifecycle["loaded_module_identities"]["status"],
+                "source_pointer": "/driver_filter_lifecycle/loaded_module_identities",
+                "detail": "An always-loaded identity is neither a validated stack participant nor direct attribution."
+            },
+            {
+                "category": "validated_stack_participation",
+                "provenance": "symbolized-and-validated",
+                "status": driver_filter_lifecycle["validated_stack_participation"]["status"],
+                "source_pointer": "/driver_filter_lifecycle/validated_stack_participation",
+                "detail": "Only module families named by a validated saved stack frame participate in this category."
+            },
+            {
+                "category": "direct_bugcheck_driver",
+                "provenance": "direct-context",
+                "status": driver_filter_lifecycle["direct_bugcheck_driver"]["status"],
+                "source_pointer": "/driver_filter_lifecycle/direct_bugcheck_driver",
+                "detail": "KiBugCheckDriver is reported only when DbgEng can read the explicitly saved kernel field."
+            },
+            {
+                "category": "filter_and_verifier_state",
+                "provenance": "unavailable",
+                "status": "unsupported",
+                "source_pointer": "/driver_filter_lifecycle",
+                "detail": "No documented bounded dump API exposes a filter stack, verifier configuration, or verifier counters for this cohort."
+            }
+        ],
+        "confidence_matrix": {
+            "confirmed_facts": [
+                "Only recurrence entries whose status is consistent across every analyzed dump.",
+                "Only explicit module identities, validated stack families, and direct attribution fields described by their linked categories."
+            ],
+            "ruled_out_explanations": [],
+            "plausible_but_unproven": [
+                "A shared transient pool-tracker failure mechanism.",
+                "A driver or memory-corruption mechanism not captured on a validated stack or direct attribution field."
+            ],
+            "next_capture_evidence_required": [
+                "An event-time trace or instrumentation recording allocation and writes for the tracker page.",
+                "Direct verifier, special-pool, or filter-stack state recorded at failure time."
+            ]
+        },
+        "detail": "This is the safe composition companion to windbg-tool.dump-evidence.v1. It does not infer causality from module intersection, stack absence, or inaccessible dumps."
     })
 }
 
@@ -5408,6 +5477,14 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let kernel_integrity = dump_kernel_integrity_snapshot(input.modules);
     let physical_page_provenance = dump_physical_page_provenance_feasibility();
     let allocation_adjacent_metadata = dump_allocation_adjacent_metadata_feasibility();
+    let evidence_synthesis = dump_evidence_synthesis(
+        input.bugcheck,
+        &fault_mechanics,
+        &pool_tracker,
+        &address_space_consistency,
+        &allocation_adjacent_metadata,
+        &write_provenance,
+    );
 
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
@@ -5432,6 +5509,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "allocation_adjacent_metadata": allocation_adjacent_metadata,
         "address_inspection": address_inspection,
         "evidence": evidence,
+        "evidence_synthesis": evidence_synthesis,
         "data_limits": dump_data_limits(
             input.target,
             input.current_stack,
@@ -5440,6 +5518,90 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
             &exception_context,
         ),
         "recommendations": dump_recommendations(input.bugcheck),
+    })
+}
+
+fn dump_evidence_synthesis(
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    fault_mechanics: &Value,
+    pool_tracker: &Value,
+    address_space_consistency: &Value,
+    allocation_adjacent_metadata: &Value,
+    write_provenance: &Value,
+) -> Value {
+    json!({
+        "schema": "windbg-tool.dump-evidence.v1",
+        "evidence": [
+            {
+                "category": "bugcheck_and_fault_access",
+                "provenance": "direct-context",
+                "status": bugcheck.status,
+                "source_pointer": "/triage/bugcheck",
+                "detail": "The bugcheck record is an explicitly saved crash snapshot, not a record of the earlier writer or allocation lifetime."
+            },
+            {
+                "category": "fault_instruction_and_register_dataflow",
+                "provenance": "symbolized-and-validated",
+                "status": fault_mechanics["status"],
+                "source_pointer": "/triage/fault_mechanics",
+                "detail": "Instruction bytes and register addressing must match the bounded validator before this category is treated as captured."
+            },
+            {
+                "category": "pool_tracker_and_address_mapping",
+                "provenance": "structural-snapshot",
+                "status": pool_tracker["status"],
+                "source_pointer": "/triage/pool_tracker",
+                "detail": "Tracker records and page mappings describe retained post-crash memory only."
+            },
+            {
+                "category": "explicit_address_space_comparison",
+                "provenance": "structural-snapshot",
+                "status": address_space_consistency["status"],
+                "source_pointer": "/triage/address_space_consistency",
+                "detail": "Only the explicitly derived fault address and supplied tracker base are compared; physical reverse-alias enumeration is unavailable."
+            },
+            {
+                "category": "allocation_provenance",
+                "provenance": "unavailable",
+                "status": allocation_adjacent_metadata["status"],
+                "source_pointer": "/triage/allocation_adjacent_metadata",
+                "detail": "The documented dump interfaces do not establish allocation owner, free history, or special-pool state."
+            },
+            {
+                "category": "recent_write_provenance",
+                "provenance": "unavailable",
+                "status": write_provenance["status"],
+                "source_pointer": "/triage/write_provenance",
+                "detail": "An ordinary crash dump has no bounded documented record of the writer that last modified this location."
+            },
+            {
+                "category": "heuristic_bugcheck_context",
+                "provenance": "heuristic",
+                "status": "see_heuristic_exception_context",
+                "source_pointer": "/triage/heuristic_exception_context",
+                "detail": "A structurally valid context candidate is useful for bounded comparison but is not direct thread or CPU attribution."
+            }
+        ],
+        "confidence_matrix": {
+            "confirmed_snapshot_facts": [
+                "The saved bugcheck and any instruction/context values that pass their individual validators.",
+                "Only the bounded page-table mappings and tracker records explicitly represented by the structural probes."
+            ],
+            "ruled_out_explanations": [],
+            "plausible_but_unproven": [
+                "A transient Windows pool-tracker failure.",
+                "Memory corruption or a Driver Verifier artifact before the saved snapshot."
+            ],
+            "unavailable_evidence": [
+                "Recent write history, allocation owner/free history, reverse physical aliases, and PFN provenance.",
+                "A direct crash CPU/thread association when the documented target-exception requests are unavailable."
+            ],
+            "next_capture_evidence_required": [
+                "A reproducing trace or instrumentation that records writes/allocation lifetime for the affected tracker page.",
+                "Driver Verifier or special-pool evidence captured at the event rather than reconstructed from this dump."
+            ]
+        },
+        "detail": "This synthesis is a stable index over the bounded report. It intentionally makes no root-cause attribution and never promotes a load-presence observation to execution or causation."
     })
 }
 
@@ -8328,6 +8490,32 @@ mod tests {
         assert_eq!(
             lifecycle["direct_bugcheck_driver"]["status"],
             "not_consistently_observed"
+        );
+    }
+
+    #[test]
+    fn cohort_evidence_synthesis_preserves_provenance_categories() {
+        let synthesis = dump_cohort_evidence_synthesis(
+            &json!({
+                "fault_instruction_bytes": {"status": "consistent_across_analyzed_dumps"}
+            }),
+            &json!({
+                "loaded_module_identities": {"status": "captured"},
+                "validated_stack_participation": {"status": "captured"},
+                "direct_bugcheck_driver": {"status": "unavailable"}
+            }),
+            3,
+        );
+
+        assert_eq!(synthesis["schema"], "windbg-tool.dump-cohort-evidence.v1");
+        assert_eq!(synthesis["analyzed_dump_count"], 3);
+        assert_eq!(
+            synthesis["evidence"][0]["provenance"],
+            "symbolized-and-validated"
+        );
+        assert_eq!(
+            synthesis["confidence_matrix"]["ruled_out_explanations"],
+            json!([])
         );
     }
 
