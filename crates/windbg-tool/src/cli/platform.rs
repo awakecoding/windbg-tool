@@ -5557,6 +5557,14 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         &pool_tracker,
         input.target_exception,
     );
+    let context_candidate_mapping = if debugger_thread_preserved {
+        dump_context_candidate_mapping_audit(session, &fault_mechanics)
+    } else {
+        json!({
+            "status": "unavailable_current_thread_not_preserved",
+            "detail": "No CR3-dependent candidate mapping probe ran because the bounded processor snapshot did not restore DbgEng's original current thread."
+        })
+    };
     let address_space_consistency = if debugger_thread_preserved {
         dump_address_space_consistency(
             session,
@@ -5577,6 +5585,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         &fault_mechanics,
         &pool_tracker,
         &address_space_consistency,
+        &context_candidate_mapping,
         &allocation_adjacent_metadata,
         &write_provenance,
     );
@@ -5589,6 +5598,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "exception_context": exception_context,
         "structural_parameter_context": structural_parameter_context,
         "fault_mechanics": fault_mechanics,
+        "context_candidate_mapping": context_candidate_mapping,
         "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
         "native_symbol_prefetch": input.native_symbols,
@@ -5621,6 +5631,7 @@ fn dump_evidence_synthesis(
     fault_mechanics: &Value,
     pool_tracker: &Value,
     address_space_consistency: &Value,
+    context_candidate_mapping: &Value,
     allocation_adjacent_metadata: &Value,
     write_provenance: &Value,
 ) -> Value {
@@ -5664,6 +5675,13 @@ fn dump_evidence_synthesis(
                 "detail": "Only explicitly supplied or fully documented-context-derived addresses are compared; physical reverse-alias enumeration is unavailable."
             },
             {
+                "category": "context_and_exception_candidate_mapping",
+                "provenance": "structural-snapshot",
+                "status": context_candidate_mapping["status"],
+                "source_pointer": "/triage/context_candidate_mapping",
+                "detail": "P3/P4 structural candidates are mapped independently and remain candidate snapshot evidence. A present R/W leaf does not prove the candidate was the fault operand or preserve the fault-time PTE state."
+            },
+            {
                 "category": "allocation_provenance",
                 "provenance": "unavailable",
                 "status": allocation_adjacent_metadata["status"],
@@ -5688,7 +5706,7 @@ fn dump_evidence_synthesis(
         "confidence_matrix": {
             "confirmed_snapshot_facts": [
                 "The saved bugcheck and any instruction/context values that pass their individual validators.",
-                "Only bounded page-table mappings for explicitly supplied or documented-context-derived addresses."
+                "Only bounded page-table mappings for explicitly supplied or separately labelled context/exception candidates."
             ],
             "ruled_out_explanations": [],
             "plausible_but_unproven": [
@@ -5828,11 +5846,16 @@ fn dump_exception_context(
         "selection": selected
             .and_then(|candidate| candidate["source"].as_str())
             .unwrap_or("none"),
+        "context_interpretation": if data.code == 0x0000_001E {
+            "structurally_validated_compatible_but_ambiguous_saved_context"
+        } else {
+            "documented_bugcheck_context_parameter"
+        },
         "context": selected.map(|candidate| candidate["context"].clone()),
         "candidates": decoded,
         "exception_record_candidate": exception_record_candidate,
         "detail": if data.code == 0x0000_001E {
-            "Microsoft documents P3/P4 as access metadata for 0x1E. This capture’s raw header P3 is not an access-type value, while bounded P3/P4 structural probes match an EXCEPTION_RECORD64 and x64 CONTEXT with P2. They are reported as a capture-specific compatibility path, not as a general parameter contract or direct thread/CPU attribution."
+            "Microsoft documents P3/P4 as access metadata for 0x1E. This capture’s raw header P3 is not an access-type value, while bounded P3/P4 structural probes match an EXCEPTION_RECORD64 and x64 CONTEXT with P2. The CONTEXT is a structurally validated compatible saved context, but remains ambiguous because DbgEng's documented target-exception requests are unavailable and the independently parsed access target conflicts with R8+R14. It is not a general parameter contract, exact fault-context proof, or direct thread/CPU attribution."
         } else {
             "The decoded context comes from the documented SYSTEM_SERVICE_EXCEPTION context-record parameter."
         },
@@ -6272,6 +6295,16 @@ fn dump_fault_mechanics_audit(
             "bounded_record_offset_20_raw_qword": counter_raw_qword,
             "detail": "R14 is a register value, not an instruction-encoded displacement. A register-derived operand is emitted only from a documented context, or retained as non-promoted structural comparison data when bounded P3/P4 compatibility probes conflict."
         },
+        "context_exception_record_relationship": {
+            "status": if effective_address_matches_target == Some(false) {
+                "unresolved_conflict"
+            } else {
+                "not_applicable"
+            },
+            "context_register_candidate": effective_address,
+            "exception_record_access_target": comparison_target,
+            "detail": "LOCK XADD is architecturally a read-modify-write instruction, but this dump exposes no documented per-instruction retirement state or DbgEng target-exception context with which to bind the capture-specific P4 CONTEXT to the P3 EXCEPTION_RECORD. The tool does not attribute a mismatch to instruction restart, fault delivery, register mutation, or a transient mapping change; the two values remain separate conflicting saved-state observations."
+        },
         "counter_field_semantics": {
             "status": "unsupported",
             "detail": "No public typed layout identifies the qword at the observed register-derived offset as a named counter or defines its valid range. The inspector therefore does not classify a delta or current qword as normal, malformed, overflowed, or corrupt."
@@ -6409,6 +6442,101 @@ fn dump_address_space_consistency_unavailable_after_processor_restore_failure(
     })
 }
 
+fn dump_context_candidate_mapping_audit(
+    session: &DebuggerSession,
+    fault_mechanics: &Value,
+) -> Value {
+    let context_register_candidate = fault_mechanics["register_dataflow"]["effective_address"]
+        .as_u64()
+        .or_else(|| fault_mechanics["register_dataflow"]["structural_effective_address"].as_u64());
+    let exception_record_candidate = fault_mechanics["memory_access"]
+        ["documented_bugcheck_parameter_contract"]["target_address"]
+        .as_u64()
+        .or_else(|| {
+            fault_mechanics["memory_access"]["structural_exception_record_access_target"].as_u64()
+        });
+    let context_register_mapping = context_register_candidate.map(|address| {
+        dump_context_candidate_mapping(
+            session,
+            address,
+            "context_register_derived_candidate",
+            "structural-snapshot",
+            "This candidate is the arithmetic result of the bounded saved CONTEXT registers. In a 0x1E pointer-shaped compatibility path, it is not promoted to the fault address.",
+        )
+    });
+    let exception_record_mapping = exception_record_candidate.map(|address| {
+        dump_context_candidate_mapping(
+            session,
+            address,
+            "exception_record_access_target",
+            if fault_mechanics["memory_access"]["documented_bugcheck_parameter_contract"]
+                ["status"]
+                .as_str()
+                == Some("captured")
+            {
+                "direct-snapshot"
+            } else {
+                "structural-snapshot"
+            },
+            "This candidate is the decoded access target from an EXCEPTION_RECORD64 or, when applicable, Microsoft's documented 0x1E access-parameter contract. It is compared with, not replaced by, the register-derived candidate.",
+        )
+    });
+    let candidates_conflict = context_register_candidate
+        .zip(exception_record_candidate)
+        .map(|(context, exception)| context != exception);
+    json!({
+        "status": if context_register_mapping.is_some() || exception_record_mapping.is_some() {
+            "captured"
+        } else {
+            "not_applicable"
+        },
+        "candidates_conflict": candidates_conflict,
+        "context_register_candidate": context_register_mapping,
+        "exception_record_candidate": exception_record_mapping,
+        "detail": "Each candidate receives a separate bounded, read-only manual page-table walk and DbgEng translation cross-check. A present, writable leaf is only captured-snapshot state; it does not prove the candidate was the instruction operand, used the same CR3, or was mapped and writable when the exception was raised."
+    })
+}
+
+fn dump_context_candidate_mapping(
+    session: &DebuggerSession,
+    address: u64,
+    candidate_kind: &str,
+    provenance: &str,
+    candidate_detail: &str,
+) -> Value {
+    let mapping =
+        serde_json::to_value(session.inspect_virtual_address(address)).unwrap_or_else(|error| {
+            json!({
+                "address": address,
+                "status": "serialization_error",
+                "detail": error.to_string()
+            })
+        });
+    let leaf = mapping["page_table_walk"]["entries"]
+        .as_array()
+        .and_then(|entries| entries.last());
+    let leaf_present = leaf.and_then(|entry| entry["present"].as_bool());
+    let leaf_writable = leaf.and_then(|entry| entry["writable"].as_bool());
+    let snapshot_assessment = match (leaf_present, leaf_writable) {
+        (Some(true), Some(true)) => "mapped_writable_snapshot",
+        (Some(true), Some(false)) => "mapped_not_writable_snapshot",
+        (Some(false), _) => "nonpresent_snapshot",
+        _ => "unavailable",
+    };
+    json!({
+        "candidate_kind": candidate_kind,
+        "provenance": provenance,
+        "address": address,
+        "mapping": mapping,
+        "snapshot_assessment": snapshot_assessment,
+        "captured_leaf_present": leaf_present,
+        "captured_leaf_writable": leaf_writable,
+        "candidate_detail": candidate_detail,
+        "fault_time_interpretation": "not_proven",
+        "detail": "The leaf flags describe only the selected debugger context's preserved page tables. AMD64 CONTEXT has no CR3/CR4, so this cannot establish the saved context's paging root, fault-time mapping, instruction operand, allocation lifetime, or causation."
+    })
+}
+
 fn address_mapping_physical_page(mapping: &Value) -> Option<u64> {
     (mapping["page_table_walk_cross_check"]["status"].as_str() == Some("matched")).then_some(())?;
     mapping
@@ -6435,7 +6563,7 @@ fn dump_address_inspection(
             "status": "unsupported",
             "detail": "DbgEng exposes no stable typed pool-header/owner API for this offline kernel dump. No raw allocation-header interpretation is inferred."
         },
-        "detail": "The address probe is bounded and read-only. A successful virtual-to-physical translation does not establish write permission or the historical PTE state at the fault instant."
+        "detail": "The address probe is bounded and read-only. A present leaf's stored R/W bit describes this snapshot only; a translation or stored leaf flag does not establish the historical PTE state, fault-time access, or allocation lifetime."
     })
 }
 
@@ -8341,6 +8469,10 @@ mod tests {
         assert_eq!(
             audit["memory_access"]["access_phase_coherence"],
             "structurally_coheres_with_xadd_destination_read"
+        );
+        assert_eq!(
+            audit["context_exception_record_relationship"]["status"],
+            "unresolved_conflict"
         );
         assert!(audit["register_dataflow"]["bounded_record_offset_20_raw_qword"].is_null());
     }

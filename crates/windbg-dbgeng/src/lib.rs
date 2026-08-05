@@ -714,6 +714,36 @@ pub struct X64ExceptionRegisters {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct X64ContextSegmentSelectors {
+    pub cs: u16,
+    pub ds: u16,
+    pub es: u16,
+    pub fs: u16,
+    pub gs: u16,
+    pub ss: u16,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64ContextValidation {
+    pub amd64_flag_present: bool,
+    pub control_register_group_present: bool,
+    pub integer_register_group_present: bool,
+    pub raw_layout_offset_cross_check: bool,
+    pub segment_selectors: X64ContextSegmentSelectors,
+    pub cs_nonzero: bool,
+    pub ss_nonzero: bool,
+    pub eflags_reserved_bit_1_set: bool,
+    pub interrupt_enable_flag: bool,
+    pub rsp_mod_16: u8,
+    pub selected_debugger_context_cr4: Option<u64>,
+    pub selected_debugger_context_virtual_address_bits: Option<u8>,
+    pub rip_canonical_for_selected_address_width: Option<bool>,
+    pub rsp_canonical_for_selected_address_width: Option<bool>,
+    pub control_registers_in_amd64_context: bool,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct X64ExceptionContext {
     pub status: String,
     pub context_record_address: Option<u64>,
@@ -721,6 +751,7 @@ pub struct X64ExceptionContext {
     pub bytes_read: u32,
     pub complete: bool,
     pub context_flags: Option<u32>,
+    pub validation: Option<X64ContextValidation>,
     pub registers: Option<X64ExceptionRegisters>,
     pub stack: Option<StackTraceResult>,
     pub detail: String,
@@ -735,11 +766,17 @@ const EXCEPTION_RECORD64_SIZE: usize = 0x98;
 // The dump target's architecture can differ from the host build architecture. Keep this prefix
 // independent of windows::CONTEXT so ARM64 builds can decode an AMD64 dump safely.
 #[repr(C)]
+#[derive(Clone, Copy)]
 struct X64ContextPrefix {
     _homes: [u64; 6],
     context_flags: u32,
     _mxcsr: u32,
-    _segments: [u16; 6],
+    seg_cs: u16,
+    seg_ds: u16,
+    seg_es: u16,
+    seg_fs: u16,
+    seg_gs: u16,
+    seg_ss: u16,
     eflags: u32,
     _debug_registers: [u64; 6],
     rax: u64,
@@ -759,6 +796,108 @@ struct X64ContextPrefix {
     r14: u64,
     r15: u64,
     rip: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct X64ContextCriticalFields {
+    context_flags: u32,
+    seg_cs: u16,
+    seg_ss: u16,
+    eflags: u32,
+    rsp: u64,
+    r8: u64,
+    r14: u64,
+    rip: u64,
+}
+
+fn x64_context_prefix_from_bytes(bytes: &[u8]) -> Option<X64ContextPrefix> {
+    (bytes.len() >= std::mem::size_of::<X64ContextPrefix>())
+        // The source byte buffer is not guaranteed to be naturally aligned.
+        .then(|| unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast::<X64ContextPrefix>()) })
+}
+
+fn x64_context_critical_fields_from_bytes(bytes: &[u8]) -> Option<X64ContextCriticalFields> {
+    fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+        Some(u16::from_le_bytes(
+            bytes.get(offset..offset + 2)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+        Some(u32::from_le_bytes(
+            bytes.get(offset..offset + 4)?.try_into().ok()?,
+        ))
+    }
+
+    fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+        Some(u64::from_le_bytes(
+            bytes.get(offset..offset + 8)?.try_into().ok()?,
+        ))
+    }
+
+    Some(X64ContextCriticalFields {
+        context_flags: read_u32(bytes, 0x30)?,
+        seg_cs: read_u16(bytes, 0x38)?,
+        seg_ss: read_u16(bytes, 0x42)?,
+        eflags: read_u32(bytes, 0x44)?,
+        rsp: read_u64(bytes, 0x98)?,
+        r8: read_u64(bytes, 0xb8)?,
+        r14: read_u64(bytes, 0xe8)?,
+        rip: read_u64(bytes, 0xf8)?,
+    })
+}
+
+fn x64_context_validation(
+    context: &X64ContextPrefix,
+    bytes: &[u8],
+    selected_address_width: Option<(u64, u8)>,
+) -> X64ContextValidation {
+    let raw_layout_offset_cross_check =
+        x64_context_critical_fields_from_bytes(bytes).is_some_and(|raw| {
+            raw.context_flags == context.context_flags
+                && raw.seg_cs == context.seg_cs
+                && raw.seg_ss == context.seg_ss
+                && raw.eflags == context.eflags
+                && raw.rsp == context.rsp
+                && raw.r8 == context.r8
+                && raw.r14 == context.r14
+                && raw.rip == context.rip
+        });
+    let (selected_debugger_context_cr4, selected_debugger_context_virtual_address_bits) =
+        selected_address_width
+            .map(|(cr4, bits)| (Some(cr4), Some(bits)))
+            .unwrap_or((None, None));
+    let canonicality = selected_debugger_context_virtual_address_bits.map(|bits| {
+        (
+            x64_virtual_address_is_canonical(context.rip, bits),
+            x64_virtual_address_is_canonical(context.rsp, bits),
+        )
+    });
+    X64ContextValidation {
+        amd64_flag_present: context.context_flags & CONTEXT_AMD64_FLAG != 0,
+        control_register_group_present: context.context_flags & 0x1 != 0,
+        integer_register_group_present: context.context_flags & 0x2 != 0,
+        raw_layout_offset_cross_check,
+        segment_selectors: X64ContextSegmentSelectors {
+            cs: context.seg_cs,
+            ds: context.seg_ds,
+            es: context.seg_es,
+            fs: context.seg_fs,
+            gs: context.seg_gs,
+            ss: context.seg_ss,
+        },
+        cs_nonzero: context.seg_cs != 0,
+        ss_nonzero: context.seg_ss != 0,
+        eflags_reserved_bit_1_set: context.eflags & 0x2 != 0,
+        interrupt_enable_flag: context.eflags & 0x200 != 0,
+        rsp_mod_16: (context.rsp & 0xf) as u8,
+        selected_debugger_context_cr4,
+        selected_debugger_context_virtual_address_bits,
+        rip_canonical_for_selected_address_width: canonicality.map(|value| value.0),
+        rsp_canonical_for_selected_address_width: canonicality.map(|value| value.1),
+        control_registers_in_amd64_context: false,
+        detail: "The fixed AMD64 CONTEXT offsets were independently decoded from the bounded byte buffer and compared with the C-compatible prefix. CS/SS and EFLAGS checks are structural sanity observations, not thread or CPU attribution. AMD64 CONTEXT does not contain CR3 or CR4; any selected-debugger CR4 is used only for canonical-address checks and does not establish the saved context's paging root.".to_string(),
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -804,6 +943,7 @@ pub struct VirtualAddressInspection {
     pub virtual_region: Option<VirtualMemoryRegion>,
     pub query_virtual_detail: String,
     pub page_table_walk: X64PageTableWalk,
+    pub translation_physical_offsets: VirtualTranslationPhysicalOffsets,
     pub page_table_walk_cross_check: VirtualAddressTranslationCrossCheck,
     pub extension_command_bridge: ExtensionCommandBridgeStatus,
     pub detail: String,
@@ -813,8 +953,22 @@ pub struct VirtualAddressInspection {
 pub struct VirtualAddressTranslationCrossCheck {
     pub status: String,
     pub virtual_to_physical_address: Option<u64>,
+    pub translation_physical_offsets_address: Option<u64>,
     pub page_table_walk_address: Option<u64>,
-    pub matches: Option<bool>,
+    pub virtual_to_physical_matches_page_table_walk: Option<bool>,
+    pub translation_physical_offsets_matches_page_table_walk: Option<bool>,
+    pub virtual_to_physical_matches_translation_physical_offsets: Option<bool>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VirtualTranslationPhysicalOffsets {
+    pub status: String,
+    pub reported_level_count: Option<u32>,
+    pub physical_offsets: Vec<u64>,
+    pub last_physical_offset: Option<u64>,
+    pub final_physical_address: Option<u64>,
+    pub final_physical_address_validation: String,
     pub detail: String,
 }
 
@@ -835,6 +989,17 @@ pub struct X64PageTableWalk {
     pub root_physical_address: Option<u64>,
     pub entries: Vec<X64PageTableEntry>,
     pub final_mapping: Option<X64PageTableMapping>,
+    pub provenance: X64PageTableProvenance,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64PageTableProvenance {
+    pub selected_debugger_context_cr3: Option<u64>,
+    pub selected_debugger_context_cr4: Option<u64>,
+    pub la57_enabled_in_selected_debugger_context: Option<bool>,
+    pub dump_header_directory_table_base: Option<u64>,
+    pub selected_root_matches_dump_header: Option<bool>,
     pub detail: String,
 }
 
@@ -1392,36 +1557,122 @@ fn x64_large_page_physical_address(raw_value: u64, address: u64, page_size: u64)
     (raw_value & page_base_mask) | (address & (page_size - 1))
 }
 
+fn unavailable_x64_page_table_provenance() -> X64PageTableProvenance {
+    X64PageTableProvenance {
+        selected_debugger_context_cr3: None,
+        selected_debugger_context_cr4: None,
+        la57_enabled_in_selected_debugger_context: None,
+        dump_header_directory_table_base: None,
+        selected_root_matches_dump_header: None,
+        detail: "The page-table walk did not obtain the selected debugger context's CR3/CR4. An AMD64 CONTEXT record does not contain CR3 or CR4, so it cannot independently provide this paging root.".to_string(),
+    }
+}
+
+fn x64_page_table_provenance(
+    selected_debugger_context_cr3: Option<u64>,
+    selected_debugger_context_cr4: Option<u64>,
+    dump_header_directory_table_base: Option<u64>,
+) -> X64PageTableProvenance {
+    let selected_root =
+        selected_debugger_context_cr3.map(|value| value & X64_PHYSICAL_ADDRESS_MASK);
+    let dump_header_root =
+        dump_header_directory_table_base.map(|value| value & X64_PHYSICAL_ADDRESS_MASK);
+    let selected_root_matches_dump_header = selected_root
+        .zip(dump_header_root)
+        .map(|(left, right)| left == right);
+    let detail = match selected_root_matches_dump_header {
+        Some(true) => "CR3 and CR4 come from DbgEng's currently selected captured context. The selected CR3 root matches the dump-header DirectoryTableBase after masking address-space identifiers, so this bounded manual walk is also rooted at the recorded header base. AMD64 CONTEXT does not preserve CR3/CR4, so that root match does not prove it was the P4 context's paging root at the fault instant.",
+        Some(false) => "CR3 and CR4 come from DbgEng's currently selected captured context. The selected CR3 root differs from the dump-header DirectoryTableBase after masking address-space identifiers; this walk reports the selected-context root and must not be treated as a header-root or P4-context walk. AMD64 CONTEXT does not preserve CR3/CR4.",
+        None => "CR3 and CR4 come from DbgEng's currently selected captured context. The dump header did not expose a comparable DirectoryTableBase. AMD64 CONTEXT does not preserve CR3/CR4, so this walk cannot establish the P4 context's paging root.",
+    };
+    X64PageTableProvenance {
+        selected_debugger_context_cr3,
+        selected_debugger_context_cr4,
+        la57_enabled_in_selected_debugger_context: selected_debugger_context_cr4
+            .map(|value| value & (1 << 12) != 0),
+        dump_header_directory_table_base,
+        selected_root_matches_dump_header,
+        detail: detail.to_string(),
+    }
+}
+
 fn virtual_address_translation_cross_check(
     virtual_to_physical_address: Option<u64>,
+    translation_physical_offsets: &VirtualTranslationPhysicalOffsets,
     page_table_walk: &X64PageTableWalk,
 ) -> VirtualAddressTranslationCrossCheck {
     let page_table_walk_address = page_table_walk
         .final_mapping
         .as_ref()
         .map(|mapping| mapping.physical_address);
-    match (virtual_to_physical_address, page_table_walk_address) {
-        (Some(virtual_to_physical_address), Some(page_table_walk_address)) => {
-            let matches = virtual_to_physical_address == page_table_walk_address;
-            VirtualAddressTranslationCrossCheck {
-                status: if matches {
-                    "matched".to_string()
-                } else {
-                    "mismatch".to_string()
-                },
-                virtual_to_physical_address: Some(virtual_to_physical_address),
-                page_table_walk_address: Some(page_table_walk_address),
-                matches: Some(matches),
-                detail: "DbgEng VirtualToPhysical and the bounded raw physical page-table walk were compared for this preserved snapshot. A match does not reconstruct historical mapping state.".to_string(),
-            }
-        }
-        _ => VirtualAddressTranslationCrossCheck {
-            status: "unavailable".to_string(),
-            virtual_to_physical_address,
-            page_table_walk_address,
-            matches: None,
-            detail: "A comparison requires both a DbgEng VirtualToPhysical result and a completed bounded raw physical page-table walk.".to_string(),
-        },
+    let translation_physical_offsets_address = translation_physical_offsets.final_physical_address;
+    let virtual_to_physical_matches_page_table_walk = virtual_to_physical_address
+        .zip(page_table_walk_address)
+        .map(|(left, right)| left == right);
+    let translation_physical_offsets_matches_page_table_walk = translation_physical_offsets_address
+        .zip(page_table_walk_address)
+        .map(|(left, right)| left == right);
+    let virtual_to_physical_matches_translation_physical_offsets = virtual_to_physical_address
+        .zip(translation_physical_offsets_address)
+        .map(|(left, right)| left == right);
+    let comparisons = [
+        virtual_to_physical_matches_page_table_walk,
+        translation_physical_offsets_matches_page_table_walk,
+        virtual_to_physical_matches_translation_physical_offsets,
+    ];
+    let status = if comparisons.iter().flatten().any(|matches| !matches) {
+        "mismatch"
+    } else if comparisons.iter().flatten().next().is_some() {
+        "matched"
+    } else {
+        "unavailable"
+    };
+    VirtualAddressTranslationCrossCheck {
+        status: status.to_string(),
+        virtual_to_physical_address,
+        translation_physical_offsets_address,
+        page_table_walk_address,
+        virtual_to_physical_matches_page_table_walk,
+        translation_physical_offsets_matches_page_table_walk,
+        virtual_to_physical_matches_translation_physical_offsets,
+        detail: "DbgEng VirtualToPhysical, IDebugDataSpaces2 translation physical offsets when available, and the bounded raw physical page-table walk were compared for this preserved snapshot. Any agreement is a snapshot consistency check, not reconstruction of historical mapping state.".to_string(),
+    }
+}
+
+fn validate_translation_physical_offsets(
+    translation_physical_offsets: &mut VirtualTranslationPhysicalOffsets,
+    virtual_to_physical_address: Option<u64>,
+    page_table_walk: &X64PageTableWalk,
+) {
+    let Some(last_physical_offset) = translation_physical_offsets.last_physical_offset else {
+        translation_physical_offsets.final_physical_address_validation =
+            "no_offsets_returned".to_string();
+        return;
+    };
+    let page_table_walk_address = page_table_walk
+        .final_mapping
+        .as_ref()
+        .map(|mapping| mapping.physical_address);
+    let matches_virtual_to_physical = virtual_to_physical_address
+        .map(|address| address == last_physical_offset)
+        .unwrap_or(false);
+    let matches_page_table_walk = page_table_walk_address
+        .map(|address| address == last_physical_offset)
+        .unwrap_or(false);
+    if matches_virtual_to_physical || matches_page_table_walk {
+        translation_physical_offsets.final_physical_address = Some(last_physical_offset);
+        translation_physical_offsets.final_physical_address_validation =
+            match (matches_virtual_to_physical, matches_page_table_walk) {
+                (true, true) => {
+                    "validated_by_virtual_to_physical_and_manual_page_table_walk".to_string()
+                }
+                (true, false) => "validated_by_virtual_to_physical".to_string(),
+                (false, true) => "validated_by_manual_page_table_walk".to_string(),
+                (false, false) => unreachable!("the condition above requires a validation"),
+            };
+    } else {
+        translation_physical_offsets.final_physical_address_validation =
+            "unvalidated_raw_hierarchy_offset".to_string();
     }
 }
 
@@ -1435,6 +1686,7 @@ fn unavailable_x64_page_table_walk(address: u64, detail: String) -> X64PageTable
         root_physical_address: None,
         entries: Vec::new(),
         final_mapping: None,
+        provenance: unavailable_x64_page_table_provenance(),
         detail,
     }
 }
@@ -2001,6 +2253,7 @@ impl DebuggerSession {
                 bytes_read,
                 complete: false,
                 context_flags: None,
+                validation: None,
                 registers: None,
                 stack: None,
                 detail: format!(
@@ -2016,6 +2269,7 @@ impl DebuggerSession {
                 bytes_read,
                 complete: false,
                 context_flags: None,
+                validation: None,
                 registers: None,
                 stack: None,
                 detail: format!(
@@ -2072,6 +2326,7 @@ impl DebuggerSession {
                 bytes_read,
                 complete: false,
                 context_flags: None,
+                validation: None,
                 registers: None,
                 stack: None,
                 detail: format!(
@@ -2080,9 +2335,8 @@ impl DebuggerSession {
                 ),
             };
         }
-        // The target CONTEXT is read from a byte buffer, which is not guaranteed to be naturally aligned.
-        let context =
-            unsafe { std::ptr::read_unaligned(buffer.as_ptr().cast::<X64ContextPrefix>()) };
+        let context = x64_context_prefix_from_bytes(buffer)
+            .expect("the complete x64 CONTEXT buffer must contain its documented prefix");
         let context_flags = context.context_flags;
         if context_flags & CONTEXT_X64_REQUIRED_REGISTER_FLAGS
             != CONTEXT_X64_REQUIRED_REGISTER_FLAGS
@@ -2094,6 +2348,7 @@ impl DebuggerSession {
                 bytes_read,
                 complete: true,
                 context_flags: Some(context_flags),
+                validation: None,
                 registers: None,
                 stack: None,
                 detail: "The complete context record does not contain the AMD64 control and integer register groups required for register or stack decoding.".to_string(),
@@ -2119,6 +2374,8 @@ impl DebuggerSession {
             rip: context.rip,
             eflags: context.eflags,
         };
+        let selected_address_width = self.selected_x64_address_width().ok();
+        let validation = x64_context_validation(&context, buffer, selected_address_width);
         let stack =
             self.stack_trace_from_offsets(registers.rbp, registers.rsp, registers.rip, max_frames);
         let (status, detail) = match &stack {
@@ -2143,6 +2400,7 @@ impl DebuggerSession {
             bytes_read,
             complete: true,
             context_flags: Some(context_flags),
+            validation: Some(validation),
             registers: Some(registers),
             stack: stack.ok(),
             detail,
@@ -2275,8 +2533,17 @@ impl DebuggerSession {
         };
 
         let page_table_walk = self.walk_x64_page_tables(address);
-        let page_table_walk_cross_check =
-            virtual_address_translation_cross_check(physical_address, &page_table_walk);
+        let mut translation_physical_offsets = self.virtual_translation_physical_offsets(address);
+        validate_translation_physical_offsets(
+            &mut translation_physical_offsets,
+            physical_address,
+            &page_table_walk,
+        );
+        let page_table_walk_cross_check = virtual_address_translation_cross_check(
+            physical_address,
+            &translation_physical_offsets,
+            &page_table_walk,
+        );
         VirtualAddressInspection {
             address,
             target_kind: self.kind,
@@ -2287,6 +2554,7 @@ impl DebuggerSession {
             virtual_region,
             query_virtual_detail,
             page_table_walk,
+            translation_physical_offsets,
             page_table_walk_cross_check,
             extension_command_bridge: ExtensionCommandBridgeStatus {
                 status: "unsupported".to_string(),
@@ -2296,16 +2564,106 @@ impl DebuggerSession {
                 ],
                 detail: "DbgEng IDebugControl::ExecuteWide executes synchronously on the owning debugger session. This wrapper has no safe, enforceable cancellation or timeout mechanism that can prevent a hung extension query without leaving the dump session in an indeterminate state. To preserve bounded, read-only analysis, no extension command is executed and no command output is claimed. The structured x64 page-table walker is the supported PTE diagnostic.".to_string(),
             },
-            detail: "A captured virtual-to-physical translation proves only that DbgEng can translate the address in this snapshot. QueryVirtual protection fields are reported only when DbgEng supplies them. Neither result reconstructs the PTE state or write permission at the historical fault instant.".to_string(),
+            detail: "A captured virtual-to-physical translation proves only that DbgEng can translate the address in this snapshot. The bounded raw page-table walk separately reports the stored leaf R/W bit when it reaches a present leaf. Neither result reconstructs the PTE state, paging root, or write permission at the historical fault instant.".to_string(),
         }
     }
 
-    fn walk_x64_page_tables(&self, address: u64) -> X64PageTableWalk {
-        let cr4 = match self.evaluate("@cr4").and_then(|value| {
+    fn virtual_translation_physical_offsets(
+        &self,
+        address: u64,
+    ) -> VirtualTranslationPhysicalOffsets {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugDataSpaces2;
+
+        const MAX_TRANSLATION_LEVELS: usize = 8;
+        let data_spaces: IDebugDataSpaces2 = match self.data_spaces.cast() {
+            Ok(data_spaces) => data_spaces,
+            Err(error) => {
+                return VirtualTranslationPhysicalOffsets {
+                    status: "unavailable".to_string(),
+                    reported_level_count: None,
+                    physical_offsets: Vec::new(),
+                    last_physical_offset: None,
+                    final_physical_address: None,
+                    final_physical_address_validation: "unavailable".to_string(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugDataSpaces2 for translation physical offsets: {error}"
+                    ),
+                };
+            }
+        };
+        let mut physical_offsets = [0u64; MAX_TRANSLATION_LEVELS];
+        let mut reported_level_count = 0u32;
+        let result = unsafe {
+            data_spaces.GetVirtualTranslationPhysicalOffsets(
+                address,
+                Some(&mut physical_offsets),
+                Some(&mut reported_level_count),
+            )
+        };
+        match result {
+            Ok(()) if reported_level_count == 0 => VirtualTranslationPhysicalOffsets {
+                status: "invalid".to_string(),
+                reported_level_count: Some(reported_level_count),
+                physical_offsets: Vec::new(),
+                last_physical_offset: None,
+                final_physical_address: None,
+                final_physical_address_validation: "unavailable".to_string(),
+                detail: "DbgEng reported a successful translation-offset request with zero levels."
+                    .to_string(),
+            },
+            Ok(()) if reported_level_count as usize > MAX_TRANSLATION_LEVELS => {
+                VirtualTranslationPhysicalOffsets {
+                    status: "partial".to_string(),
+                    reported_level_count: Some(reported_level_count),
+                    physical_offsets: physical_offsets.to_vec(),
+                    last_physical_offset: physical_offsets.last().copied(),
+                    final_physical_address: None,
+                    final_physical_address_validation: "unavailable".to_string(),
+                    detail: format!(
+                        "DbgEng reported {reported_level_count} translation levels, exceeding the fixed bounded buffer of {MAX_TRANSLATION_LEVELS}; no final address is inferred."
+                    ),
+                }
+            }
+            Ok(()) => {
+                let offsets = physical_offsets[..reported_level_count as usize].to_vec();
+                VirtualTranslationPhysicalOffsets {
+                    status: "captured".to_string(),
+                    reported_level_count: Some(reported_level_count),
+                    last_physical_offset: offsets.last().copied(),
+                    final_physical_address: None,
+                    final_physical_address_validation: "unvalidated_raw_hierarchy_offset"
+                        .to_string(),
+                    physical_offsets: offsets,
+                    detail: "DbgEng IDebugDataSpaces2 returned raw physical paging-hierarchy offsets for this address. The final raw offset is not called a translated physical address unless it independently matches VirtualToPhysical or a completed bounded manual page-table walk.".to_string(),
+                }
+            }
+            Err(error) => VirtualTranslationPhysicalOffsets {
+                status: "unavailable".to_string(),
+                reported_level_count: None,
+                physical_offsets: Vec::new(),
+                last_physical_offset: None,
+                final_physical_address: None,
+                final_physical_address_validation: "unavailable".to_string(),
+                detail: format!(
+                    "DbgEng GetVirtualTranslationPhysicalOffsets did not provide a translation: {error}"
+                ),
+            },
+        }
+    }
+
+    fn selected_x64_address_width(&self) -> anyhow::Result<(u64, u8)> {
+        let cr4 = self.evaluate("@cr4").and_then(|value| {
             value
                 .unsigned_value
                 .context("DbgEng evaluated @cr4 without an unsigned integer result")
-        }) {
+        })?;
+        Ok((cr4, if cr4 & (1 << 12) != 0 { 57 } else { 48 }))
+    }
+
+    fn walk_x64_page_tables(&self, address: u64) -> X64PageTableWalk {
+        let dump_header_directory_table_base = self.dump_header().directory_table_base;
+        let (cr4, virtual_address_bits) = match self.selected_x64_address_width() {
             Ok(value) => value,
             Err(error) => {
                 return unavailable_x64_page_table_walk(
@@ -2314,7 +2672,6 @@ impl DebuggerSession {
                 )
             }
         };
-        let virtual_address_bits = if cr4 & (1 << 12) != 0 { 57 } else { 48 };
         let canonical = x64_virtual_address_is_canonical(address, virtual_address_bits);
         if !canonical {
             return X64PageTableWalk {
@@ -2326,6 +2683,11 @@ impl DebuggerSession {
                 root_physical_address: None,
                 entries: Vec::new(),
                 final_mapping: None,
+                provenance: x64_page_table_provenance(
+                    None,
+                    Some(cr4),
+                    dump_header_directory_table_base,
+                ),
                 detail: "The supplied virtual address is not canonical for the captured CR4.LA57 state; no physical page-table reads were attempted.".to_string(),
             };
         }
@@ -2342,6 +2704,11 @@ impl DebuggerSession {
                 )
             }
         };
+        let provenance = x64_page_table_provenance(
+            Some(directory_table_base),
+            Some(cr4),
+            dump_header_directory_table_base,
+        );
         let root_physical_address = directory_table_base & X64_PHYSICAL_ADDRESS_MASK;
         if root_physical_address == 0 {
             return X64PageTableWalk {
@@ -2353,6 +2720,7 @@ impl DebuggerSession {
                 root_physical_address: Some(root_physical_address),
                 entries: Vec::new(),
                 final_mapping: None,
+                provenance,
                 detail: "The captured CR3 does not contain a nonzero page-table physical base."
                     .to_string(),
             };
@@ -2393,6 +2761,7 @@ impl DebuggerSession {
                         root_physical_address: Some(root_physical_address),
                         entries,
                         final_mapping: None,
+                        provenance: provenance.clone(),
                         detail: format!(
                             "DbgEng could not read the {level} physical entry at 0x{entry_physical_address:X}: {error}"
                         ),
@@ -2411,6 +2780,7 @@ impl DebuggerSession {
                     root_physical_address: Some(root_physical_address),
                     entries,
                     final_mapping: None,
+                    provenance: provenance.clone(),
                     detail: format!("The captured {level} is not present. This is post-bugcheck snapshot evidence and does not establish an earlier transition."),
                 };
             }
@@ -2435,6 +2805,7 @@ impl DebuggerSession {
                         page_size,
                         page_size_name: if is_pdpt { "1_gib" } else { "2_mib" }.to_string(),
                     }),
+                    provenance: provenance.clone(),
                     detail: "The walker reached a present large-page mapping. Entries are preserved post-bugcheck state, not proof of the permission or lifetime state at the earlier fault instant.".to_string(),
                 };
             }
@@ -2454,6 +2825,7 @@ impl DebuggerSession {
                         page_size: 4096,
                         page_size_name: "4_kib".to_string(),
                     }),
+                    provenance: provenance.clone(),
                     detail: "The walker reached a present 4 KiB mapping. Entries are preserved post-bugcheck state, not proof of the permission or lifetime state at the earlier fault instant.".to_string(),
                 };
             }
@@ -2468,6 +2840,7 @@ impl DebuggerSession {
                     root_physical_address: Some(root_physical_address),
                     entries,
                     final_mapping: None,
+                    provenance,
                     detail: format!("The present {level} has a zero next-table physical base."),
                 };
             }
@@ -4653,8 +5026,53 @@ mod tests {
     #[test]
     fn x64_context_prefix_matches_the_documented_register_offset() {
         assert_eq!(std::mem::size_of::<X64ContextPrefix>(), 0x100);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, context_flags), 0x30);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, seg_cs), 0x38);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, seg_ss), 0x42);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, eflags), 0x44);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, rsp), 0x98);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, r8), 0xb8);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, r14), 0xe8);
+        assert_eq!(std::mem::offset_of!(X64ContextPrefix, rip), 0xf8);
         assert_eq!(X64_CONTEXT_SIZE, 0x4D0);
         assert_eq!(CONTEXT_X64_REQUIRED_REGISTER_FLAGS, 0x0010_0003);
+    }
+
+    #[test]
+    fn validates_serialized_amd64_context_offsets_independently() {
+        let mut bytes = vec![0u8; X64_CONTEXT_SIZE as usize];
+        bytes[0x30..0x34].copy_from_slice(&0x0010_001f_u32.to_le_bytes());
+        bytes[0x38..0x3a].copy_from_slice(&0x10_u16.to_le_bytes());
+        bytes[0x42..0x44].copy_from_slice(&0x18_u16.to_le_bytes());
+        bytes[0x44..0x48].copy_from_slice(&0x202_u32.to_le_bytes());
+        bytes[0x98..0xa0].copy_from_slice(&0xffff_f800_0000_1000_u64.to_le_bytes());
+        bytes[0xb8..0xc0].copy_from_slice(&0xffff_8581_bd06_8cf0_u64.to_le_bytes());
+        bytes[0xe8..0xf0].copy_from_slice(&0x20_u64.to_le_bytes());
+        bytes[0xf8..0x100].copy_from_slice(&0xffff_f800_e439_70b0_u64.to_le_bytes());
+
+        let context = x64_context_prefix_from_bytes(&bytes).unwrap();
+        let validation = x64_context_validation(&context, &bytes, Some((0, 48)));
+
+        assert_eq!(context.r8, 0xffff_8581_bd06_8cf0);
+        assert_eq!(context.r14, 0x20);
+        assert_eq!(context.rip, 0xffff_f800_e439_70b0);
+        assert!(validation.raw_layout_offset_cross_check);
+        assert!(validation.amd64_flag_present);
+        assert!(validation.control_register_group_present);
+        assert!(validation.integer_register_group_present);
+        assert!(validation.cs_nonzero);
+        assert!(validation.ss_nonzero);
+        assert!(validation.eflags_reserved_bit_1_set);
+        assert_eq!(validation.rsp_mod_16, 0);
+        assert_eq!(
+            validation.rip_canonical_for_selected_address_width,
+            Some(true)
+        );
+        assert_eq!(
+            validation.rsp_canonical_for_selected_address_width,
+            Some(true)
+        );
+        assert!(!validation.control_registers_in_amd64_context);
     }
 
     #[test]
@@ -4953,13 +5371,59 @@ mod tests {
             page_size: 4096,
             page_size_name: "4_kib".to_string(),
         });
+        let offsets = VirtualTranslationPhysicalOffsets {
+            status: "captured".to_string(),
+            reported_level_count: Some(4),
+            physical_offsets: vec![0x1000, 0x2000, 0x3000, 0x1234_5000],
+            last_physical_offset: Some(0x1234_5000),
+            final_physical_address: Some(0x1234_5000),
+            final_physical_address_validation: "test".to_string(),
+            detail: "test".to_string(),
+        };
 
-        let matched = virtual_address_translation_cross_check(Some(0x1234_5000), &walk);
+        let matched = virtual_address_translation_cross_check(Some(0x1234_5000), &offsets, &walk);
         assert_eq!(matched.status, "matched");
-        assert_eq!(matched.matches, Some(true));
+        assert_eq!(
+            matched.virtual_to_physical_matches_page_table_walk,
+            Some(true)
+        );
+        assert_eq!(
+            matched.translation_physical_offsets_matches_page_table_walk,
+            Some(true)
+        );
 
-        let mismatched = virtual_address_translation_cross_check(Some(0x1234_6000), &walk);
+        let mismatched =
+            virtual_address_translation_cross_check(Some(0x1234_6000), &offsets, &walk);
         assert_eq!(mismatched.status, "mismatch");
-        assert_eq!(mismatched.matches, Some(false));
+        assert_eq!(
+            mismatched.virtual_to_physical_matches_page_table_walk,
+            Some(false)
+        );
+        assert_eq!(
+            mismatched.virtual_to_physical_matches_translation_physical_offsets,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn does_not_promote_an_unvalidated_translation_hierarchy_offset() {
+        let walk = unavailable_x64_page_table_walk(0xffff_ffff_ffff_ffff, "test".to_string());
+        let mut offsets = VirtualTranslationPhysicalOffsets {
+            status: "captured".to_string(),
+            reported_level_count: Some(5),
+            physical_offsets: vec![0x1000, 0x1ff8, 0x2ff8, 0x3ff8, 0x4ff8],
+            last_physical_offset: Some(0x4ff8),
+            final_physical_address: None,
+            final_physical_address_validation: "unvalidated_raw_hierarchy_offset".to_string(),
+            detail: "test".to_string(),
+        };
+
+        validate_translation_physical_offsets(&mut offsets, None, &walk);
+
+        assert_eq!(offsets.final_physical_address, None);
+        assert_eq!(
+            offsets.final_physical_address_validation,
+            "unvalidated_raw_hierarchy_offset"
+        );
     }
 }
