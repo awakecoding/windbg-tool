@@ -18,7 +18,7 @@ use windbg_dbgeng::{
     write_process_dump, BreakpointInfo, DebuggerOutputCaptureOptions, DebuggerSession, DumpKind,
     DumpOpenOptions, DumpWriteOptions, LiveInitialStop, LiveLaunchEnd, LiveLaunchOptions,
     LiveLaunchSessionOptions, ManagedCodeAvailability, ModuleInfo, ProcessDumpOptions,
-    ProcessServerOptions,
+    ProcessServerOptions, MAX_BOUNDED_MODULE_ENUMERATION, MAX_MODULE_PARAMETER_QUERIES,
 };
 use windbg_install::WindbgManager;
 use windbg_symbols::{
@@ -4574,7 +4574,7 @@ pub(super) fn run_dump_cohort(args: DumpCohortArgs, output: &OutputOptions) -> a
         .count();
     print_value(
         json!({
-            "schema": "windbg-tool.dump-cohort.v1",
+            "schema": "windbg-tool.dump-cohort.v2",
             "status": if analyzed == 0 { "unavailable" } else { "captured" },
             "offline_requested": args.offline,
             "symbol_server_used": false,
@@ -4584,19 +4584,25 @@ pub(super) fn run_dump_cohort(args: DumpCohortArgs, output: &OutputOptions) -> a
             "missing_dump_count": missing,
             "entries": entries,
             "recurrence": dump_cohort_recurrence(&entries, analyzed),
+            "driver_filter_lifecycle": dump_cohort_driver_filter_lifecycle(&entries, analyzed),
             "bounds": {
                 "per_dump": [
                     "one DbgEng dump open",
                     "one ReadBugCheckData query",
                     "one documented target-exception request group",
                     "one current stack limited by max_frames",
-                    "at most one fault-address module/parameter/disassembly probe"
+                    "at most one fault-address module/parameter/disassembly probe",
+                    "one loaded-module enumeration capped at 512 entries",
+                    "module-parameter requests in batches of at most 128 bases"
                 ],
                 "whole_dump_scan": false,
-                "loaded_module_enumeration": false,
+                "loaded_module_enumeration": {
+                    "status": "bounded",
+                    "limit": MAX_BOUNDED_MODULE_ENUMERATION
+                },
                 "raw_command_execution": false
             },
-            "detail": "Cohort matches compare only values actually returned for each dump. Missing symbols, missing contexts, and missing files remain unavailable; module load presence is not collected or interpreted as driver involvement.",
+            "detail": "Cohort matches compare only values actually returned for each dump. Module load presence is kept separate from validated stack participation and direct kernel attribution; it is never treated as driver involvement by itself.",
             "telemetry": {
                 "elapsed_ms": started.elapsed().as_millis() as u64
             }
@@ -4664,6 +4670,15 @@ fn dump_cohort_entry(path: &Path, max_frames: u32) -> Value {
     let heuristic_context =
         dump_exception_context(&session, &target, bugcheck.data.as_ref(), max_frames);
     let context_shape = dump_cohort_context_shape(&direct_exception, &heuristic_context);
+    let module_inventory = dump_cohort_module_inventory(&session);
+    let driver_filter_evidence = json!({
+        "bugcheck_driver": dump_bugcheck_driver(&session),
+        "driver_verifier": dump_driver_verifier_snapshot(),
+        "filter_stack": {
+            "status": "unsupported",
+            "detail": "The documented DbgEng dump APIs do not expose a bounded public FLTMGR frame, instance, or current-I/O traversal. Loaded FLTMGR or filter modules are recorded as load metadata only."
+        }
+    });
     json!({
         "path": path,
         "status": "captured",
@@ -4674,11 +4689,78 @@ fn dump_cohort_entry(path: &Path, max_frames: u32) -> Value {
         "target_exception": direct_exception,
         "context_shape": context_shape,
         "validated_stack_module_families": dump_cohort_stack_module_families(&stack),
+        "module_inventory": module_inventory,
+        "driver_filter_evidence": driver_filter_evidence,
         "stack": stack,
         "telemetry": {
             "dump_open_and_bounded_probe_elapsed_ms": opened.elapsed().as_millis() as u64
         },
         "detail": "Only one current stack and at most one fault-address probe were collected. The current stack is included only as a saved snapshot; its modules are not historical causality evidence."
+    })
+}
+
+fn dump_cohort_module_inventory(session: &DebuggerSession) -> Value {
+    let modules = match session.modules_bounded(MAX_BOUNDED_MODULE_ENUMERATION) {
+        Ok(modules) => modules,
+        Err(error) => {
+            return json!({
+                "status": "unavailable",
+                "limit": MAX_BOUNDED_MODULE_ENUMERATION,
+                "detail": format!("DbgEng could not enumerate the bounded loaded-module set: {error}")
+            });
+        }
+    };
+    let mut parameters_by_base = BTreeMap::new();
+    for bases in modules
+        .iter()
+        .map(|module| module.base_address)
+        .collect::<Vec<_>>()
+        .chunks(MAX_MODULE_PARAMETER_QUERIES)
+    {
+        match session.module_parameters(bases) {
+            Ok(parameters) => {
+                for parameter in parameters {
+                    parameters_by_base.insert(parameter.base_address, parameter);
+                }
+            }
+            Err(error) => {
+                return json!({
+                    "status": "partial",
+                    "limit": MAX_BOUNDED_MODULE_ENUMERATION,
+                    "module_count": modules.len(),
+                    "detail": format!("DbgEng enumerated module names but could not retrieve a bounded module-parameter batch: {error}")
+                });
+            }
+        }
+    }
+    let identities = modules
+        .iter()
+        .map(|module| {
+            let parameters = parameters_by_base.get(&module.base_address);
+            json!({
+                "identity": {
+                    "module_name": module.module_name,
+                    "image_size": parameters.map(|parameter| parameter.image_size),
+                    "time_date_stamp": parameters.map(|parameter| parameter.time_date_stamp),
+                    "checksum": parameters.map(|parameter| parameter.checksum),
+                },
+                "base_address": module.base_address,
+                "image_name": module.image_name,
+                "loaded_image_name": module.loaded_image_name,
+                "symbol_file": module.symbol_file,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "status": "captured",
+        "limit": MAX_BOUNDED_MODULE_ENUMERATION,
+        "module_count": modules.len(),
+        "modules": identities,
+        "version_metadata": {
+            "status": "unavailable",
+            "detail": "DbgEng's documented module parameters provide dump-supplied image size, PE TimeDateStamp, and checksum. They do not provide an Authenticode result or file-version resource for the loaded image."
+        },
+        "detail": "This is a bounded loaded-image snapshot. Module identities are compared separately from validated stack frames and direct bugcheck attribution."
     })
 }
 
@@ -4778,6 +4860,72 @@ fn dump_cohort_recurrence(entries: &[Value], analyzed: usize) -> Value {
             Some(json!({"provenance": provenance, "effective_address": effective}))
         }),
         "detail": "A recurrence value is reported only when the same non-null value was returned for every analyzed dump. Unavailable values reduce the observed count and never become a match."
+    })
+}
+
+fn dump_cohort_driver_filter_lifecycle(entries: &[Value], analyzed: usize) -> Value {
+    json!({
+        "loaded_module_identities": cohort_common_array_values(entries, analyzed, |entry| {
+            entry.pointer("/module_inventory/modules").and_then(Value::as_array).map(|modules| {
+                modules.iter().filter_map(|module| module.get("identity").cloned()).collect()
+            })
+        }),
+        "validated_stack_participation": cohort_common_array_values(entries, analyzed, |entry| {
+            entry.pointer("/validated_stack_module_families/families")
+                .and_then(Value::as_array)
+                .cloned()
+        }),
+        "direct_bugcheck_driver": cohort_common_values(entries, analyzed, |entry| {
+            let driver = entry.pointer("/driver_filter_evidence/bugcheck_driver")?;
+            matches!(driver["status"].as_str(), Some("captured" | "not_set")).then(|| {
+                json!({
+                    "status": driver["status"],
+                    "driver_name": driver["driver_name"],
+                })
+            })
+        }),
+        "driver_verifier": {
+            "status": "unsupported",
+            "detail": "No documented DbgEng dump API exposes a reliable Driver Verifier configuration, counters, or verified-driver list for these offline captures."
+        },
+        "filter_stack": {
+            "status": "unsupported",
+            "detail": "No documented DbgEng dump API exposes a bounded public filter-instance or current-I/O traversal. Loaded filter modules are not presented as filter-stack participation."
+        },
+        "detail": "Always-loaded is an image-identity intersection only. It does not imply execution, stack participation, verification, signature validity, or causation. Validated stack participation and direct KiBugCheckDriver attribution are reported independently."
+    })
+}
+
+fn cohort_common_array_values<F>(entries: &[Value], analyzed: usize, values: F) -> Value
+where
+    F: Fn(&Value) -> Option<Vec<Value>>,
+{
+    let observed = entries
+        .iter()
+        .filter(|entry| entry["status"].as_str() == Some("captured"))
+        .filter_map(values)
+        .map(|values| {
+            values
+                .into_iter()
+                .filter_map(|value| serde_json::to_string(&value).ok().map(|key| (key, value)))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .collect::<Vec<_>>();
+    let observed_dump_count = observed.len();
+    let common = observed
+        .iter()
+        .cloned()
+        .reduce(|mut intersection, values| {
+            intersection.retain(|key, _| values.contains_key(key));
+            intersection
+        })
+        .map(|values| values.into_values().collect::<Vec<_>>())
+        .unwrap_or_default();
+    json!({
+        "status": if observed_dump_count == analyzed && analyzed > 0 { "captured" } else if observed_dump_count == 0 { "unavailable" } else { "partial" },
+        "analyzed_dump_count": analyzed,
+        "observed_dump_count": observed_dump_count,
+        "identities_or_modules_present_in_every_observed_dump": common,
     })
 }
 
@@ -8136,6 +8284,51 @@ mod tests {
             Some("f04b0fc12c06")
         );
         assert_eq!(cohort_instruction_bytes("nt!Foo"), None);
+    }
+
+    #[test]
+    fn cohort_module_lifecycle_keeps_loads_distinct_from_stack_and_attribution() {
+        let entries = vec![
+            json!({
+                "status": "captured",
+                "module_inventory": {
+                    "modules": [
+                        {"identity": {"module_name": "nt", "image_size": 1, "time_date_stamp": 2, "checksum": 3}},
+                        {"identity": {"module_name": "loaded_only", "image_size": 4, "time_date_stamp": 5, "checksum": 6}}
+                    ]
+                },
+                "validated_stack_module_families": {"families": ["nt"]},
+                "driver_filter_evidence": {"bugcheck_driver": {"status": "not_set"}}
+            }),
+            json!({
+                "status": "captured",
+                "module_inventory": {
+                    "modules": [
+                        {"identity": {"module_name": "nt", "image_size": 1, "time_date_stamp": 2, "checksum": 3}}
+                    ]
+                },
+                "validated_stack_module_families": {"families": ["nt", "other"]},
+                "driver_filter_evidence": {"bugcheck_driver": {"status": "captured", "driver_name": "other.sys"}}
+            }),
+        ];
+
+        let lifecycle = dump_cohort_driver_filter_lifecycle(&entries, 2);
+
+        assert_eq!(lifecycle["loaded_module_identities"]["status"], "captured");
+        assert_eq!(
+            lifecycle["loaded_module_identities"]
+                ["identities_or_modules_present_in_every_observed_dump"],
+            json!([{"module_name": "nt", "image_size": 1, "time_date_stamp": 2, "checksum": 3}])
+        );
+        assert_eq!(
+            lifecycle["validated_stack_participation"]
+                ["identities_or_modules_present_in_every_observed_dump"],
+            json!(["nt"])
+        );
+        assert_eq!(
+            lifecycle["direct_bugcheck_driver"]["status"],
+            "not_consistently_observed"
+        );
     }
 
     #[test]

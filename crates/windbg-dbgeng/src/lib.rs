@@ -28,6 +28,7 @@ pub const DBGENG_RUNTIME_DIR_ENV: &str = "WINDBG_DBGENG_RUNTIME_DIR";
 pub const MAX_VIRTUAL_MEMORY_MAP_REGIONS: u32 = 4096;
 pub const MAX_THREAD_ACCOUNTING_THREADS: u32 = 128;
 pub const MAX_MODULE_PARAMETER_QUERIES: usize = 128;
+pub const MAX_BOUNDED_MODULE_ENUMERATION: u32 = 512;
 pub const MAX_SYMBOL_ENTRY_OFFSET_REGIONS: usize = 16;
 const DEFAULT_DBGENG_SYMBOL_CACHE: &str = ".windbg-symbol-cache";
 const DBGENG_DLL_NAME: &str = "dbgeng.dll";
@@ -2718,6 +2719,27 @@ impl DebuggerSession {
         unsafe {
             self.symbols.GetNumberModules(&mut loaded, &mut unloaded)?;
         }
+        self.modules_by_loaded_count(loaded)
+    }
+
+    pub fn modules_bounded(&self, max_modules: u32) -> anyhow::Result<Vec<ModuleInfo>> {
+        ensure!(
+            max_modules > 0 && max_modules <= MAX_BOUNDED_MODULE_ENUMERATION,
+            "DbgEng bounded module enumeration limit must be from one through {MAX_BOUNDED_MODULE_ENUMERATION}"
+        );
+        let mut loaded = 0u32;
+        let mut unloaded = 0u32;
+        unsafe {
+            self.symbols.GetNumberModules(&mut loaded, &mut unloaded)?;
+        }
+        ensure!(
+            loaded <= max_modules,
+            "DbgEng target exposes {loaded} loaded modules, exceeding the bounded enumeration limit of {max_modules}"
+        );
+        self.modules_by_loaded_count(loaded)
+    }
+
+    fn modules_by_loaded_count(&self, loaded: u32) -> anyhow::Result<Vec<ModuleInfo>> {
         let mut modules = Vec::with_capacity(loaded as usize);
         for index in 0..loaded {
             let base_address = unsafe { self.symbols.GetModuleByIndex(index)? };
@@ -3620,6 +3642,10 @@ impl DebuggerSession {
     }
 
     pub fn modules(&self) -> anyhow::Result<Vec<ModuleInfo>> {
+        anyhow::bail!("DbgEng sessions are only supported on Windows")
+    }
+
+    pub fn modules_bounded(&self, _max_modules: u32) -> anyhow::Result<Vec<ModuleInfo>> {
         anyhow::bail!("DbgEng sessions are only supported on Windows")
     }
 
