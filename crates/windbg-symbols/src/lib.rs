@@ -18,6 +18,12 @@ const MAX_IMAGE_DOWNLOAD_BYTES: u64 = 256 * 1024 * 1024;
 const IMAGE_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(60);
 const IMAGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECTS: usize = 5;
+const MAX_PDB_VALIDATION_BYTES: u64 = 256 * 1024 * 1024;
+const MSF7_SIGNATURE: &[u8; 32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\0\0\0";
+const MSF7_BLOCK_SIZE_OFFSET: usize = 32;
+const MSF7_BLOCK_COUNT_OFFSET: usize = 40;
+const MSF7_DIRECTORY_SIZE_OFFSET: usize = 44;
+const MSF7_BLOCK_MAP_OFFSET: usize = 52;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct CodeViewIdentity {
@@ -166,6 +172,8 @@ pub enum NativeSymbolStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PdbIdentityValidation {
+    Validated,
+    Mismatch,
     Unverified,
     NotAvailable,
 }
@@ -176,19 +184,13 @@ pub struct NativeSymbolResult {
     pub identity: PeIdentity,
     pub cache_dir: PathBuf,
     pub pdb_path: Option<PathBuf>,
+    pub pdb_identity_validation: PdbIdentityValidation,
     pub detail: String,
 }
 
 impl NativeSymbolResult {
     pub fn pdb_identity_validation(&self) -> PdbIdentityValidation {
-        match self.status {
-            NativeSymbolStatus::Cached | NativeSymbolStatus::Downloaded => {
-                PdbIdentityValidation::Unverified
-            }
-            NativeSymbolStatus::OfflineMissing | NativeSymbolStatus::Unavailable => {
-                PdbIdentityValidation::NotAvailable
-            }
-        }
+        self.pdb_identity_validation
     }
 }
 
@@ -264,11 +266,7 @@ pub fn prefetch_pdb(
     let identity = inspect_pe_identity(image_path)?;
     let expected_path = cache_dir.join(&identity.codeview.pdb_store_path);
     if expected_path.is_file() {
-        return Ok(unverified_cached_pdb_result(
-            identity,
-            cache_dir,
-            expected_path,
-        ));
+        return cached_pdb_result(identity, cache_dir, expected_path);
     }
     if offline {
         return Ok(NativeSymbolResult {
@@ -276,43 +274,219 @@ pub fn prefetch_pdb(
             identity,
             cache_dir: cache_dir.to_path_buf(),
             pdb_path: None,
+            pdb_identity_validation: PdbIdentityValidation::NotAvailable,
             detail: "Offline mode prevented native symbol download and no PDB exists at the CodeView-derived cache path.".to_string(),
         });
     }
     let downloaded_path = download_pdb(&identity.codeview, cache_dir)?;
-    Ok(unverified_downloaded_pdb_result(
-        identity,
-        cache_dir,
-        downloaded_path,
-    ))
+    downloaded_pdb_result(identity, cache_dir, downloaded_path)
 }
 
-fn unverified_cached_pdb_result(
+fn cached_pdb_result(
     identity: PeIdentity,
     cache_dir: &Path,
     expected_path: PathBuf,
-) -> NativeSymbolResult {
-    NativeSymbolResult {
-        status: NativeSymbolStatus::Cached,
+) -> anyhow::Result<NativeSymbolResult> {
+    pdb_result(
+        NativeSymbolStatus::Cached,
         identity,
-        cache_dir: cache_dir.to_path_buf(),
-        pdb_path: Some(expected_path),
-        detail: "A PDB exists at the CodeView-derived cache path, but this tool has not parsed its MSF stream to validate the embedded GUID and age. It is not configured as a matching symbol file.".to_string(),
-    }
+        cache_dir,
+        expected_path,
+        "A PDB exists at the CodeView-derived cache path.",
+    )
 }
 
-fn unverified_downloaded_pdb_result(
+fn downloaded_pdb_result(
     identity: PeIdentity,
     cache_dir: &Path,
     downloaded_path: PathBuf,
-) -> NativeSymbolResult {
-    NativeSymbolResult {
-        status: NativeSymbolStatus::Downloaded,
+) -> anyhow::Result<NativeSymbolResult> {
+    pdb_result(
+        NativeSymbolStatus::Downloaded,
+        identity,
+        cache_dir,
+        downloaded_path,
+        "The PDB was downloaded from the CodeView-derived symbol-server path.",
+    )
+}
+
+fn pdb_result(
+    status: NativeSymbolStatus,
+    identity: PeIdentity,
+    cache_dir: &Path,
+    pdb_path: PathBuf,
+    source_detail: &str,
+) -> anyhow::Result<NativeSymbolResult> {
+    let pdb_identity_validation = validate_pdb_identity(&pdb_path, &identity.codeview)?;
+    let detail = match pdb_identity_validation {
+        PdbIdentityValidation::Validated => {
+            format!(
+                "{source_detail} Its MSF Info stream GUID and age match the PE CodeView record."
+            )
+        }
+        PdbIdentityValidation::Mismatch => format!(
+            "{source_detail} Its MSF Info stream GUID or age differs from the PE CodeView record."
+        ),
+        PdbIdentityValidation::Unverified | PdbIdentityValidation::NotAvailable => {
+            unreachable!("PDB identity validation either succeeds or returns a mismatch")
+        }
+    };
+    Ok(NativeSymbolResult {
+        status,
         identity,
         cache_dir: cache_dir.to_path_buf(),
-        pdb_path: Some(downloaded_path),
-        detail: "The PDB was downloaded from the CodeView-derived symbol-server path, but this tool has not parsed its MSF stream to validate the embedded GUID and age. It is not configured as a matching symbol file.".to_string(),
+        pdb_path: Some(pdb_path),
+        pdb_identity_validation,
+        detail,
+    })
+}
+
+fn validate_pdb_identity(
+    pdb_path: &Path,
+    expected: &CodeViewIdentity,
+) -> anyhow::Result<PdbIdentityValidation> {
+    let metadata = fs::metadata(pdb_path)
+        .with_context(|| format!("reading PDB metadata {}", pdb_path.display()))?;
+    ensure!(
+        metadata.len() <= MAX_PDB_VALIDATION_BYTES,
+        "PDB {} exceeds the {} MiB validation limit",
+        pdb_path.display(),
+        MAX_PDB_VALIDATION_BYTES / (1024 * 1024)
+    );
+    let bytes = fs::read(pdb_path)
+        .with_context(|| format!("reading PDB MSF stream {}", pdb_path.display()))?;
+    pdb_identity_validation_from_bytes(&bytes, expected)
+}
+
+fn pdb_identity_validation_from_bytes(
+    bytes: &[u8],
+    expected: &CodeViewIdentity,
+) -> anyhow::Result<PdbIdentityValidation> {
+    ensure!(
+        bytes.starts_with(MSF7_SIGNATURE),
+        "PDB does not use the supported MSF 7.0 container"
+    );
+    let block_size = read_u32(bytes, MSF7_BLOCK_SIZE_OFFSET)? as usize;
+    ensure!(
+        block_size.is_power_of_two() && (512..=65_536).contains(&block_size),
+        "PDB MSF block size {block_size} is outside the supported range"
+    );
+    let block_count = read_u32(bytes, MSF7_BLOCK_COUNT_OFFSET)? as usize;
+    let directory_size = read_u32(bytes, MSF7_DIRECTORY_SIZE_OFFSET)? as usize;
+    let block_map_block = read_u32(bytes, MSF7_BLOCK_MAP_OFFSET)? as usize;
+    ensure!(
+        directory_size <= bytes.len(),
+        "PDB MSF directory size exceeds the file size"
+    );
+    ensure!(
+        block_count
+            .checked_mul(block_size)
+            .is_some_and(|size| size <= bytes.len()),
+        "PDB MSF block count exceeds the file size"
+    );
+
+    let directory_block_count = directory_size.div_ceil(block_size);
+    let block_map_size = directory_block_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .context("PDB MSF directory block map size overflow")?;
+    let block_map_offset = block_map_block
+        .checked_mul(block_size)
+        .context("PDB MSF block map offset overflow")?;
+    let directory_blocks = read_u32_list(bytes, block_map_offset, block_map_size / 4)?;
+    let directory = read_msf_blocks(
+        bytes,
+        block_size,
+        block_count,
+        &directory_blocks,
+        directory_size,
+    )?;
+
+    let stream_count = read_u32(&directory, 0)? as usize;
+    let sizes_offset = 4usize;
+    let stream_sizes_bytes = stream_count
+        .checked_mul(std::mem::size_of::<u32>())
+        .context("PDB stream-size table overflow")?;
+    let stream_sizes = read_u32_list(&directory, sizes_offset, stream_sizes_bytes / 4)?;
+    ensure!(stream_count > 1, "PDB MSF has no Info stream");
+    let mut blocks_offset = sizes_offset + stream_sizes_bytes;
+    let mut info_blocks = None;
+    let mut info_size = None;
+    for (stream_index, size) in stream_sizes.into_iter().enumerate() {
+        if size == u32::MAX {
+            continue;
+        }
+        let stream_size = size as usize;
+        let stream_block_count = stream_size.div_ceil(block_size);
+        let stream_blocks = read_u32_list(&directory, blocks_offset, stream_block_count)?;
+        if stream_index == 1 {
+            info_blocks = Some(stream_blocks);
+            info_size = Some(stream_size);
+        }
+        blocks_offset = blocks_offset
+            .checked_add(
+                stream_block_count
+                    .checked_mul(std::mem::size_of::<u32>())
+                    .context("PDB stream block list overflow")?,
+            )
+            .context("PDB stream block offset overflow")?;
     }
+    let info = read_msf_blocks(
+        bytes,
+        block_size,
+        block_count,
+        &info_blocks.context("PDB MSF Info stream is missing")?,
+        info_size.context("PDB MSF Info stream size is missing")?,
+    )?;
+    ensure!(info.len() >= 28, "PDB MSF Info stream is truncated");
+    let age = read_u32(&info, 8)?;
+    let guid = pdb_guid_string(&info[12..28]);
+    Ok(if guid == expected.pdb_guid && age == expected.pdb_age {
+        PdbIdentityValidation::Validated
+    } else {
+        PdbIdentityValidation::Mismatch
+    })
+}
+
+fn read_u32_list(bytes: &[u8], offset: usize, count: usize) -> anyhow::Result<Vec<u32>> {
+    let byte_count = count
+        .checked_mul(std::mem::size_of::<u32>())
+        .context("PDB u32 list size overflow")?;
+    read_bytes(bytes, offset, byte_count)?;
+    (0..count)
+        .map(|index| read_u32(bytes, offset + index * 4))
+        .collect()
+}
+
+fn read_msf_blocks(
+    bytes: &[u8],
+    block_size: usize,
+    block_count: usize,
+    blocks: &[u32],
+    requested_size: usize,
+) -> anyhow::Result<Vec<u8>> {
+    ensure!(
+        requested_size <= bytes.len(),
+        "PDB MSF stream size exceeds the file size"
+    );
+    let required_blocks = requested_size.div_ceil(block_size);
+    ensure!(
+        blocks.len() == required_blocks,
+        "PDB MSF block list does not cover the requested stream"
+    );
+    let mut result = Vec::with_capacity(requested_size);
+    for block in blocks {
+        let block = *block as usize;
+        ensure!(
+            block < block_count,
+            "PDB MSF block number is outside the file"
+        );
+        let offset = block
+            .checked_mul(block_size)
+            .context("PDB MSF block offset overflow")?;
+        let chunk_size = block_size.min(requested_size.saturating_sub(result.len()));
+        result.extend_from_slice(read_bytes(bytes, offset, chunk_size)?);
+    }
+    Ok(result)
 }
 
 fn download_pdb(identity: &CodeViewIdentity, cache_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -695,65 +869,38 @@ mod tests {
     }
 
     #[test]
-    fn cached_pdb_is_identity_unverified_until_its_msf_stream_is_parsed() {
-        let cache = test_directory();
-        let identity = PeIdentity {
-            image_name: "ntoskrnl.exe".to_string(),
-            image_timestamp: 0x4A63_AF4E,
-            image_size: 0x0145_0000,
-            image_store_key: "4A63AF4E1450000".to_string(),
-            image_store_path: "ntoskrnl.exe\\4A63AF4E1450000\\ntoskrnl.exe".to_string(),
-            codeview: CodeViewIdentity {
-                pdb_name: "ntkrnlmp.pdb".to_string(),
-                pdb_guid: "0123456789ABCDEF0123456789ABCDEF".to_string(),
-                pdb_age: 1,
-                pdb_store_key: "0123456789ABCDEF0123456789ABCDEF1".to_string(),
-                pdb_store_path: "ntkrnlmp.pdb\\0123456789ABCDEF0123456789ABCDEF1\\ntkrnlmp.pdb"
-                    .to_string(),
-            },
-        };
-        let cached_path = cache.join(&identity.codeview.pdb_store_path);
+    fn pdb_msf_info_stream_validates_guid_and_age() {
+        let guid = [
+            0x23, 0xBC, 0x24, 0x19, 0x09, 0x55, 0xF8, 0x19, 0x8B, 0x17, 0xA3, 0x84, 0xB9, 0x44,
+            0xB5, 0x43,
+        ];
+        let expected = test_codeview_identity(guid, 1);
 
-        let result = unverified_cached_pdb_result(identity, &cache, cached_path.clone());
+        let result = pdb_identity_validation_from_bytes(&test_msf7_pdb(guid, 1), &expected);
 
-        assert!(matches!(result.status, NativeSymbolStatus::Cached));
-        assert_eq!(
-            result.pdb_identity_validation(),
-            PdbIdentityValidation::Unverified
-        );
-        assert_eq!(result.pdb_path.as_deref(), Some(cached_path.as_path()));
-        assert!(result.detail.contains("not parsed"));
+        assert_eq!(result.unwrap(), PdbIdentityValidation::Validated);
     }
 
     #[test]
-    fn downloaded_pdb_is_identity_unverified_until_its_msf_stream_is_parsed() {
-        let cache = test_directory();
-        let identity = PeIdentity {
-            image_name: "ntoskrnl.exe".to_string(),
-            image_timestamp: 0x4A63_AF4E,
-            image_size: 0x0145_0000,
-            image_store_key: "4A63AF4E1450000".to_string(),
-            image_store_path: "ntoskrnl.exe\\4A63AF4E1450000\\ntoskrnl.exe".to_string(),
-            codeview: CodeViewIdentity {
-                pdb_name: "ntkrnlmp.pdb".to_string(),
-                pdb_guid: "0123456789ABCDEF0123456789ABCDEF".to_string(),
-                pdb_age: 1,
-                pdb_store_key: "0123456789ABCDEF0123456789ABCDEF1".to_string(),
-                pdb_store_path: "ntkrnlmp.pdb\\0123456789ABCDEF0123456789ABCDEF1\\ntkrnlmp.pdb"
-                    .to_string(),
-            },
-        };
-        let downloaded_path = cache.join(&identity.codeview.pdb_store_path);
+    fn pdb_msf_info_stream_rejects_age_mismatch() {
+        let guid = [
+            0x23, 0xBC, 0x24, 0x19, 0x09, 0x55, 0xF8, 0x19, 0x8B, 0x17, 0xA3, 0x84, 0xB9, 0x44,
+            0xB5, 0x43,
+        ];
+        let expected = test_codeview_identity(guid, 1);
 
-        let result = unverified_downloaded_pdb_result(identity, &cache, downloaded_path.clone());
+        let result = pdb_identity_validation_from_bytes(&test_msf7_pdb(guid, 6), &expected);
 
-        assert!(matches!(result.status, NativeSymbolStatus::Downloaded));
-        assert_eq!(
-            result.pdb_identity_validation(),
-            PdbIdentityValidation::Unverified
-        );
-        assert_eq!(result.pdb_path.as_deref(), Some(downloaded_path.as_path()));
-        assert!(result.detail.contains("not parsed"));
+        assert_eq!(result.unwrap(), PdbIdentityValidation::Mismatch);
+    }
+
+    #[test]
+    fn pdb_msf_info_stream_rejects_invalid_container() {
+        let expected = test_codeview_identity([0; 16], 1);
+
+        let result = pdb_identity_validation_from_bytes(&[0; 56], &expected);
+
+        assert!(result.is_err());
     }
 
     fn test_pe_header(timestamp: u32, image_size: u32) -> Vec<u8> {
@@ -765,6 +912,44 @@ mod tests {
         let optional = file_header + 20;
         bytes[optional..optional + 2].copy_from_slice(&OPTIONAL_HEADER_PE32_PLUS.to_le_bytes());
         bytes[optional + 56..optional + 60].copy_from_slice(&image_size.to_le_bytes());
+        bytes
+    }
+
+    fn test_codeview_identity(guid: [u8; 16], age: u32) -> CodeViewIdentity {
+        let pdb_guid = pdb_guid_string(&guid);
+        CodeViewIdentity {
+            pdb_name: "ntkrnlmp.pdb".to_string(),
+            pdb_store_key: format!("{pdb_guid}{age:X}"),
+            pdb_store_path: format!("ntkrnlmp.pdb\\{pdb_guid}{age:X}\\ntkrnlmp.pdb"),
+            pdb_guid,
+            pdb_age: age,
+        }
+    }
+
+    fn test_msf7_pdb(guid: [u8; 16], age: u32) -> Vec<u8> {
+        const BLOCK_SIZE: usize = 512;
+        let mut bytes = vec![0u8; BLOCK_SIZE * 4];
+        bytes[..MSF7_SIGNATURE.len()].copy_from_slice(MSF7_SIGNATURE);
+        bytes[MSF7_BLOCK_SIZE_OFFSET..MSF7_BLOCK_SIZE_OFFSET + 4]
+            .copy_from_slice(&(BLOCK_SIZE as u32).to_le_bytes());
+        bytes[MSF7_BLOCK_COUNT_OFFSET..MSF7_BLOCK_COUNT_OFFSET + 4]
+            .copy_from_slice(&(4u32).to_le_bytes());
+        bytes[MSF7_DIRECTORY_SIZE_OFFSET..MSF7_DIRECTORY_SIZE_OFFSET + 4]
+            .copy_from_slice(&(20u32).to_le_bytes());
+        bytes[MSF7_BLOCK_MAP_OFFSET..MSF7_BLOCK_MAP_OFFSET + 4]
+            .copy_from_slice(&(1u32).to_le_bytes());
+        bytes[BLOCK_SIZE..BLOCK_SIZE + 4].copy_from_slice(&(2u32).to_le_bytes());
+
+        let directory = BLOCK_SIZE * 2;
+        bytes[directory..directory + 4].copy_from_slice(&(2u32).to_le_bytes());
+        bytes[directory + 4..directory + 8].copy_from_slice(&(0u32).to_le_bytes());
+        bytes[directory + 8..directory + 12].copy_from_slice(&(28u32).to_le_bytes());
+        bytes[directory + 12..directory + 16].copy_from_slice(&(3u32).to_le_bytes());
+
+        let info = BLOCK_SIZE * 3;
+        bytes[info..info + 4].copy_from_slice(&(20000404u32).to_le_bytes());
+        bytes[info + 8..info + 12].copy_from_slice(&age.to_le_bytes());
+        bytes[info + 12..info + 28].copy_from_slice(&guid);
         bytes
     }
 

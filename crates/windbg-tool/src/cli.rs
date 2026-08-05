@@ -1286,6 +1286,12 @@ struct DumpInspectArgs {
     refresh_symbols: bool,
     #[arg(
         long,
+        requires = "refresh_symbols",
+        help = "Permit DbgEng to attempt a cached PDB whose MSF GUID or age does not match the PE CodeView record; output remains explicitly unvalidated"
+    )]
+    allow_pdb_identity_mismatch: bool,
+    #[arg(
+        long,
         value_name = "PATH",
         default_value = ".windbg-symbol-cache",
         help = "Rust-native symbol cache; DbgEng never treats this as an srv* path"

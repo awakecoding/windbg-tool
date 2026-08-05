@@ -5115,6 +5115,7 @@ pub(super) fn run_dump_inspect(
         &args.symbol_cache,
         &args.image_path,
         args.offline,
+        args.allow_pdb_identity_mismatch,
     );
     let symbols_elapsed_ms = symbols_started.elapsed().as_millis() as u64;
     let threads_started = Instant::now();
@@ -5206,6 +5207,7 @@ fn prepare_dump_native_symbols(
     cache_dir: &Path,
     extra_image_paths: &[PathBuf],
     offline: bool,
+    allow_pdb_identity_mismatch: bool,
 ) -> Value {
     let fault_address = bugcheck
         .data
@@ -5382,16 +5384,24 @@ fn prepare_dump_native_symbols(
             });
         }
     };
-    if prefetch.pdb_identity_validation() == PdbIdentityValidation::Unverified {
+    let pdb_identity_validation = prefetch.pdb_identity_validation();
+    let mismatch_override =
+        pdb_identity_validation == PdbIdentityValidation::Mismatch && allow_pdb_identity_mismatch;
+    if pdb_identity_validation != PdbIdentityValidation::Validated && !mismatch_override {
         return json!({
-            "status": "pdb_identity_unverified",
+            "status": match pdb_identity_validation {
+                PdbIdentityValidation::Mismatch => "pdb_identity_mismatch",
+                PdbIdentityValidation::Unverified => "pdb_identity_unverified",
+                PdbIdentityValidation::NotAvailable => "pdb_identity_not_available",
+                PdbIdentityValidation::Validated => unreachable!("validated PDB reaches the configuration path"),
+            },
             "module": module,
             "image_path": image_path,
             "image_prefetch": image_prefetch,
             "prefetch": prefetch,
-            "pdb_identity_validation": "unverified",
+            "pdb_identity_validation": pdb_identity_validation,
             "offline": offline,
-            "detail": "A PDB was available at the CodeView-derived symbol-server path, but its embedded GUID and age were not validated. It was not configured for symbol resolution."
+            "detail": "The cached PDB was not configured for symbol resolution because its identity did not match the PE CodeView record. Pass --allow-pdb-identity-mismatch together with --refresh-symbols only to record DbgEng's bounded load attempt as explicitly unvalidated output."
         });
     }
     let Some(pdb_path) = prefetch.pdb_path.as_ref() else {
@@ -5423,12 +5433,13 @@ fn prepare_dump_native_symbols(
         .as_ref()
         .ok()
         .and_then(|()| session.symbol_by_offset(fault_address).ok().flatten());
-    let pdb_identity_validation = prefetch.pdb_identity_validation();
     json!({
-        "status": match prefetch.status {
-            NativeSymbolStatus::Cached | NativeSymbolStatus::Downloaded => "pdb_identity_unverified",
-            NativeSymbolStatus::OfflineMissing => "offline_missing",
-            NativeSymbolStatus::Unavailable => "unavailable",
+        "status": match (prefetch.status.clone(), pdb_identity_validation) {
+            (NativeSymbolStatus::Cached | NativeSymbolStatus::Downloaded, PdbIdentityValidation::Validated) => "pdb_identity_validated",
+            (NativeSymbolStatus::Cached | NativeSymbolStatus::Downloaded, PdbIdentityValidation::Mismatch) => "pdb_identity_mismatch_override",
+            (NativeSymbolStatus::OfflineMissing, _) => "offline_missing",
+            (NativeSymbolStatus::Unavailable, _) => "unavailable",
+            _ => "unavailable",
         },
         "module": module,
         "module_parameters": parameters,
@@ -5437,11 +5448,17 @@ fn prepare_dump_native_symbols(
         "pdb_directory": pdb_directory,
         "prefetch": prefetch,
         "pdb_identity_validation": pdb_identity_validation,
+        "pdb_identity_mismatch_override": mismatch_override,
         "forced_reload": match reload {
             Ok(()) => json!({"status": "loaded"}),
             Err(error) => json!({"status": "failed", "detail": format!("{error:#}")}),
         },
         "resolved_fault_symbol": resolved_symbol,
+        "resolved_fault_symbol_provenance": if mismatch_override {
+            "dbgeng_local_pdb_identity_mismatch_override"
+        } else {
+            "dbgeng_local_pdb_identity_validated"
+        },
         "offline": offline,
     })
 }
