@@ -5557,11 +5557,18 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         &pool_tracker,
         input.target_exception,
     );
+    let fault_context_provenance = dump_fault_context_provenance(
+        input.bugcheck,
+        &exception_context,
+        input.target_exception,
+        &fault_mechanics,
+    );
     let context_candidate_mapping = if debugger_thread_preserved {
-        dump_context_candidate_mapping_audit(session, &fault_mechanics)
+        dump_context_candidate_mapping_audit(session, &fault_mechanics, &fault_context_provenance)
     } else {
         json!({
             "status": "unavailable_current_thread_not_preserved",
+            "fault_time_context_status": fault_context_provenance["fault_time_context"]["status"],
             "detail": "No CR3-dependent candidate mapping probe ran because the bounded processor snapshot did not restore DbgEng's original current thread."
         })
     };
@@ -5598,6 +5605,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "exception_context": exception_context,
         "structural_parameter_context": structural_parameter_context,
         "fault_mechanics": fault_mechanics,
+        "fault_context_provenance": fault_context_provenance,
         "context_candidate_mapping": context_candidate_mapping,
         "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
@@ -5680,6 +5688,17 @@ fn dump_evidence_synthesis(
                 "status": context_candidate_mapping["status"],
                 "source_pointer": "/triage/context_candidate_mapping",
                 "detail": "P3/P4 structural candidates are mapped independently and remain candidate snapshot evidence. A present R/W leaf does not prove the candidate was the fault operand or preserve the fault-time PTE state."
+            },
+            {
+                "category": "fault_time_context_provenance",
+                "provenance": if context_candidate_mapping["fault_time_context_status"] == "fault_time" {
+                    "direct-context"
+                } else {
+                    "unavailable"
+                },
+                "status": context_candidate_mapping["fault_time_context_status"],
+                "source_pointer": "/triage/fault_context_provenance",
+                "detail": "A CONTEXT is promoted to fault-time evidence only after a documented or exact structural linkage, AMD64 validation, RIP/P2 agreement, and register-operand/access-target agreement. Derived unwind contexts and bounded P3/P4 compatibility parses cannot satisfy the linkage requirement."
             },
             {
                 "category": "allocation_provenance",
@@ -6329,6 +6348,216 @@ fn dump_fault_mechanics_audit(
     })
 }
 
+fn fault_time_context_status(
+    context_available: bool,
+    documented_or_exact_link: bool,
+    amd64_validation_passes: bool,
+    rip_matches_fault_instruction: bool,
+    operand_matches_access_target: bool,
+) -> &'static str {
+    if !context_available {
+        "unavailable"
+    } else if documented_or_exact_link
+        && amd64_validation_passes
+        && rip_matches_fault_instruction
+        && operand_matches_access_target
+    {
+        "fault_time"
+    } else {
+        "ambiguous"
+    }
+}
+
+fn dump_fault_context_provenance(
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    exception_context: &Option<Value>,
+    target_exception: &Value,
+    fault_mechanics: &Value,
+) -> Value {
+    let bugcheck_data = bugcheck.data.as_ref();
+    let fault_instruction_address = bugcheck_data.and_then(dump_fault_address);
+    let structural_context = exception_context.as_ref().filter(|context| {
+        context["selection"].as_str() == Some("structurally_validated_parameter_4_context")
+    });
+    let selected_context = exception_context
+        .as_ref()
+        .and_then(|context| context.get("context"));
+    let context_available = matches!(
+        selected_context.and_then(|context| context["status"].as_str()),
+        Some("captured" | "context_captured_stack_unavailable")
+    );
+    let validation = selected_context.and_then(|context| context.get("validation"));
+    let amd64_validation_passes = validation.is_some_and(|validation| {
+        [
+            "amd64_flag_present",
+            "control_register_group_present",
+            "integer_register_group_present",
+            "raw_layout_offset_cross_check",
+            "cs_nonzero",
+            "ss_nonzero",
+            "eflags_reserved_bit_1_set",
+        ]
+        .into_iter()
+        .all(|field| validation[field].as_bool() == Some(true))
+            && validation["rip_canonical_for_selected_address_width"].as_bool() == Some(true)
+            && validation["rsp_canonical_for_selected_address_width"].as_bool() == Some(true)
+    });
+    let rip_matches_fault_instruction =
+        fault_mechanics["fault_instruction_matches_context_rip"].as_bool() == Some(true);
+    let context_candidate = fault_mechanics["register_dataflow"]["effective_address"]
+        .as_u64()
+        .or_else(|| fault_mechanics["register_dataflow"]["structural_effective_address"].as_u64());
+    let structural_exception_target =
+        fault_mechanics["memory_access"]["structural_exception_record_access_target"].as_u64();
+    let documented_exception_target = target_exception
+        .pointer("/record/access_violation/address")
+        .and_then(Value::as_u64)
+        .or_else(|| {
+            fault_mechanics["memory_access"]["documented_bugcheck_parameter_contract"]
+                ["target_address"]
+                .as_u64()
+        });
+    let comparison_target = documented_exception_target.or(structural_exception_target);
+    let operand_matches_access_target = context_candidate
+        .zip(comparison_target)
+        .map(|(context, target)| context == target)
+        == Some(true);
+    let target_exception_record_matches_bugcheck = bugcheck_data.is_some_and(|data| {
+        target_exception["record_status"].as_str() == Some("captured")
+            && target_exception["record"]["code"].as_u64() == Some(data.parameters[0] as u32 as u64)
+            && target_exception["record"]["address"].as_u64() == Some(data.parameters[1])
+    });
+    let documented_or_exact_link = exception_context_is_documented(exception_context)
+        && target_exception["context_status"].as_str() == Some("captured")
+        && target_exception_record_matches_bugcheck;
+    let fault_time_status = fault_time_context_status(
+        context_available,
+        documented_or_exact_link,
+        amd64_validation_passes,
+        rip_matches_fault_instruction,
+        operand_matches_access_target,
+    );
+    let p4_unwind = selected_context
+        .and_then(|context| context.get("unwind_contexts"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let structural_context_address = structural_context.and_then(|_| {
+        bugcheck_data
+            .filter(|data| data.code == 0x0000_001E)
+            .map(|data| data.parameters[3])
+    });
+    json!({
+        "schema": "windbg-tool.fault-context-provenance.v1",
+        "status": if fault_time_status == "fault_time" { "captured" } else { "unavailable_fault_time_context" },
+        "fault_time_context": {
+            "status": fault_time_status,
+            "selected_source": exception_context.as_ref().and_then(|context| context["selection"].as_str()),
+            "context_address": structural_context_address,
+            "detail": if fault_time_status == "fault_time" {
+                "The selected context satisfies the required documented/exact linkage and cross-checks."
+            } else {
+                "No selected context is promoted to fault-time state. A structurally valid P4 context can remain an ambiguous saved snapshot even when its RIP equals P2."
+            }
+        },
+        "promotion_checks": {
+            "documented_or_exact_link": documented_or_exact_link,
+            "amd64_validation_passes": amd64_validation_passes,
+            "rip_matches_fault_instruction": rip_matches_fault_instruction,
+            "operand_matches_access_target": operand_matches_access_target,
+            "context_register_candidate": context_candidate,
+            "access_target_for_comparison": comparison_target,
+            "structural_exception_record_access_target": structural_exception_target,
+            "documented_exception_target": documented_exception_target,
+            "rsp_mod_16": validation.and_then(|value| value["rsp_mod_16"].as_u64()),
+            "detail": "RSP alignment is recorded as an observation; canonicality and the explicitly validated AMD64 control/integer/selector fields are required. Address adjacency, readability, and an unwind result are not linkage."
+        },
+        "evidence_graph": {
+            "nodes": [
+                {
+                    "id": "fault_instruction",
+                    "source": "raw_bugcheck_parameter_2",
+                    "address": fault_instruction_address,
+                    "status": if fault_instruction_address.is_some() { "captured" } else { "unavailable" }
+                },
+                {
+                    "id": "bugcheck_p3",
+                    "source": "raw_bugcheck_parameter",
+                    "address": bugcheck_data.map(|data| data.parameters[2]),
+                    "status": if structural_exception_target.is_some() { "structurally_validated_exception_record" } else { "unavailable" }
+                },
+                {
+                    "id": "bugcheck_p4",
+                    "source": "raw_bugcheck_parameter",
+                    "address": bugcheck_data.map(|data| data.parameters[3]),
+                    "status": if context_available { "structurally_validated_amd64_context" } else { "unavailable" }
+                },
+                {
+                    "id": "dbgeng_target_exception",
+                    "source": target_exception["source"],
+                    "status": target_exception["status"],
+                    "record_status": target_exception["record_status"],
+                    "context_status": target_exception["context_status"],
+                    "record_matches_bugcheck": target_exception_record_matches_bugcheck
+                },
+                {
+                    "id": "dbgeng_stored_event",
+                    "source": target_exception["stored_event"]["source"],
+                    "status": target_exception["stored_event"]["status"],
+                    "context_status": target_exception["stored_event"]["context_status"]
+                },
+                {
+                    "id": "p4_derived_unwind",
+                    "source": "dbgeng_idebugcontrol4_get_context_stack_trace",
+                    "status": p4_unwind["status"],
+                    "detail": "This bounded unwind starts from the selected saved context. Its frame contexts are derived evidence; DbgEng does not guarantee volatile-register restoration after unwind."
+                },
+                {
+                    "id": "trap_or_exception_frame",
+                    "source": "documented_dbgeng_or_identity_validated_type",
+                    "status": "unsupported",
+                    "detail": "No documented target API or identity-validated public type linked a trap/exception frame to this bugcheck. No adjacency or private kernel layout is interpreted."
+                }
+            ],
+            "edges": [
+                {
+                    "from": "bugcheck_p3",
+                    "to": "fault_instruction",
+                    "relationship": "structural_field_match",
+                    "status": if structural_exception_target.is_some() { "P3 exception address matches P2" } else { "unavailable" }
+                },
+                {
+                    "from": "bugcheck_p4",
+                    "to": "fault_instruction",
+                    "relationship": "structural_field_match",
+                    "status": if rip_matches_fault_instruction { "context RIP matches P2" } else { "unavailable_or_mismatch" }
+                },
+                {
+                    "from": "dbgeng_target_exception",
+                    "to": "fault_instruction",
+                    "relationship": "documented_api_link",
+                    "status": if documented_or_exact_link { "captured" } else { "unavailable" }
+                },
+                {
+                    "from": "bugcheck_p4",
+                    "to": "p4_derived_unwind",
+                    "relationship": "derived_unwind",
+                    "status": p4_unwind["status"]
+                }
+            ]
+        },
+        "architectural_sanity": {
+            "instruction_bytes_exact_xadd": fault_mechanics["memory_access"]["kind"].as_str() == Some("atomic_read_modify_write"),
+            "facts": [
+                "The exact LOCK XADD memory destination is a read-modify-write operand.",
+                "The architectural instruction form does not itself link an arbitrary saved Windows CONTEXT to an EXCEPTION_RECORD.",
+                "This dump does not record per-instruction retirement state or a documented Windows fault-delivery relationship that resolves the P3/P4 target conflict."
+            ],
+            "status": if fault_mechanics["memory_access"]["kind"].as_str() == Some("atomic_read_modify_write") { "applicable" } else { "not_applicable" }
+        },
+        "detail": "The graph only records direct raw parameters, bounded structural validation, documented DbgEng request results, and derived unwind output. It deliberately does not infer a trap frame, thread, CPU, fault-time CR3, register mutation, instruction restart, or historical mapping state."
+    })
+}
+
 fn dump_kernel_integrity_snapshot(modules: &[ModuleInfo]) -> Value {
     json!({
         "status": "unsupported",
@@ -6445,6 +6674,7 @@ fn dump_address_space_consistency_unavailable_after_processor_restore_failure(
 fn dump_context_candidate_mapping_audit(
     session: &DebuggerSession,
     fault_mechanics: &Value,
+    fault_context_provenance: &Value,
 ) -> Value {
     let context_register_candidate = fault_mechanics["register_dataflow"]["effective_address"]
         .as_u64()
@@ -6491,9 +6721,10 @@ fn dump_context_candidate_mapping_audit(
             "not_applicable"
         },
         "candidates_conflict": candidates_conflict,
+        "fault_time_context_status": fault_context_provenance["fault_time_context"]["status"],
         "context_register_candidate": context_register_mapping,
         "exception_record_candidate": exception_record_mapping,
-        "detail": "Each candidate receives a separate bounded, read-only manual page-table walk and DbgEng translation cross-check. A present, writable leaf is only captured-snapshot state; it does not prove the candidate was the instruction operand, used the same CR3, or was mapped and writable when the exception was raised."
+        "detail": "Each candidate receives a separate bounded, read-only manual page-table walk and DbgEng translation cross-check. A present, writable leaf is only captured-snapshot state; it does not prove the candidate was the instruction operand, used the same CR3, or was mapped and writable when the exception was raised. A P4-derived mapping is never fault mapping unless fault_context_provenance promotes that context to fault_time."
     })
 }
 
@@ -8619,6 +8850,28 @@ mod tests {
         assert_eq!(
             metadata["special_pool_and_verifier"]["status"],
             "unsupported"
+        );
+    }
+
+    #[test]
+    fn fault_time_context_promotion_requires_all_independent_checks() {
+        assert_eq!(
+            fault_time_context_status(true, false, true, true, true),
+            "ambiguous",
+            "an operand match without a documented or exact linkage cannot promote a context"
+        );
+        assert_eq!(
+            fault_time_context_status(true, true, true, true, false),
+            "ambiguous",
+            "a RIP-matching context with a different access target cannot be fault-time"
+        );
+        assert_eq!(
+            fault_time_context_status(true, true, true, true, true),
+            "fault_time"
+        );
+        assert_eq!(
+            fault_time_context_status(false, true, true, true, true),
+            "unavailable"
         );
     }
 

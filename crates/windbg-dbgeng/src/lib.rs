@@ -672,12 +672,27 @@ pub struct TargetAccessViolation {
 pub struct TargetExceptionSnapshot {
     pub status: String,
     pub source: String,
+    pub stored_event: StoredEventInformation,
     pub thread_system_id: Option<u32>,
     pub thread_status: String,
     pub record: Option<TargetExceptionRecord>,
     pub record_status: String,
     pub context: Option<X64ExceptionContext>,
     pub context_status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StoredEventInformation {
+    pub status: String,
+    pub source: String,
+    pub event_type: Option<u32>,
+    pub process_system_id: Option<u32>,
+    pub thread_system_id: Option<u32>,
+    pub context: Option<X64ExceptionContext>,
+    pub context_status: String,
+    pub extra_information_bytes_returned: Option<u32>,
+    pub extra_information_status: String,
     pub detail: String,
 }
 
@@ -754,7 +769,31 @@ pub struct X64ExceptionContext {
     pub validation: Option<X64ContextValidation>,
     pub registers: Option<X64ExceptionRegisters>,
     pub stack: Option<StackTraceResult>,
+    pub unwind_contexts: Option<X64ContextStackTrace>,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64ContextStackTrace {
+    pub status: String,
+    pub source: String,
+    pub requested_frames: u32,
+    pub returned_frames: u32,
+    pub frame_zero_matches_start_context: Option<bool>,
+    pub frames: Vec<X64UnwindContextFrame>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct X64UnwindContextFrame {
+    pub frame_number: u32,
+    pub instruction_offset: u64,
+    pub context_rip: Option<u64>,
+    pub context_flags: Option<u32>,
+    pub required_register_groups_present: bool,
+    pub r8: Option<u64>,
+    pub r14: Option<u64>,
+    pub structural_effective_address: Option<u64>,
 }
 
 const X64_CONTEXT_SIZE: u32 = 0x4D0;
@@ -2093,16 +2132,121 @@ impl DebuggerSession {
         }
     }
 
+    fn stored_event_information(&self, max_frames: u32) -> StoredEventInformation {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl4;
+
+        const MAX_STORED_EVENT_EXTRA_BYTES: usize = 512;
+
+        let control: IDebugControl4 = match self.client.cast() {
+            Ok(control) => control,
+            Err(error) => {
+                return StoredEventInformation {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+                    event_type: None,
+                    process_system_id: None,
+                    thread_system_id: None,
+                    context: None,
+                    context_status: "unavailable".to_string(),
+                    extra_information_bytes_returned: None,
+                    extra_information_status: "not_returned".to_string(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugControl4 for the bounded stored-event probe: {error}"
+                    ),
+                };
+            }
+        };
+        let mut event_type = 0u32;
+        let mut process_system_id = 0u32;
+        let mut thread_system_id = 0u32;
+        let mut context_bytes = [0u8; X64_CONTEXT_SIZE as usize];
+        let mut context_used = 0u32;
+        let mut extra_information = [0u8; MAX_STORED_EVENT_EXTRA_BYTES];
+        let mut extra_information_used = 0u32;
+        let result = unsafe {
+            control.GetStoredEventInformation(
+                &mut event_type,
+                &mut process_system_id,
+                &mut thread_system_id,
+                Some(context_bytes.as_mut_ptr().cast()),
+                context_bytes.len() as u32,
+                Some(&mut context_used),
+                Some(extra_information.as_mut_ptr().cast()),
+                extra_information.len() as u32,
+                Some(&mut extra_information_used),
+            )
+        };
+        let Err(error) = result else {
+            let context_status = match (
+                self.processor_type().ok(),
+                context_used.min(context_bytes.len() as u32),
+            ) {
+                (Some(0x8664), 0) => "not_returned".to_string(),
+                (Some(0x8664), used) if used < X64_CONTEXT_SIZE => {
+                    format!("partial: {used} of {X64_CONTEXT_SIZE} bytes")
+                }
+                (Some(0x8664), _) => "captured".to_string(),
+                _ => "architecture_unsupported".to_string(),
+            };
+            let context = (context_status == "captured").then(|| {
+                self.decode_x64_exception_context(
+                    None,
+                    &context_bytes,
+                    context_used.min(context_bytes.len() as u32),
+                    max_frames,
+                )
+            });
+            return StoredEventInformation {
+                status: "captured".to_string(),
+                source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+                event_type: Some(event_type),
+                process_system_id: Some(process_system_id),
+                thread_system_id: Some(thread_system_id),
+                context,
+                context_status,
+                extra_information_bytes_returned: Some(extra_information_used),
+                extra_information_status: if extra_information_used == 0 {
+                    "not_returned".to_string()
+                } else if extra_information_used <= extra_information.len() as u32 {
+                    "present_not_decoded".to_string()
+                } else {
+                    format!(
+                        "truncated_not_decoded: {extra_information_used} bytes exceed the {} byte limit",
+                        extra_information.len()
+                    )
+                },
+                detail: "DbgEng documents stored-event data as optional and typically present in user-mode minidumps. This bounded probe retains only returned identifiers, a complete AMD64 CONTEXT when present, and the extra-data byte count; unknown extra bytes are never decoded or treated as kernel exception provenance.".to_string(),
+            };
+        };
+        StoredEventInformation {
+            status: "unavailable".to_string(),
+            source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+            event_type: None,
+            process_system_id: None,
+            thread_system_id: None,
+            context: None,
+            context_status: "unavailable".to_string(),
+            extra_information_bytes_returned: None,
+            extra_information_status: "not_returned".to_string(),
+            detail: format!(
+                "DbgEng GetStoredEventInformation did not expose a stored event for this target: {error}"
+            ),
+        }
+    }
+
     pub fn target_exception_snapshot(&self, max_frames: u32) -> TargetExceptionSnapshot {
         use windows::core::Interface;
         use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugAdvanced2;
 
+        let stored_event = self.stored_event_information(max_frames);
         let advanced: IDebugAdvanced2 = match self.client.cast() {
             Ok(advanced) => advanced,
             Err(error) => {
                 return TargetExceptionSnapshot {
                     status: "unavailable".to_string(),
                     source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+                    stored_event,
                     thread_system_id: None,
                     thread_status: "unavailable".to_string(),
                     record: None,
@@ -2198,13 +2342,14 @@ impl DebuggerSession {
                 _ => "partial".to_string(),
             },
             source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+            stored_event,
             thread_system_id: (thread_status == "captured").then_some(thread_system_id),
             thread_status,
             record,
             record_status,
             context,
             context_status,
-            detail: "The thread, EXCEPTION_RECORD64, and machine CONTEXT are independently returned by documented DbgEng target-exception requests. A returned thread identifies DbgEng's recorded exception thread, not a logical processor or historical writer.".to_string(),
+            detail: "DbgEng documents the target-exception requests for a stored event in a user-mode minidump. They are invoked here only as bounded capability probes; a returned thread identifies DbgEng's recorded exception thread, not a logical processor or historical writer. Their unavailability does not disprove the bounded structural P3/P4 candidates.".to_string(),
         }
     }
 
@@ -2256,6 +2401,7 @@ impl DebuggerSession {
                 validation: None,
                 registers: None,
                 stack: None,
+                unwind_contexts: None,
                 detail: format!(
                     "DbgEng could not read the x64 exception context at 0x{context_record_address:X}: {error}"
                 ),
@@ -2272,6 +2418,7 @@ impl DebuggerSession {
                 validation: None,
                 registers: None,
                 stack: None,
+                unwind_contexts: None,
                 detail: format!(
                     "The dump contains only {bytes_read} of {requested_size} bytes for the x64 CONTEXT record."
                 ),
@@ -2310,6 +2457,134 @@ impl DebuggerSession {
         )
     }
 
+    fn context_stack_trace(&self, start_context: &[u8], max_frames: u32) -> X64ContextStackTrace {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            IDebugControl4, DEBUG_STACK_FRAME,
+        };
+
+        if start_context.len() < X64_CONTEXT_SIZE as usize {
+            return X64ContextStackTrace {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                requested_frames: max_frames,
+                returned_frames: 0,
+                frame_zero_matches_start_context: None,
+                frames: Vec::new(),
+                detail: format!(
+                    "The bounded start context contains only {} of {X64_CONTEXT_SIZE} AMD64 CONTEXT bytes.",
+                    start_context.len()
+                ),
+            };
+        }
+        if max_frames == 0 {
+            return X64ContextStackTrace {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                requested_frames: max_frames,
+                returned_frames: 0,
+                frame_zero_matches_start_context: None,
+                frames: Vec::new(),
+                detail: "A positive frame limit is required for the bounded context stack trace."
+                    .to_string(),
+            };
+        }
+        let control: IDebugControl4 = match self.client.cast() {
+            Ok(control) => control,
+            Err(error) => {
+                return X64ContextStackTrace {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                    requested_frames: max_frames,
+                    returned_frames: 0,
+                    frame_zero_matches_start_context: None,
+                    frames: Vec::new(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugControl4 for the bounded context stack trace: {error}"
+                    ),
+                };
+            }
+        };
+        let mut stack_frames = vec![DEBUG_STACK_FRAME::default(); max_frames as usize];
+        let mut frame_context_bytes = vec![0u8; max_frames as usize * X64_CONTEXT_SIZE as usize];
+        let mut filled = 0u32;
+        let result = unsafe {
+            control.GetContextStackTrace(
+                Some(start_context.as_ptr().cast()),
+                X64_CONTEXT_SIZE,
+                Some(&mut stack_frames),
+                Some(frame_context_bytes.as_mut_ptr().cast()),
+                frame_context_bytes.len() as u32,
+                X64_CONTEXT_SIZE,
+                Some(&mut filled),
+            )
+        };
+        let Err(error) = result else {
+            let returned_frames = filled.min(max_frames) as usize;
+            stack_frames.truncate(returned_frames);
+            let frames = stack_frames
+                .iter()
+                .enumerate()
+                .map(|(index, frame)| {
+                    let start = index * X64_CONTEXT_SIZE as usize;
+                    let end = start + X64_CONTEXT_SIZE as usize;
+                    let context = x64_context_prefix_from_bytes(&frame_context_bytes[start..end]);
+                    let required_register_groups_present = context.is_some_and(|context| {
+                        context.context_flags & CONTEXT_X64_REQUIRED_REGISTER_FLAGS
+                            == CONTEXT_X64_REQUIRED_REGISTER_FLAGS
+                    });
+                    let (context_rip, context_flags, r8, r14) = context
+                        .map(|context| {
+                            (
+                                Some(context.rip),
+                                Some(context.context_flags),
+                                Some(context.r8),
+                                Some(context.r14),
+                            )
+                        })
+                        .unwrap_or((None, None, None, None));
+                    X64UnwindContextFrame {
+                        frame_number: frame.FrameNumber,
+                        instruction_offset: frame.InstructionOffset,
+                        context_rip,
+                        context_flags,
+                        required_register_groups_present,
+                        r8,
+                        r14,
+                        structural_effective_address: r8
+                            .zip(r14)
+                            .and_then(|(r8, r14)| r8.checked_add(r14)),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let start = x64_context_prefix_from_bytes(start_context);
+            let frame_zero_matches_start_context =
+                start.zip(frames.first()).map(|(start, frame)| {
+                    frame.context_rip == Some(start.rip)
+                        && frame.r8 == Some(start.r8)
+                        && frame.r14 == Some(start.r14)
+                });
+            return X64ContextStackTrace {
+                status: "captured".to_string(),
+                source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+                requested_frames: max_frames,
+                returned_frames: returned_frames as u32,
+                frame_zero_matches_start_context,
+                frames,
+                detail: "DbgEng reconstructed these contexts by unwinding from the supplied saved CONTEXT. They are derived from that input, not an independent exception/trap-frame capture. Microsoft documents that volatile registers need not be restored by stack unwinding, so R8/R14 values after frame zero are never used as fault-time evidence.".to_string(),
+            };
+        };
+        X64ContextStackTrace {
+            status: "unavailable".to_string(),
+            source: "dbgeng_idebugcontrol4_get_context_stack_trace".to_string(),
+            requested_frames: max_frames,
+            returned_frames: 0,
+            frame_zero_matches_start_context: None,
+            frames: Vec::new(),
+            detail: format!("DbgEng GetContextStackTrace failed: {error}"),
+        }
+    }
+
     fn decode_x64_exception_context(
         &self,
         context_record_address: Option<u64>,
@@ -2329,6 +2604,7 @@ impl DebuggerSession {
                 validation: None,
                 registers: None,
                 stack: None,
+                unwind_contexts: None,
                 detail: format!(
                     "DbgEng returned only {} of {requested_size} bytes for the x64 CONTEXT record.",
                     buffer.len()
@@ -2351,6 +2627,7 @@ impl DebuggerSession {
                 validation: None,
                 registers: None,
                 stack: None,
+                unwind_contexts: None,
                 detail: "The complete context record does not contain the AMD64 control and integer register groups required for register or stack decoding.".to_string(),
             };
         }
@@ -2378,6 +2655,7 @@ impl DebuggerSession {
         let validation = x64_context_validation(&context, buffer, selected_address_width);
         let stack =
             self.stack_trace_from_offsets(registers.rbp, registers.rsp, registers.rip, max_frames);
+        let unwind_contexts = self.context_stack_trace(buffer, max_frames);
         let (status, detail) = match &stack {
             Ok(result) => (
                 "captured".to_string(),
@@ -2403,6 +2681,7 @@ impl DebuggerSession {
             validation: Some(validation),
             registers: Some(registers),
             stack: stack.ok(),
+            unwind_contexts: Some(unwind_contexts),
             detail,
         }
     }
@@ -4098,6 +4377,18 @@ impl DebuggerSession {
         TargetExceptionSnapshot {
             status: "unavailable".to_string(),
             source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+            stored_event: StoredEventInformation {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
+                event_type: None,
+                process_system_id: None,
+                thread_system_id: None,
+                context: None,
+                context_status: "unavailable".to_string(),
+                extra_information_bytes_returned: None,
+                extra_information_status: "not_returned".to_string(),
+                detail: "DbgEng sessions are only supported on Windows".to_string(),
+            },
             thread_system_id: None,
             thread_status: "unavailable".to_string(),
             record: None,
