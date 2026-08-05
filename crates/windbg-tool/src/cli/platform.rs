@@ -23,7 +23,7 @@ use windbg_dbgeng::{
 use windbg_install::WindbgManager;
 use windbg_symbols::{
     image_matches, inspect_pe_image_identity, prefetch_image, prefetch_pdb, NativeImageStatus,
-    NativeSymbolStatus, PeImageIdentity,
+    NativeSymbolStatus, PdbIdentityValidation, PeImageIdentity,
 };
 use windbg_ttd::backend::capability_contract;
 use windows::core::{PCWSTR, PWSTR};
@@ -4578,7 +4578,7 @@ pub(super) fn run_dump_cohort(args: DumpCohortArgs, output: &OutputOptions) -> a
         dump_cohort_evidence_synthesis(&recurrence, &driver_filter_lifecycle, analyzed);
     print_value(
         json!({
-            "schema": "windbg-tool.dump-cohort.v2",
+            "schema": "windbg-tool.dump-cohort.v3",
             "status": if analyzed == 0 { "unavailable" } else { "captured" },
             "offline_requested": args.offline,
             "symbol_server_used": false,
@@ -4607,7 +4607,7 @@ pub(super) fn run_dump_cohort(args: DumpCohortArgs, output: &OutputOptions) -> a
                 },
                 "raw_command_execution": false
             },
-            "detail": "Cohort matches compare only values actually returned for each dump. Module load presence is kept separate from validated stack participation and direct kernel attribution; it is never treated as driver involvement by itself.",
+            "detail": "Cohort matches compare only values actually returned for each dump. Module load presence is kept separate from module-mapped saved-frame references and direct kernel attribution; it is never treated as driver involvement by itself.",
             "telemetry": {
                 "elapsed_ms": started.elapsed().as_millis() as u64
             }
@@ -4674,7 +4674,8 @@ fn dump_cohort_entry(path: &Path, max_frames: u32) -> Value {
         );
     let heuristic_context =
         dump_exception_context(&session, &target, bugcheck.data.as_ref(), max_frames);
-    let context_shape = dump_cohort_context_shape(&direct_exception, &heuristic_context);
+    let context_shape =
+        dump_cohort_context_shape(fault_address, &direct_exception, &heuristic_context);
     let module_inventory = dump_cohort_module_inventory(&session);
     let driver_filter_evidence = json!({
         "bugcheck_driver": dump_bugcheck_driver(&session),
@@ -4693,7 +4694,7 @@ fn dump_cohort_entry(path: &Path, max_frames: u32) -> Value {
         "fault": fault,
         "target_exception": direct_exception,
         "context_shape": context_shape,
-        "validated_stack_module_families": dump_cohort_stack_module_families(&stack),
+        "module_mapped_stack_module_families": dump_cohort_stack_module_families(&session, &stack),
         "module_inventory": module_inventory,
         "driver_filter_evidence": driver_filter_evidence,
         "stack": stack,
@@ -4765,7 +4766,7 @@ fn dump_cohort_module_inventory(session: &DebuggerSession) -> Value {
             "status": "unavailable",
             "detail": "DbgEng's documented module parameters provide dump-supplied image size, PE TimeDateStamp, and checksum. They do not provide an Authenticode result or file-version resource for the loaded image."
         },
-        "detail": "This is a bounded loaded-image snapshot. Module identities are compared separately from validated stack frames and direct bugcheck attribution."
+        "detail": "This is a bounded loaded-image snapshot. Module identities are compared separately from module-mapped saved-frame references and direct bugcheck attribution."
     })
 }
 
@@ -4782,74 +4783,101 @@ fn dump_cohort_fault(session: &DebuggerSession, address: u64) -> Value {
     json!({
         "address": address,
         "instruction_text": instruction_text,
-        "instruction_bytes_hex": instruction_text.and_then(cohort_instruction_bytes),
+        "instruction_bytes": observation["instruction_bytes"],
+        "instruction_bytes_hex": observation["instruction_bytes"]["data"],
         "module": observation["module"],
         "module_parameters": module_parameters,
-        "source": "dbgeng_single_instruction_disassembly_and_module_parameters",
-        "detail": "Instruction bytes are reported only when DbgEng included a contiguous hex token in its one-instruction disassembly text; otherwise they remain unavailable."
+        "source": "dbgeng_single_instruction_disassembly_raw_byte_read_and_module_parameters",
+        "detail": "Instruction bytes are returned only from a bounded virtual-memory read whose length is supplied by DbgEng's one-instruction disassembly range. Formatted disassembly text is not parsed for byte tokens."
     })
 }
 
-fn cohort_instruction_bytes(text: &str) -> Option<&str> {
-    text.split_ascii_whitespace().find(|token| {
-        token.len() >= 2
-            && token.len().is_multiple_of(2)
-            && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-    })
-}
-
-fn dump_cohort_context_shape(target_exception: &Value, heuristic_context: &Option<Value>) -> Value {
+fn dump_cohort_context_shape(
+    fault_address: Option<u64>,
+    target_exception: &Value,
+    heuristic_context: &Option<Value>,
+) -> Value {
     let direct = target_exception["context"]["registers"].as_object();
-    let (registers, provenance) = if let Some(registers) = direct {
-        (Some(registers), "direct_context")
+    let direct_matches_fault = direct
+        .and_then(|registers| registers.get("rip"))
+        .and_then(Value::as_u64)
+        .zip(fault_address)
+        .map(|(rip, fault)| rip == fault);
+    let (registers, provenance) = if direct_matches_fault == Some(true) {
+        (direct, "direct_context")
     } else {
-        (
-            heuristic_context
-                .as_ref()
-                .and_then(|context| context["context"]["registers"].as_object()),
-            "heuristic_bugcheck_parameter_context",
-        )
+        let registers = heuristic_context
+            .as_ref()
+            .and_then(|context| context["context"]["registers"].as_object());
+        let provenance = match heuristic_context
+            .as_ref()
+            .and_then(|context| context["selection"].as_str())
+        {
+            Some("parameter_3_exception_context") => "documented_bugcheck_context",
+            Some("heuristic_parameter_4_context") => "heuristic_bugcheck_parameter_context",
+            _ => "unavailable",
+        };
+        (registers, provenance)
     };
     let Some(registers) = registers else {
         return json!({
             "status": "unavailable",
-            "provenance": "unavailable",
-            "detail": "Neither a documented target-exception context nor a structurally valid bounded bugcheck-context candidate was available."
+            "provenance": if direct_matches_fault == Some(false) {
+                "documented_context_rip_mismatch"
+            } else {
+                "unavailable"
+            },
+            "detail": "Neither a documented target-exception context with RIP matching the bugcheck fault address nor a structurally valid bounded bugcheck-context candidate was available."
         });
     };
     let r8 = registers.get("r8").and_then(Value::as_u64);
     let r14 = registers.get("r14").and_then(Value::as_u64);
-    json!({
+    let effective_address = r8
+        .zip(r14)
+        .and_then(|(base, offset)| base.checked_add(offset));
+    let mut result = json!({
         "status": "captured",
         "provenance": provenance,
         "rip": registers.get("rip").and_then(Value::as_u64),
         "r8": r8,
         "r14": r14,
         "rbp": registers.get("rbp").and_then(Value::as_u64),
-        "effective_address_r8_plus_r14": r8.zip(r14).and_then(|(base, offset)| base.checked_add(offset)),
-        "detail": "The shape preserves only the registers required to compare the observed addressing form. Heuristic contexts are explicitly not used for direct thread or processor attribution."
-    })
+        "detail": "The shape preserves only the registers required to compare the observed addressing form. A documented DbgEng context contributes only when its RIP equals the bugcheck fault address. Heuristic contexts are explicitly not used for direct thread, processor, or fault-address attribution."
+    });
+    let key = if matches!(provenance, "direct_context" | "documented_bugcheck_context") {
+        "effective_address_r8_plus_r14"
+    } else {
+        "heuristic_effective_address_r8_plus_r14"
+    };
+    result[key] = json!(effective_address);
+    result
 }
 
-fn dump_cohort_stack_module_families(stack: &Value) -> Value {
+fn dump_cohort_stack_module_families(session: &DebuggerSession, stack: &Value) -> Value {
     let valid_frames = stack["valid_frames"].as_u64().unwrap_or(0) as usize;
+    let mut module_mapped_frame_count = 0usize;
     let families = stack["frames"]
         .as_array()
         .into_iter()
         .flatten()
         .take(valid_frames)
-        .filter_map(|frame| frame["symbol"]["name"].as_str())
-        .filter_map(|symbol| {
-            symbol
-                .split_once('!')
-                .map(|(module, _)| module.to_ascii_lowercase())
+        .filter_map(|frame| frame["instruction_offset"].as_u64())
+        .filter_map(|address| {
+            session
+                .module_by_offset(address)
+                .ok()
+                .flatten()
+                .and_then(|module| {
+                    module_mapped_frame_count += 1;
+                    module.module_name.map(|name| name.to_ascii_lowercase())
+                })
         })
         .collect::<BTreeSet<_>>();
     json!({
-        "status": if valid_frames == 0 { "unavailable" } else { "captured" },
-        "valid_frame_count": valid_frames,
+        "status": if module_mapped_frame_count == 0 { "unavailable" } else { "captured" },
+        "module_mapped_frame_count": module_mapped_frame_count,
         "families": families,
-        "detail": "Only modules named by validated saved stack frames are listed. A module absent from this list is not ruled out, and a listed module is not attributed."
+        "detail": "Only modules returned by DbgEng module lookup for saved stack instruction offsets are listed. This is not independent unwind validation. A module absent from this bounded list is not ruled out, and a listed module is not attributed."
     })
 }
 
@@ -4858,9 +4886,23 @@ fn dump_cohort_recurrence(entries: &[Value], analyzed: usize) -> Value {
         "bugcheck": cohort_common_values(entries, analyzed, |entry| entry.pointer("/bugcheck/code").cloned()),
         "fault_instruction_address": cohort_common_values(entries, analyzed, |entry| entry.pointer("/fault/address").cloned()),
         "fault_instruction_bytes": cohort_common_values(entries, analyzed, |entry| entry.pointer("/fault/instruction_bytes_hex").cloned()),
-        "fault_module_identity": cohort_common_values(entries, analyzed, |entry| entry.pointer("/fault/module/module_name").cloned()),
-        "context_addressing_shape": cohort_common_values(entries, analyzed, |entry| {
+        "fault_module_identity": cohort_common_values(entries, analyzed, |entry| {
+            let module = entry.pointer("/fault/module")?;
+            let parameters = entry.pointer("/fault/module_parameters")?;
+            Some(json!({
+                "module_name": module["module_name"],
+                "image_size": parameters["image_size"],
+                "time_date_stamp": parameters["time_date_stamp"],
+                "checksum": parameters["checksum"],
+            }))
+        }),
+        "direct_context_addressing_shape": cohort_common_values(entries, analyzed, |entry| {
             let provenance = entry.pointer("/context_shape/provenance")?;
+            matches!(
+                provenance.as_str(),
+                Some("direct_context" | "documented_bugcheck_context")
+            )
+            .then_some(())?;
             let effective = entry.pointer("/context_shape/effective_address_r8_plus_r14")?;
             Some(json!({"provenance": provenance, "effective_address": effective}))
         }),
@@ -4875,8 +4917,10 @@ fn dump_cohort_driver_filter_lifecycle(entries: &[Value], analyzed: usize) -> Va
                 modules.iter().filter_map(|module| module.get("identity").cloned()).collect()
             })
         }),
-        "validated_stack_participation": cohort_common_array_values(entries, analyzed, |entry| {
-            entry.pointer("/validated_stack_module_families/families")
+        "module_mapped_stack_participation": cohort_common_array_values(entries, analyzed, |entry| {
+            (entry.pointer("/module_mapped_stack_module_families/status")?.as_str() == Some("captured"))
+                .then(|| entry.pointer("/module_mapped_stack_module_families/families"))
+                .flatten()
                 .and_then(Value::as_array)
                 .cloned()
         }),
@@ -4897,7 +4941,7 @@ fn dump_cohort_driver_filter_lifecycle(entries: &[Value], analyzed: usize) -> Va
             "status": "unsupported",
             "detail": "No documented DbgEng dump API exposes a bounded public filter-instance or current-I/O traversal. Loaded filter modules are not presented as filter-stack participation."
         },
-        "detail": "Always-loaded is an image-identity intersection only. It does not imply execution, stack participation, verification, signature validity, or causation. Validated stack participation and direct KiBugCheckDriver attribution are reported independently."
+        "detail": "Always-loaded is an image-identity intersection only. It does not imply execution, stack participation, verification, signature validity, or causation. Module-mapped stack references and direct KiBugCheckDriver attribution are reported independently."
     })
 }
 
@@ -4912,24 +4956,24 @@ fn dump_cohort_evidence_synthesis(
         "evidence": [
             {
                 "category": "recurring_fault_instruction_bytes",
-                "provenance": "symbolized-and-validated",
+                "provenance": "direct-context",
                 "status": recurrence["fault_instruction_bytes"]["status"],
                 "source_pointer": "/recurrence/fault_instruction_bytes",
-                "detail": "Consistency requires the same non-null one-instruction byte token from every analyzed dump."
+                "detail": "Consistency requires the same non-null bounded raw instruction-byte read from every analyzed dump."
             },
             {
                 "category": "loaded_module_identity_intersection",
                 "provenance": "structural-snapshot",
                 "status": driver_filter_lifecycle["loaded_module_identities"]["status"],
                 "source_pointer": "/driver_filter_lifecycle/loaded_module_identities",
-                "detail": "An always-loaded identity is neither a validated stack participant nor direct attribution."
+                "detail": "An always-loaded identity is neither a module-mapped saved-frame reference nor direct attribution."
             },
             {
-                "category": "validated_stack_participation",
-                "provenance": "symbolized-and-validated",
-                "status": driver_filter_lifecycle["validated_stack_participation"]["status"],
-                "source_pointer": "/driver_filter_lifecycle/validated_stack_participation",
-                "detail": "Only module families named by a validated saved stack frame participate in this category."
+                "category": "module_mapped_stack_participation",
+                "provenance": "structural-snapshot",
+                "status": driver_filter_lifecycle["module_mapped_stack_participation"]["status"],
+                "source_pointer": "/driver_filter_lifecycle/module_mapped_stack_participation",
+                "detail": "Only module families resolved from DbgEng-returned, module-mapped saved stack frames participate in this category; this is not independent unwind validation."
             },
             {
                 "category": "direct_bugcheck_driver",
@@ -4949,12 +4993,12 @@ fn dump_cohort_evidence_synthesis(
         "confidence_matrix": {
             "confirmed_facts": [
                 "Only recurrence entries whose status is consistent across every analyzed dump.",
-                "Only explicit module identities, validated stack families, and direct attribution fields described by their linked categories."
+                "Only explicit module identities, module-mapped saved-frame references, and direct attribution fields described by their linked categories."
             ],
             "ruled_out_explanations": [],
             "plausible_but_unproven": [
                 "A shared transient pool-tracker failure mechanism.",
-                "A driver or memory-corruption mechanism not captured on a validated stack or direct attribution field."
+                "A driver or memory-corruption mechanism not captured in a module-mapped saved-frame reference or direct attribution field."
             ],
             "next_capture_evidence_required": [
                 "An event-time trace or instrumentation recording allocation and writes for the tracker page.",
@@ -5085,7 +5129,7 @@ pub(super) fn run_dump_inspect(
             "status": "unavailable",
             "logical_processor_count": null,
             "returned": 0,
-            "validated_stack_count": 0,
+            "nonempty_saved_stack_count": 0,
             "unwind_limited_stack_count": 0,
             "max_frames_per_processor": args.max_frames,
             "processors": [],
@@ -5201,7 +5245,6 @@ fn prepare_dump_native_symbols(
     let image_names = [
         module.image_name.as_deref(),
         module.loaded_image_name.as_deref(),
-        module.symbol_file.as_deref(),
     ]
     .into_iter()
     .flatten()
@@ -5334,6 +5377,18 @@ fn prepare_dump_native_symbols(
             });
         }
     };
+    if prefetch.pdb_identity_validation() == PdbIdentityValidation::Unverified {
+        return json!({
+            "status": "pdb_identity_unverified",
+            "module": module,
+            "image_path": image_path,
+            "image_prefetch": image_prefetch,
+            "prefetch": prefetch,
+            "pdb_identity_validation": "unverified",
+            "offline": offline,
+            "detail": "A PDB was available at the CodeView-derived symbol-server path, but its embedded GUID and age were not validated. It was not configured for symbol resolution."
+        });
+    }
     let Some(pdb_path) = prefetch.pdb_path.as_ref() else {
         return json!({
             "status": prefetch.status,
@@ -5363,10 +5418,10 @@ fn prepare_dump_native_symbols(
         .as_ref()
         .ok()
         .and_then(|()| session.symbol_by_offset(fault_address).ok().flatten());
+    let pdb_identity_validation = prefetch.pdb_identity_validation();
     json!({
         "status": match prefetch.status {
-            NativeSymbolStatus::Cached => "configured_from_cache",
-            NativeSymbolStatus::Downloaded => "downloaded_and_configured",
+            NativeSymbolStatus::Cached | NativeSymbolStatus::Downloaded => "pdb_identity_unverified",
             NativeSymbolStatus::OfflineMissing => "offline_missing",
             NativeSymbolStatus::Unavailable => "unavailable",
         },
@@ -5376,6 +5431,7 @@ fn prepare_dump_native_symbols(
         "image_prefetch": image_prefetch,
         "pdb_directory": pdb_directory,
         "prefetch": prefetch,
+        "pdb_identity_validation": pdb_identity_validation,
         "forced_reload": match reload {
             Ok(()) => json!({"status": "loaded"}),
             Err(error) => json!({"status": "failed", "detail": format!("{error:#}")}),
@@ -5454,9 +5510,19 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         input.tracker_table_base,
         input.processor_snapshot["logical_processor_count"].as_u64(),
     );
-    let address_inspection = input
-        .inspected_address
-        .map(|address| dump_address_inspection(session, address, input.tracker_table_base));
+    let debugger_thread_preserved =
+        input.processor_snapshot["current_thread_preserved"].as_bool() != Some(false);
+    let address_inspection = input.inspected_address.map(|address| {
+        if debugger_thread_preserved {
+            dump_address_inspection(session, address, input.tracker_table_base)
+        } else {
+            json!({
+                "status": "unavailable_current_thread_not_preserved",
+                "address": address,
+                "detail": "The bounded processor snapshot did not restore DbgEng's original current thread. No CR3-dependent virtual-to-physical mapping was attempted after that failure."
+            })
+        }
+    });
     let bugcheck_driver = dump_bugcheck_driver(session);
     let evidence = dump_evidence_grades(&driver_evidence, &pool_tracker, &bugcheck_driver);
     let processor_activity = dump_processor_activity(input.processor_snapshot);
@@ -5469,11 +5535,18 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         &pool_tracker,
         input.target_exception,
     );
-    let address_space_consistency = dump_address_space_consistency(
-        session,
-        fault_mechanics["register_dataflow"]["effective_address"].as_u64(),
-        input.tracker_table_base,
-    );
+    let address_space_consistency = if debugger_thread_preserved {
+        dump_address_space_consistency(
+            session,
+            fault_mechanics["register_dataflow"]["effective_address"].as_u64(),
+            input.tracker_table_base,
+        )
+    } else {
+        dump_address_space_consistency_unavailable_after_processor_restore_failure(
+            fault_mechanics["register_dataflow"]["effective_address"].as_u64(),
+            input.tracker_table_base,
+        )
+    };
     let kernel_integrity = dump_kernel_integrity_snapshot(input.modules);
     let physical_page_provenance = dump_physical_page_provenance_feasibility();
     let allocation_adjacent_metadata = dump_allocation_adjacent_metadata_feasibility();
@@ -5541,24 +5614,28 @@ fn dump_evidence_synthesis(
             },
             {
                 "category": "fault_instruction_and_register_dataflow",
-                "provenance": "symbolized-and-validated",
+                "provenance": if fault_mechanics["register_dataflow"]["status"] == "captured" {
+                    "direct-context"
+                } else {
+                    "heuristic"
+                },
                 "status": fault_mechanics["status"],
                 "source_pointer": "/triage/fault_mechanics",
-                "detail": "Instruction bytes and register addressing must match the bounded validator before this category is treated as captured."
+                "detail": "Raw instruction bytes and register addressing must both come from documented target-exception context before this category is captured. A structurally plausible 0x1E P4 context remains heuristic."
             },
             {
                 "category": "pool_tracker_and_address_mapping",
-                "provenance": "structural-snapshot",
+                "provenance": "unavailable",
                 "status": pool_tracker["status"],
                 "source_pointer": "/triage/pool_tracker",
-                "detail": "Tracker records and page mappings describe retained post-crash memory only."
+                "detail": "Pool-tracker record and topology decoding are unavailable without an exact public type/layout contract."
             },
             {
                 "category": "explicit_address_space_comparison",
                 "provenance": "structural-snapshot",
                 "status": address_space_consistency["status"],
                 "source_pointer": "/triage/address_space_consistency",
-                "detail": "Only the explicitly derived fault address and supplied tracker base are compared; physical reverse-alias enumeration is unavailable."
+                "detail": "Only a documented-context-derived fault address and an explicitly supplied address are compared; physical reverse-alias enumeration is unavailable."
             },
             {
                 "category": "allocation_provenance",
@@ -5585,7 +5662,7 @@ fn dump_evidence_synthesis(
         "confidence_matrix": {
             "confirmed_snapshot_facts": [
                 "The saved bugcheck and any instruction/context values that pass their individual validators.",
-                "Only the bounded page-table mappings and tracker records explicitly represented by the structural probes."
+                "Only bounded page-table mappings for explicitly supplied or documented-context-derived addresses."
             ],
             "ruled_out_explanations": [],
             "plausible_but_unproven": [
@@ -5619,35 +5696,33 @@ fn dump_exception_context(
     max_frames: u32,
 ) -> Option<Value> {
     let data = bugcheck?;
-    let candidates = match data.code {
-        0x0000_003B => vec![("parameter_3_exception_context", data.parameters[2])],
-        // KMODE_EXCEPTION_NOT_HANDLED does not promise a CONTEXT parameter. Some
-        // contemporary kernel builds preserve one in parameter four, so probe only
-        // the documented-size record and report the result as a heuristic.
-        0x0000_001E => vec![
-            ("heuristic_parameter_4_context", data.parameters[3]),
-            ("heuristic_parameter_3_context", data.parameters[2]),
-        ],
-        _ => return None,
-    };
     if target.processor_type != Some(0x8664) {
         return Some(json!({
             "status": "architecture_unsupported",
-            "candidates": candidates.into_iter().map(|(source, address)| json!({
-                "source": source,
-                "context_record_address": address,
-            })).collect::<Vec<_>>(),
             "detail": "The bugcheck supplied or suggested a context address, but x64 decoding is only implemented for AMD64 dump targets.",
         }));
     }
 
+    let candidates = match data.code {
+        0x0000_003B => vec![("parameter_3_exception_context", data.parameters[2])],
+        // KMODE_EXCEPTION_NOT_HANDLED does not document a CONTEXT parameter. For this
+        // capture, inspect P4 only as a heuristic candidate and require its RIP to agree
+        // with P2 before exposing its register values.
+        0x0000_001E => vec![("heuristic_parameter_4_context", data.parameters[3])],
+        _ => return None,
+    };
     let decoded = candidates
         .into_iter()
         .map(|(source, address)| {
             let context = session.x64_exception_context(address, max_frames);
+            let rip_matches_bugcheck = context
+                .registers
+                .as_ref()
+                .map(|registers| registers.rip == data.parameters[1]);
             json!({
                 "source": source,
                 "context": context,
+                "context_rip_matches_bugcheck_fault_address": rip_matches_bugcheck,
             })
         })
         .collect::<Vec<_>>();
@@ -5655,19 +5730,50 @@ fn dump_exception_context(
         matches!(
             candidate["context"]["status"].as_str(),
             Some("captured" | "context_captured_stack_unavailable")
-        )
+        ) && candidate["context_rip_matches_bugcheck_fault_address"].as_bool() == Some(true)
+    });
+    let exception_record_candidate = (data.code == 0x0000_001E).then(|| {
+        let address = data.parameters[2];
+        match session.x64_exception_record(address) {
+            Ok(record) => {
+                let code_matches_bugcheck = record.code == data.parameters[0] as u32;
+                let instruction_address_matches_bugcheck = record.address == data.parameters[1];
+                let matches_bugcheck =
+                    code_matches_bugcheck && instruction_address_matches_bugcheck;
+                json!({
+                    "status": if matches_bugcheck { "structurally_matches_bugcheck" } else { "mismatch" },
+                    "source": "heuristic_parameter_3_exception_record",
+                    "address": address,
+                    "record": record,
+                    "code_matches_bugcheck": code_matches_bugcheck,
+                    "instruction_address_matches_bugcheck": instruction_address_matches_bugcheck,
+                    "detail": "P3 is decoded only as a capture-specific EXCEPTION_RECORD64 candidate. This structural match is not the documented general 0x1E parameter contract."
+                })
+            }
+            Err(error) => json!({
+                "status": "unavailable",
+                "source": "heuristic_parameter_3_exception_record",
+                "address": address,
+                "detail": format!("DbgEng could not read a complete x64 EXCEPTION_RECORD candidate: {error:#}")
+            }),
+        }
     });
     Some(json!({
-        "status": selected
-            .and_then(|candidate| candidate["context"]["status"].as_str())
-            .unwrap_or("unavailable"),
+        "status": if data.code == 0x0000_001E && selected.is_some() {
+            "heuristic_context_candidate"
+        } else {
+            selected
+                .and_then(|candidate| candidate["context"]["status"].as_str())
+                .unwrap_or("unavailable")
+        },
         "selection": selected
             .and_then(|candidate| candidate["source"].as_str())
             .unwrap_or("none"),
         "context": selected.map(|candidate| candidate["context"].clone()),
         "candidates": decoded,
+        "exception_record_candidate": exception_record_candidate,
         "detail": if data.code == 0x0000_001E {
-            "For bugcheck 0x1E, context candidates are bounded structural probes rather than a documented parameter contract."
+            "For bugcheck 0x1E, P3/P4 are not a documented exception-record/context contract. P4 register values are retained only when its decoded RIP matches P2 and remain heuristic rather than direct DbgEng target-exception evidence."
         } else {
             "The decoded context comes from the documented SYSTEM_SERVICE_EXCEPTION context-record parameter."
         },
@@ -5747,10 +5853,41 @@ fn dump_address_observation(
             "detail": format!("The dump does not provide disassembly at 0x{address:X}: {error}"),
         }),
     };
+    let instruction_bytes = disassembly["lines"]
+        .as_array()
+        .and_then(|lines| lines.first())
+        .and_then(|line| line["next_address"].as_u64())
+        .and_then(|next_address| next_address.checked_sub(address))
+        .filter(|length| (1..=15).contains(length))
+        .map(|length| match session.read_memory(address, length as u32) {
+            Ok(memory) if memory.complete => json!({
+                "status": "captured",
+                "data": memory.data,
+                "length": length,
+                "source": "dbgeng_read_virtual_at_disassembly_address",
+            }),
+            Ok(memory) => json!({
+                "status": "partial",
+                "length": length,
+                "memory": memory,
+            }),
+            Err(error) => json!({
+                "status": "unavailable",
+                "length": length,
+                "detail": format!("DbgEng could not read the disassembled instruction bytes: {error}"),
+            }),
+        })
+        .unwrap_or_else(|| {
+            json!({
+                "status": "unavailable",
+                "detail": "DbgEng did not return a bounded next-instruction address for a raw byte read."
+            })
+        });
     json!({
         "address": address,
         "module": module,
         "disassembly": disassembly,
+        "instruction_bytes": instruction_bytes,
     })
 }
 
@@ -5761,6 +5898,31 @@ fn selected_exception_register(exception_context: &Option<Value>, name: &str) ->
         .get("registers")?
         .get(name)?
         .as_u64()
+}
+
+fn exception_context_is_documented(exception_context: &Option<Value>) -> bool {
+    matches!(
+        exception_context
+            .as_ref()
+            .and_then(|context| context["selection"].as_str()),
+        Some("documented_dbgeng_target_exception_context" | "parameter_3_exception_context")
+    )
+}
+
+fn selected_heuristic_exception_record_access_address(
+    exception_context: &Option<Value>,
+) -> Option<u64> {
+    exception_context
+        .as_ref()?
+        .pointer("/exception_record_candidate/record/access_violation/address")?
+        .as_u64()
+}
+
+fn exact_pool_tracker_xadd_instruction(fault: &Option<Value>) -> bool {
+    fault
+        .as_ref()
+        .and_then(|value| value["instruction_bytes"]["data"].as_str())
+        .is_some_and(|bytes| bytes.eq_ignore_ascii_case("f04b0fc12c06"))
 }
 
 fn dump_bugcheck_driver(session: &DebuggerSession) -> Value {
@@ -5827,304 +5989,25 @@ fn dump_bugcheck_driver(session: &DebuggerSession) -> Value {
 }
 
 fn dump_pool_tracker_observation(
-    session: &DebuggerSession,
+    _session: &DebuggerSession,
     exception_context: &Option<Value>,
-    fault: &Option<Value>,
+    _fault: &Option<Value>,
     supplied_table_base: Option<u64>,
     logical_processor_count: Option<u64>,
 ) -> Value {
-    const ENTRY_STRIDE: u64 = 0x50;
-    let active_table = match evaluate_unsigned(session, "poi(nt!PoolTrackTable)") {
-        Ok(value) if value != 0 => value,
-        Ok(_) => {
-            return json!({
-                "status": "not_initialized",
-                "detail": "nt!PoolTrackTable is null in this snapshot.",
-            });
-        }
-        Err(error) => {
-            return json!({
-                "status": "unavailable",
-                "detail": error,
-            });
-        }
-    };
-    let table_size = match evaluate_unsigned(session, "poi(nt!PoolTrackTableSize)") {
-        Ok(value) if (1..=1_048_576).contains(&value) => value,
-        Ok(value) => {
-            return json!({
-                "status": "unavailable",
-                "active_table": active_table,
-                "detail": format!("nt!PoolTrackTableSize has unsupported value {value}; bounded entry inspection was skipped."),
-            });
-        }
-        Err(error) => {
-            return json!({
-                "status": "unavailable",
-                "active_table": active_table,
-                "detail": error,
-            });
-        }
-    };
-    let table_mask = evaluate_unsigned(session, "poi(nt!PoolTrackTableMask)").ok();
-    let table_bytes = match table_size.checked_mul(ENTRY_STRIDE) {
-        Some(value) => value,
-        None => {
-            return json!({
-                "status": "unavailable",
-                "active_table": active_table,
-                "table_size": table_size,
-                "detail": "Pool tracker table range overflowed while calculating its bounded address range.",
-            });
-        }
-    };
-    let table_end = match active_table.checked_add(table_bytes) {
-        Some(value) => value,
-        None => {
-            return json!({
-                "status": "unavailable",
-                "active_table": active_table,
-                "table_size": table_size,
-                "detail": "Pool tracker table end overflowed while calculating its bounded address range.",
-            });
-        }
-    };
-    let entry_address = selected_exception_register(exception_context, "r8");
-    let r14 = selected_exception_register(exception_context, "r14");
-    let rax = selected_exception_register(exception_context, "rax");
-    let entry_provenance = pool_tracker_entry_provenance(fault, entry_address, r14);
-    let supplied_table =
-        pool_tracker_table_relation(entry_address, supplied_table_base, table_size, ENTRY_STRIDE);
-    let entry_relation = entry_address.map(|address| {
-        if (active_table..table_end).contains(&address) {
-            "within_active_table"
-        } else {
-            "outside_active_table"
-        }
-    });
-    let nearby_entries = entry_address
-        .map(|address| {
-            [
-                address.checked_sub(ENTRY_STRIDE),
-                Some(address),
-                address.checked_add(ENTRY_STRIDE),
-            ]
-            .into_iter()
-            .flatten()
-            .map(|address| pool_tracker_entry_snapshot(session, address))
-            .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let observed_tag = nearby_entries
-        .iter()
-        .find(|entry| entry["address"].as_u64() == entry_address)
-        .and_then(|entry| entry["tag"]["printable"].as_bool())
-        .unwrap_or(false);
-    let classification = match (supplied_table["relation"].as_str(), observed_tag) {
-        (Some("within_supplied_table"), true) => "supplied_tracker_table_entry",
-        _ => match (entry_relation, observed_tag) {
-            (Some("outside_active_table"), true) => {
-                "outside_central_table_tracker_like_unclassified"
-            }
-            (Some("outside_active_table"), false) => "outside_central_table_unclassified",
-            (Some("within_active_table"), _) => "active_tracker_table_entry",
-            _ => "no_validated_exception_entry_available",
-        },
-    };
-    let per_cpu_topology = dump_per_cpu_tracker_topology(
-        session,
-        table_size,
-        entry_address,
-        supplied_table_base,
-        ENTRY_STRIDE,
-        logical_processor_count,
-    );
-    json!({
-        "status": "captured",
-        "layout": {
-            "entry_stride_bytes": ENTRY_STRIDE,
-            "source": "build-observed bounded layout",
-            "detail": "The inspector reads raw fields at stable offsets and does not infer an allocation owner or free history from an entry.",
-        },
-        "active_table": active_table,
-        "active_table_size": table_size,
-        "active_table_mask": table_mask,
-        "table_shape": pool_tracker_table_shape(table_size, table_mask),
-        "active_table_end_exclusive": table_end,
-        "exception_entry_address": entry_address,
-        "exception_entry_relation": entry_relation,
-        "exception_entry_provenance": entry_provenance,
-        "supplied_table": supplied_table,
-        "register_derived_addresses": {
-            "r8_plus_r14": entry_address.zip(r14).and_then(|(r8, r14)| r8.checked_add(r14)),
-            "r8_plus_rax": entry_address.zip(rax).and_then(|(r8, rax)| r8.checked_add(rax)),
-            "detail": "These are arithmetic observations from the selected exception context; fault-instruction interpretation remains in the disassembly evidence.",
-        },
-        "nearby_entries": nearby_entries,
-        "per_cpu_topology": per_cpu_topology,
-        "classification": classification,
-    })
-}
-
-fn dump_per_cpu_tracker_topology(
-    session: &DebuggerSession,
-    table_size: u64,
-    entry_address: Option<u64>,
-    supplied_table_base: Option<u64>,
-    entry_stride: u64,
-    logical_processor_count: Option<u64>,
-) -> Value {
-    const KNOWN_NT_TIMESTAMP: u32 = 0x4A63_AF4E;
-    const KNOWN_NT_IMAGE_SIZE: u32 = 0x0145_0000;
-    const PER_CPU_POINTER_ARRAY_RVA: u64 = 0x00EF_AB00;
-    const MAX_PROCESSOR_SLOTS: u64 = 128;
-    let nt_base = match evaluate_unsigned(session, "nt") {
-        Ok(value) => value,
-        Err(error) => return json!({"status": "unsupported", "detail": error}),
-    };
-    let parameters = match session.module_parameters(&[nt_base]) {
-        Ok(mut parameters) => parameters.pop(),
-        Err(error) => {
-            return json!({"status": "unavailable", "detail": format!("DbgEng could not read nt module parameters: {error}")})
-        }
-    };
-    let Some(parameters) = parameters else {
-        return json!({"status": "unavailable", "detail": "DbgEng returned no nt module parameters."});
-    };
-    if !is_known_per_cpu_tracker_layout(
-        parameters.time_date_stamp,
-        parameters.image_size,
-        KNOWN_NT_TIMESTAMP,
-        KNOWN_NT_IMAGE_SIZE,
-    ) {
+    if !exception_context_is_documented(exception_context) {
         return json!({
-            "status": "unsupported_build",
-            "nt_base": nt_base,
-            "module_parameters": parameters,
-            "detail": "The build-gated per-CPU pointer-array RVA is not validated for this nt image; no pointer-array read was attempted."
+            "status": "heuristic_context_not_used",
+            "heuristic_entry_address_r8": selected_exception_register(exception_context, "r8"),
+            "heuristic_r14_register_value": selected_exception_register(exception_context, "r14"),
+            "detail": "The pool-tracker probe requires a documented DbgEng target-exception context. Register values from a bugcheck P4 structural candidate are preserved in fault mechanics only and are not used to classify tracker records or table membership."
         });
-    }
-    let Some(array_address) = nt_base.checked_add(PER_CPU_POINTER_ARRAY_RVA) else {
-        return json!({"status": "unavailable", "detail": "The build-gated per-CPU pointer-array address overflowed."});
-    };
-    let Some(logical_processor_count) = logical_processor_count else {
-        return json!({
-            "status": "unavailable",
-            "pointer_array_address": array_address,
-            "detail": "DbgEng did not expose the actual logical processor count, so the inspector did not scan a broad fixed pointer-array range."
-        });
-    };
-    if logical_processor_count == 0 || logical_processor_count > MAX_PROCESSOR_SLOTS {
-        return json!({
-            "status": "unsupported_processor_count",
-            "pointer_array_address": array_address,
-            "logical_processor_count": logical_processor_count,
-            "supported_processor_limit": MAX_PROCESSOR_SLOTS,
-            "detail": "The build-gated tracker array supports only the validated 1 through 128 logical processor slots; no pointer-array read was attempted."
-        });
-    }
-    let pointer_bytes = match session
-        .read_memory(array_address, (logical_processor_count * 8) as u32)
-    {
-        Ok(memory) if memory.complete => match decode_hex_bytes(&memory.data) {
-            Some(bytes) => bytes,
-            None => {
-                return json!({"status": "unavailable", "detail": "DbgEng returned invalid hexadecimal for the per-CPU pointer array."})
-            }
-        },
-        Ok(memory) => {
-            return json!({"status": "partial", "pointer_array": memory, "detail": "The bounded per-CPU pointer-array read was incomplete."})
-        }
-        Err(error) => {
-            return json!({"status": "unavailable", "detail": format!("DbgEng could not read the build-gated per-CPU pointer array: {error}")})
-        }
-    };
-    let entry_index = entry_address
-        .zip(supplied_table_base)
-        .and_then(|(entry, base)| entry.checked_sub(base))
-        .filter(|offset| offset % entry_stride == 0)
-        .map(|offset| offset / entry_stride)
-        .filter(|index| *index < table_size);
-    let table_bytes = match table_size.checked_mul(entry_stride) {
-        Some(bytes) => bytes,
-        None => {
-            return json!({"status": "unavailable", "detail": "The tracker table extent overflowed."})
-        }
-    };
-    let mut tables = Vec::new();
-    for (slot, chunk) in pointer_bytes.chunks_exact(8).enumerate() {
-        let base = u64::from_le_bytes(chunk.try_into().expect("exact pointer chunk"));
-        if base == 0 {
-            continue;
-        }
-        let Some(end) = base.checked_add(table_bytes) else {
-            tables.push(json!({"slot": slot, "base": base, "status": "invalid_extent"}));
-            continue;
-        };
-        let first = pool_tracker_entry_snapshot(session, base);
-        let last = pool_tracker_entry_snapshot(session, end - entry_stride);
-        let fault_index_record = entry_index.and_then(|index| {
-            base.checked_add(index * entry_stride)
-                .map(|address| pool_tracker_entry_snapshot(session, address))
-        });
-        let extent_readable = first["status"].as_str() == Some("captured")
-            && last["status"].as_str() == Some("captured");
-        tables.push(json!({
-            "slot": slot,
-            "base": base,
-            "end_exclusive": end,
-            "base_alignment": base % 0x1000 == 0,
-            "extent_boundary_readable": extent_readable,
-            "first_entry": first,
-            "last_entry": last,
-            "fault_index": entry_index,
-            "fault_index_entry": fault_index_record,
-        }));
     }
     json!({
-        "status": "captured",
-        "source": "build_gated_nt_rva_and_bounded_reads",
-        "nt_base": nt_base,
-        "module_parameters": parameters,
-        "pointer_array_address": array_address,
+        "status": "unsupported_private_layout",
+        "supplied_table_base": supplied_table_base,
         "logical_processor_count": logical_processor_count,
-        "slot_limit": logical_processor_count,
-        "table_size": table_size,
-        "entry_stride": entry_stride,
-        "nonzero_tables": tables,
-        "crash_cpu_correlation": {
-            "status": "unavailable",
-            "detail": "The saved bugcheck CONTEXT and faulting stack do not carry a documented processor-slot identifier exposed by this dump path. Membership in a supplied slot-19 table validates the table relation, not the faulting CPU identity."
-        },
-        "detail": "Only slots exposed by the actual DbgEng logical processor count are read. Each nonzero base is checked only for page alignment and bounded first/last/fault-index reads. Matching tags or differing counters are snapshot observations, not allocation lifetime or race evidence."
-    })
-}
-
-fn is_known_per_cpu_tracker_layout(
-    time_date_stamp: u32,
-    image_size: u32,
-    expected_time_date_stamp: u32,
-    expected_image_size: u32,
-) -> bool {
-    time_date_stamp == expected_time_date_stamp && image_size == expected_image_size
-}
-
-fn pool_tracker_table_shape(table_size: u64, table_mask: Option<u64>) -> Value {
-    let power_of_two = table_size.is_power_of_two();
-    let expected_mask = power_of_two.then(|| table_size - 1);
-    let mask_matches = expected_mask
-        .zip(table_mask)
-        .map(|(expected, mask)| expected == mask);
-    json!({
-        "status": match mask_matches {
-            Some(true) => "consistent",
-            Some(false) => "inconsistent",
-            None => "not_evaluated",
-        },
-        "table_size_is_power_of_two": power_of_two,
-        "expected_mask_when_power_of_two": expected_mask,
-        "observed_mask": table_mask,
-        "detail": "A mask is compared only when the captured table size is a power of two. A mismatch is a direct central-table metadata inconsistency, not proof of an allocation lifetime transition."
+        "detail": "DbgEng did not expose an exact public pool-tracker type/layout contract for this target. Fixed entry strides, field offsets, tag decoding, central-table relations, and per-CPU topology are deliberately not decoded."
     })
 }
 
@@ -6136,58 +6019,16 @@ fn dump_processor_activity(processor_snapshot: &Value) -> Value {
             "detail": "The processor snapshot did not provide an iterable result."
         });
     };
-    let mut observations = Vec::new();
-    for processor in processors {
-        let processor_index = processor["processor_index"].as_u64();
-        let mut symbols = processor["current_symbol"]["name"]
-            .as_str()
-            .into_iter()
-            .chain(
-                processor["stack"]["frames"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .take(processor["stack"]["valid_frames"].as_u64().unwrap_or(0) as usize)
-                    .filter_map(|frame| frame["symbol"]["name"].as_str()),
-            )
-            .collect::<Vec<_>>();
-        symbols.sort_unstable();
-        symbols.dedup();
-        for symbol in symbols {
-            let lowered = symbol.to_ascii_lowercase();
-            let topic = if lowered.contains("pooltrack") {
-                Some("pool_tracker")
-            } else if lowered.contains("verifier") || lowered.starts_with("nt!vi") {
-                Some("driver_verifier")
-            } else if lowered.contains("dpc") {
-                Some("dpc_activity")
-            } else if lowered.contains("exallocatepool")
-                || lowered.contains("exfreepool")
-                || lowered.contains("exppool")
-            {
-                Some("pool_allocator")
-            } else {
-                None
-            };
-            if let Some(topic) = topic {
-                observations.push(json!({
-                    "processor_index": processor_index,
-                    "topic": topic,
-                    "symbol": symbol,
-                    "detail": "This is a captured current instruction or validated stack symbol from a saved processor context. It does not imply a race, recent writer, or causal relationship to the bugcheck."
-                }));
-            }
-        }
-    }
     json!({
         "status": if processor_snapshot["status"].as_str() == Some("unavailable") {
             "unavailable"
         } else {
-            "captured"
+            "unsupported_symbol_identity"
         },
         "logical_processor_count": processor_snapshot["logical_processor_count"],
-        "observations": observations,
-        "detail": "Only active threads selected by DbgEng for each exposed logical processor were examined. No process-wide or broad thread scan was performed."
+        "observations": [],
+        "returned_processor_count": processors.len(),
+        "detail": "Only active threads selected by DbgEng for each exposed logical processor were examined. Function-topic classification (pool tracker, allocator, verifier, or DPC) is intentionally disabled because this bounded snapshot does not establish exact PDB identity for DbgEng-returned function names. Raw instruction pointers and module mappings remain in processor_snapshot; no process-wide or broad thread scan was performed."
     })
 }
 
@@ -6261,13 +6102,34 @@ fn dump_fault_mechanics_audit(
         .and_then(|value| value["disassembly"]["lines"].as_array())
         .and_then(|lines| lines.first())
         .and_then(|line| line["text"].as_str());
-    let lower_instruction = instruction.map(str::to_ascii_lowercase);
-    let is_r8_r14_xadd = lower_instruction.as_deref().is_some_and(|text| {
-        text.contains("lock xadd")
-            && (text.contains("[r14+r8]") || text.contains("[r8+r14]"))
-            && text.contains("rbp")
-    });
-    let counter_raw_qword = r8.and_then(|entry_address| {
+    let is_r8_r14_xadd = exact_pool_tracker_xadd_instruction(fault);
+    let context_is_documented = exception_context_is_documented(exception_context);
+    let fault_instruction_matches_context_rip = fault_instruction_address
+        .zip(context_rip)
+        .map(|(fault, rip)| fault == rip);
+    let heuristic_record_access_address =
+        selected_heuristic_exception_record_access_address(exception_context);
+    let heuristic_effective_address_matches_record = heuristic_record_access_address
+        .zip(effective_address)
+        .map(|(record_address, context_address)| record_address == context_address);
+    let register_dataflow_status = if !is_r8_r14_xadd || effective_address.is_none() {
+        "incomplete"
+    } else if context_is_documented && fault_instruction_matches_context_rip == Some(true) {
+        "captured"
+    } else if fault_instruction_matches_context_rip != Some(true) {
+        "context_rip_mismatch"
+    } else if heuristic_record_access_address.is_some()
+        && heuristic_effective_address_matches_record != Some(true)
+    {
+        "conflicting_heuristic_context"
+    } else {
+        "heuristic_context_only"
+    };
+    let counter_raw_qword = r8.zip(r14).and_then(|(entry_address, offset)| {
+        (offset == 0x20)
+            .then(|| entry_address.checked_add(offset))
+            .flatten()
+            .filter(|address| Some(*address) == effective_address)?;
         pool_tracker["nearby_entries"]
             .as_array()?
             .iter()
@@ -6284,33 +6146,37 @@ fn dump_fault_mechanics_audit(
         "unavailable"
     };
     json!({
-        "status": if is_r8_r14_xadd && effective_address.is_some() {
-            "captured"
-        } else {
-            "incomplete"
-        },
+        "status": register_dataflow_status,
         "fault_instruction_address": fault_instruction_address,
         "context_rip": context_rip,
-        "fault_instruction_matches_context_rip": fault_instruction_address.zip(context_rip).map(|(fault, rip)| fault == rip),
+        "fault_instruction_matches_context_rip": fault_instruction_matches_context_rip,
         "context_source": context_source,
         "instruction": instruction,
+        "instruction_bytes": fault.as_ref().map(|value| value["instruction_bytes"].clone()),
         "memory_access": {
-            "kind": access_kind,
+            "kind": if is_r8_r14_xadd { access_kind } else { "unavailable" },
             "write_completion": "unknown",
-            "detail": "On x64, LOCK XADD reads and writes its memory destination atomically. A fault at this instruction establishes an attempted read-modify-write, not that its write completed or that a prior writer corrupted the destination."
+            "detail": "Only the exact bytes F0 4B 0F C1 2C 06 decode as LOCK XADD qword ptr [R14+R8], RBP. A fault at that instruction establishes an attempted atomic read-modify-write, not that its write completed or that a prior writer corrupted the destination."
         },
         "register_dataflow": {
-            "entry_base_r8": r8,
-            "observed_displacement_r14": r14,
-            "effective_address": effective_address,
-            "attempted_delta_rbp": rbp,
+            "status": register_dataflow_status,
+            "entry_base_r8": context_is_documented.then_some(r8).flatten(),
+            "heuristic_entry_base_r8": (!context_is_documented).then_some(r8).flatten(),
+            "r14_register_value": context_is_documented.then_some(r14).flatten(),
+            "heuristic_r14_register_value": (!context_is_documented).then_some(r14).flatten(),
+            "effective_address": (register_dataflow_status == "captured").then_some(effective_address).flatten(),
+            "heuristic_effective_address": (register_dataflow_status != "captured").then_some(effective_address).flatten(),
+            "attempted_delta_rbp": context_is_documented.then_some(rbp).flatten(),
+            "heuristic_attempted_delta_rbp": (!context_is_documented).then_some(rbp).flatten(),
             "effective_address_matches_r8_plus_r14": effective_address.zip(r8.zip(r14).and_then(|(base, offset)| base.checked_add(offset))).map(|(left, right)| left == right),
+            "heuristic_exception_record_access_address": heuristic_record_access_address,
+            "heuristic_effective_address_matches_exception_record": heuristic_effective_address_matches_record,
             "bounded_record_offset_20_raw_qword": counter_raw_qword,
-            "detail": "The offset and delta are direct register/instruction observations. The raw qword is preserved only when the existing bounded tracker-entry snapshot covers R8."
+            "detail": "R14 is a register value, not an instruction-encoded displacement. The offset-0x20 qword is retained only when R14 equals 0x20 and the bounded snapshot covers the computed operand. Heuristic register values are not promoted to a captured fault target."
         },
         "counter_field_semantics": {
             "status": "unsupported",
-            "detail": "No public typed layout identifies the qword at this build-observed offset as a named counter or defines its valid range. The inspector therefore does not classify the 0x110 delta or current qword as normal, malformed, overflowed, or corrupt."
+            "detail": "No public typed layout identifies the qword at the observed register-derived offset as a named counter or defines its valid range. The inspector therefore does not classify a delta or current qword as normal, malformed, overflowed, or corrupt."
         },
         "exception_provenance": {
             "status": target_exception["status"].as_str().unwrap_or("unavailable"),
@@ -6424,7 +6290,29 @@ fn dump_address_space_consistency(
     })
 }
 
+fn dump_address_space_consistency_unavailable_after_processor_restore_failure(
+    fault_target: Option<u64>,
+    tracker_table_base: Option<u64>,
+) -> Value {
+    json!({
+        "status": "unavailable_current_thread_not_preserved",
+        "fault_target_mapping": Value::Null,
+        "tracker_table_base_mapping": Value::Null,
+        "known_mapping_relation": "unavailable",
+        "fault_target_physical_page": Value::Null,
+        "tracker_table_base_physical_page": Value::Null,
+        "reverse_alias_enumeration": {
+            "status": "not_attempted",
+            "detail": "No mapping probe ran because the debugger did not preserve its original current thread."
+        },
+        "requested_fault_target": fault_target,
+        "requested_tracker_table_base": tracker_table_base,
+        "detail": "The bounded processor snapshot did not restore DbgEng's original current thread. No CR3-dependent virtual-to-physical mapping was attempted afterward, because it could describe a different address space."
+    })
+}
+
 fn address_mapping_physical_page(mapping: &Value) -> Option<u64> {
+    (mapping["page_table_walk_cross_check"]["status"].as_str() == Some("matched")).then_some(())?;
     mapping
         .pointer("/page_table_walk/final_mapping/physical_address")
         .and_then(Value::as_u64)
@@ -6436,188 +6324,20 @@ fn dump_address_inspection(
     address: u64,
     supplied_table_base: Option<u64>,
 ) -> Value {
-    const ENTRY_STRIDE: u64 = 0x50;
     let mapping = session.inspect_virtual_address(address);
-    let table_size = evaluate_unsigned(session, "poi(nt!PoolTrackTableSize)").ok();
-    let supplied_table = table_size.map(|size| {
-        pool_tracker_table_relation(Some(address), supplied_table_base, size, ENTRY_STRIDE)
-    });
     json!({
         "address": address,
         "mapping": mapping,
-        "bounded_raw_window": pool_tracker_entry_snapshot(session, address),
-        "supplied_table": supplied_table,
+        "pool_tracker_layout": {
+            "status": "unsupported_private_layout",
+            "supplied_table_base": supplied_table_base,
+            "detail": "No exact public type/layout contract exposed the pool-tracker entry stride, table size, or field offsets for this dump. The supplied address is not classified as a tracker record."
+        },
         "allocation_header": {
             "status": "unsupported",
-            "detail": "DbgEng exposes no stable typed pool-header/owner API for this offline kernel dump. The raw 0x50-byte record is preserved, but no allocation lifetime, owner, or pool-header interpretation is inferred."
+            "detail": "DbgEng exposes no stable typed pool-header/owner API for this offline kernel dump. No raw allocation-header interpretation is inferred."
         },
-        "detail": "The address probe is bounded and read-only. A successful dump read or virtual-to-physical translation does not establish write permission or the historical PTE state at the fault instant."
-    })
-}
-
-fn pool_tracker_table_relation(
-    address: Option<u64>,
-    table_base: Option<u64>,
-    table_size: u64,
-    entry_stride: u64,
-) -> Value {
-    let Some(address) = address else {
-        return json!({
-            "status": "not_applicable",
-            "relation": "no_address",
-        });
-    };
-    let Some(table_base) = table_base else {
-        return json!({
-            "status": "not_provided",
-            "relation": "table_base_not_provided",
-        });
-    };
-    let Some(table_bytes) = table_size.checked_mul(entry_stride) else {
-        return json!({
-            "status": "unavailable",
-            "relation": "range_overflow",
-        });
-    };
-    let Some(table_end) = table_base.checked_add(table_bytes) else {
-        return json!({
-            "status": "unavailable",
-            "relation": "range_overflow",
-        });
-    };
-    if !(table_base..table_end).contains(&address) {
-        return json!({
-            "status": "captured",
-            "relation": "outside_supplied_table",
-            "table_base": table_base,
-            "table_end_exclusive": table_end,
-        });
-    }
-    let offset = address - table_base;
-    let entry_aligned = offset % entry_stride == 0;
-    json!({
-        "status": "captured",
-        "relation": if entry_aligned { "within_supplied_table" } else { "within_supplied_table_unaligned" },
-        "table_base": table_base,
-        "table_end_exclusive": table_end,
-        "entry_offset": offset,
-        "entry_index": offset / entry_stride,
-        "entry_aligned": entry_aligned,
-        "detail": "The supplied base is caller evidence. This range check establishes address membership only; it does not prove the table's allocation ownership or lifetime."
-    })
-}
-
-fn pool_tracker_entry_provenance(
-    fault: &Option<Value>,
-    entry_address: Option<u64>,
-    r14: Option<u64>,
-) -> Value {
-    let fault_symbol = fault
-        .as_ref()
-        .and_then(|value| value["disassembly"]["lines"].as_array())
-        .and_then(|lines| lines.first())
-        .and_then(|line| line["symbol"]["name"].as_str());
-    let fault_instruction = fault
-        .as_ref()
-        .and_then(|value| value["disassembly"]["lines"].as_array())
-        .and_then(|lines| lines.first())
-        .and_then(|line| line["text"].as_str());
-    let instruction_uses_r8 =
-        fault_instruction
-            .map(str::to_ascii_lowercase)
-            .is_some_and(|instruction| {
-                instruction.contains("[r14+r8]") || instruction.contains("[r8+r14]")
-            });
-    let tracker_charge_function = fault_symbol
-        .map(str::to_ascii_lowercase)
-        .is_some_and(|symbol| symbol.contains("exppooltrackerchargeentry"));
-    json!({
-        "status": if entry_address.is_some() && r14.is_some() && instruction_uses_r8 && tracker_charge_function {
-            "validated"
-        } else {
-            "unvalidated"
-        },
-        "source": "fault_instruction_and_decoded_registers",
-        "fault_symbol": fault_symbol,
-        "fault_instruction": fault_instruction,
-        "instruction_uses_r8_memory_operand": instruction_uses_r8,
-        "tracker_charge_function": tracker_charge_function,
-        "detail": "A validated result requires a captured R8/R14 context plus a fault instruction in ExpPoolTrackerChargeEntry that uses R8 as a memory operand. It establishes register-to-instruction provenance, not allocation ownership or free history.",
-    })
-}
-
-fn evaluate_unsigned(session: &DebuggerSession, expression: &str) -> Result<u64, String> {
-    session
-        .evaluate(expression)
-        .map_err(|error| format!("DbgEng could not evaluate {expression}: {error}"))?
-        .unsigned_value
-        .ok_or_else(|| format!("DbgEng evaluated {expression} without an unsigned integer result."))
-}
-
-fn pool_tracker_entry_snapshot(session: &DebuggerSession, address: u64) -> Value {
-    const READ_SIZE: u32 = 0x50;
-    match session.read_memory(address, READ_SIZE) {
-        Ok(memory) => {
-            let Some(bytes) = decode_hex_bytes(&memory.data) else {
-                return json!({
-                    "address": address,
-                    "status": "invalid_hex",
-                    "memory": memory,
-                });
-            };
-            let read_u64 = |offset: usize| {
-                bytes
-                    .get(offset..offset + std::mem::size_of::<u64>())
-                    .and_then(|value| value.try_into().ok())
-                    .map(u64::from_le_bytes)
-            };
-            let tag = read_u64(0).map(|value| (value & u32::MAX as u64) as u32);
-            json!({
-                "address": address,
-                "status": if memory.complete { "captured" } else { "partial" },
-                "tag": tag.map(pool_tag_value),
-                "raw_qwords": {
-                    "offset_00": read_u64(0),
-                    "offset_08": read_u64(8),
-                    "offset_10": read_u64(16),
-                    "offset_18": read_u64(24),
-                    "offset_20": read_u64(32),
-                    "offset_28": read_u64(40),
-                    "offset_30": read_u64(48),
-                    "offset_38": read_u64(56),
-                    "offset_40": read_u64(64),
-                    "offset_48": read_u64(72),
-                },
-                "memory": memory,
-            })
-        }
-        Err(error) => json!({
-            "address": address,
-            "status": "unavailable",
-            "detail": format!("DbgEng could not read the bounded pool tracker entry: {error}"),
-        }),
-    }
-}
-
-fn pool_tag_value(tag: u32) -> Value {
-    let bytes = tag.to_le_bytes();
-    let printable = bytes
-        .iter()
-        .all(|byte| byte.is_ascii_graphic() || *byte == b' ');
-    let text = bytes
-        .iter()
-        .map(|byte| {
-            if byte.is_ascii_graphic() || *byte == b' ' {
-                char::from(*byte)
-            } else {
-                '.'
-            }
-        })
-        .collect::<String>();
-    json!({
-        "raw": tag,
-        "text": text,
-        "printable": printable,
+        "detail": "The address probe is bounded and read-only. A successful virtual-to-physical translation does not establish write permission or the historical PTE state at the fault instant."
     })
 }
 
@@ -6637,27 +6357,17 @@ fn decode_hex_bytes(value: &str) -> Option<Vec<u8>> {
 }
 
 fn dump_evidence_grades(
-    driver_evidence: &Value,
-    pool_tracker: &Value,
+    _driver_evidence: &Value,
+    _pool_tracker: &Value,
     bugcheck_driver: &Value,
 ) -> Value {
-    let tracker_classification = pool_tracker["classification"].as_str();
-    let tracker_grade = match tracker_classification {
-        Some("active_tracker_table_entry" | "supplied_tracker_table_entry") => "observed",
-        Some(_) => "possible",
-        None => "not_established",
-    };
+    let tracker_grade = "not_established";
     let driver_grade = match bugcheck_driver["status"].as_str() {
         Some("captured") => "observed",
         Some("not_set") => "not_established",
         _ => "not_established",
     };
-    let external_driver_grade =
-        if driver_evidence["status"].as_str() == Some("direct_evidence_present") {
-            "observed"
-        } else {
-            "not_established"
-        };
+    let external_driver_grade = "not_established";
     json!({
         "grading_scale": {
             "observed": "Captured directly from the dump.",
@@ -6669,7 +6379,7 @@ fn dump_evidence_grades(
             {
                 "topic": "pool_tracker_entry_lifetime",
                 "grade": tracker_grade,
-                "detail": "Central-table range membership alone does not classify per-CPU tracker replicas. A supplied per-CPU base can establish bounded table membership, but not allocation ownership, free history, or a lifetime transition.",
+                "detail": "No exact public pool-tracker layout is available for this target, so the dump provides no validated tracker-entry lifetime evidence.",
             },
             {
                 "topic": "bugcheck_driver",
@@ -6679,7 +6389,7 @@ fn dump_evidence_grades(
             {
                 "topic": "third_party_driver_causation",
                 "grade": external_driver_grade,
-                "detail": "Loaded modules are inventory only. Attribution requires a fault, validated stack, or populated bugcheck-driver observation.",
+                "detail": "Loaded modules and module-mapped saved stack references are contextual only. A populated bugcheck-driver field can be direct attribution evidence; a stack reference alone is not.",
             },
         ],
     })
@@ -6849,24 +6559,21 @@ fn dump_driver_evidence(
     }
     for module in stack_modules {
         observations.push(json!({
-            "kind": "validated_stack_module",
-            "rank": "high",
+            "kind": "module_mapped_stack_module",
+            "rank": "contextual",
             "module": module,
-            "detail": "A non-kernel module appeared in a validated stack frame.",
+            "detail": "A non-kernel module was mapped from a DbgEng-returned saved stack instruction offset. This is contextual evidence, not independent unwind validation or causation.",
         }));
     }
 
     json!({
-        "status": if observations.iter().any(|item| item["rank"] == "high") {
-            "direct_evidence_present"
-        } else {
-            "no_driver_implicated"
-        },
+        "status": "bounded_observations",
+        "direct_driver_attribution": false,
         "observations": observations,
         "loaded_module_count": modules.len(),
         "inventory_rank": "not_implicated",
         "detail": format!(
-            "Loaded-module inventory is context only. {} direct fault-module observations were captured; dump-stack participants must not be treated as crash causes without a fault or stack reference.",
+            "Loaded-module inventory is context only. {} fault-location module observations were captured. Module-mapped saved stack references do not establish unwind correctness, driver activity, or causation; their absence does not exclude driver involvement.",
             direct_modules.len()
         ),
     })
@@ -6913,11 +6620,11 @@ fn dump_recommendations(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         0x0000_003B => json!([
             {
                 "priority": "high",
-                "detail": "Use the captured exception context and fault instruction to identify a validated caller. If it remains unavailable, collect a kernel or complete dump.",
+                "detail": "Use the captured exception context and fault instruction to identify module-mapped saved-frame context. If it remains unavailable, collect a kernel or complete dump.",
             },
             {
                 "priority": "medium",
-                "detail": "Treat a kernel-only fault location as possible data corruption until a driver appears in validated stack or bugcheck-driver evidence.",
+                "detail": "Treat a kernel-only fault location as possible data corruption until direct bugcheck-driver evidence or independently corroborated execution evidence is available.",
             },
         ]),
         0x0000_0051 => json!([
@@ -6932,7 +6639,7 @@ fn dump_recommendations(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         ]),
         _ => json!([{
             "priority": "collect",
-            "detail": "Use the typed bugcheck parameters, validated stack, symbols, and driver evidence before attributing a crash.",
+            "detail": "Use typed bugcheck parameters, module-mapped saved-frame references, identity-validated symbols, and direct driver evidence before attributing a crash.",
         }]),
     }
 }
@@ -8232,6 +7939,79 @@ mod tests {
     }
 
     #[test]
+    fn accepts_only_documented_context_sources_as_captured_registers() {
+        assert!(exception_context_is_documented(&Some(json!({
+            "selection": "parameter_3_exception_context"
+        }))));
+        assert!(exception_context_is_documented(&Some(json!({
+            "selection": "documented_dbgeng_target_exception_context"
+        }))));
+        assert!(!exception_context_is_documented(&Some(json!({
+            "selection": "heuristic_parameter_4_context"
+        }))));
+    }
+
+    #[test]
+    fn cohort_context_shape_keeps_documented_bugcheck_context_distinct_from_heuristic() {
+        let documented = dump_cohort_context_shape(
+            Some(0x1000),
+            &json!({}),
+            &Some(json!({
+                "selection": "parameter_3_exception_context",
+                "context": {
+                    "registers": { "rip": 0x1000, "r8": 0x2000, "r14": 0x20, "rbp": 0x110 }
+                }
+            })),
+        );
+        assert_eq!(documented["provenance"], "documented_bugcheck_context");
+        assert_eq!(
+            documented["effective_address_r8_plus_r14"],
+            json!(0x2020u64)
+        );
+        assert!(documented["heuristic_effective_address_r8_plus_r14"].is_null());
+
+        let heuristic = dump_cohort_context_shape(
+            Some(0x1000),
+            &json!({}),
+            &Some(json!({
+                "selection": "heuristic_parameter_4_context",
+                "context": {
+                    "registers": { "rip": 0x1000, "r8": 0x2000, "r14": 0x20, "rbp": 0x110 }
+                }
+            })),
+        );
+        assert_eq!(
+            heuristic["provenance"],
+            "heuristic_bugcheck_parameter_context"
+        );
+        assert_eq!(
+            heuristic["heuristic_effective_address_r8_plus_r14"],
+            json!(0x2020u64)
+        );
+        assert!(heuristic["effective_address_r8_plus_r14"].is_null());
+    }
+
+    #[test]
+    fn cohort_context_shape_rejects_documented_context_with_unrelated_rip() {
+        let context_shape = dump_cohort_context_shape(
+            Some(0x1000),
+            &json!({
+                "context": {
+                    "registers": { "rip": 0x2000, "r8": 0x3000, "r14": 0x20 }
+                }
+            }),
+            &None,
+        );
+
+        assert_eq!(context_shape["status"], "unavailable");
+        assert_eq!(
+            context_shape["provenance"],
+            "documented_context_rip_mismatch"
+        );
+        assert!(context_shape["effective_address_r8_plus_r14"].is_null());
+    }
+
+    #[test]
     fn dump_triage_describes_kmode_exception_parameters_and_fault_address() {
         let data = windbg_dbgeng::BugCheckData {
             code: 0x1E,
@@ -8253,72 +8033,25 @@ mod tests {
     }
 
     #[test]
-    fn pool_tracker_helpers_preserve_raw_evidence() {
+    fn evidence_grades_do_not_promote_unavailable_tracker_layouts() {
         assert_eq!(
             decode_hex_bytes("4B65792000000000"),
             Some(b"Key \0\0\0\0".to_vec())
         );
         assert_eq!(decode_hex_bytes("F"), None);
-        assert_eq!(pool_tag_value(u32::from_le_bytes(*b"Key "))["text"], "Key ");
-        assert_eq!(pool_tag_value(0)["printable"], false);
 
         let grades = dump_evidence_grades(
             &json!({"status": "inventory_only"}),
-            &json!({"classification": "outside_central_table_tracker_like_unclassified"}),
+            &json!({"status": "unsupported_private_layout"}),
             &json!({"status": "not_set"}),
         );
-        assert_eq!(grades["observations"][0]["grade"], "possible");
+        assert_eq!(grades["observations"][0]["grade"], "not_established");
         assert_eq!(grades["observations"][1]["grade"], "not_established");
         assert_eq!(grades["observations"][2]["grade"], "not_established");
     }
 
     #[test]
-    fn pool_tracker_table_relation_requires_a_supplied_aligned_base() {
-        let within = pool_tracker_table_relation(Some(0x150), Some(0x100), 4, 0x50);
-        assert_eq!(within["relation"], "within_supplied_table");
-        assert_eq!(within["entry_index"], 1);
-
-        let unaligned = pool_tracker_table_relation(Some(0x151), Some(0x100), 4, 0x50);
-        assert_eq!(unaligned["relation"], "within_supplied_table_unaligned");
-
-        let missing = pool_tracker_table_relation(Some(0x150), None, 4, 0x50);
-        assert_eq!(missing["relation"], "table_base_not_provided");
-    }
-
-    #[test]
-    fn per_cpu_tracker_layout_requires_exact_module_fingerprint() {
-        assert!(is_known_per_cpu_tracker_layout(
-            0x4A63_AF4E,
-            0x0145_0000,
-            0x4A63_AF4E,
-            0x0145_0000,
-        ));
-        assert!(!is_known_per_cpu_tracker_layout(
-            0x4A63_AF4F,
-            0x0145_0000,
-            0x4A63_AF4E,
-            0x0145_0000,
-        ));
-    }
-
-    #[test]
-    fn pool_tracker_table_shape_requires_a_power_of_two_mask_match() {
-        assert_eq!(
-            pool_tracker_table_shape(1024, Some(1023))["status"],
-            "consistent"
-        );
-        assert_eq!(
-            pool_tracker_table_shape(1024, Some(1024))["status"],
-            "inconsistent"
-        );
-        assert_eq!(
-            pool_tracker_table_shape(1000, Some(999))["status"],
-            "not_evaluated"
-        );
-    }
-
-    #[test]
-    fn processor_activity_keeps_symbols_as_snapshot_observations() {
+    fn processor_activity_withholds_function_topics_without_identity_validation() {
         let value = dump_processor_activity(&json!({
             "status": "captured",
             "logical_processor_count": 2,
@@ -8332,11 +8065,9 @@ mod tests {
             }]
         }));
 
-        assert_eq!(value["status"], "captured");
-        assert_eq!(value["observations"].as_array().unwrap().len(), 2);
-        assert_eq!(value["observations"][0]["processor_index"], 1);
-        assert_eq!(value["observations"][0]["topic"], "pool_tracker");
-        assert_eq!(value["observations"][1]["topic"], "dpc_activity");
+        assert_eq!(value["status"], "unsupported_symbol_identity");
+        assert_eq!(value["returned_processor_count"], 1);
+        assert_eq!(value["observations"], json!([]));
     }
 
     #[test]
@@ -8350,7 +8081,7 @@ mod tests {
             detail: "fixture".to_string(),
         };
         let context = Some(json!({
-            "selection": "heuristic_parameter_4_context",
+            "selection": "documented_dbgeng_target_exception_context",
             "context": {
                 "registers": {
                     "rip": 0x1000,
@@ -8362,6 +8093,7 @@ mod tests {
             }
         }));
         let fault = Some(json!({
+            "instruction_bytes": {"data": "f04b0fc12c06"},
             "disassembly": {
                 "lines": [{
                     "text": "lock xadd qword ptr [r14+r8],rbp"
@@ -8392,6 +8124,7 @@ mod tests {
         assert_eq!(audit["interrupt_state"]["interrupt_enable_flag"], true);
 
         let incompatible_fault = Some(json!({
+            "instruction_bytes": {"data": "4983c420"},
             "disassembly": { "lines": [{ "text": "add qword ptr [r14+r8],rbp" }] }
         }));
         assert_eq!(
@@ -8404,6 +8137,54 @@ mod tests {
             )["status"],
             "incomplete"
         );
+    }
+
+    #[test]
+    fn fault_mechanics_withholds_heuristic_context_effective_address_on_conflict() {
+        let bugcheck = windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(windbg_dbgeng::BugCheckData {
+                code: 0x1E,
+                parameters: [0xC000_0005, 0x1000, 0, 0x2000],
+            }),
+            detail: "fixture".to_string(),
+        };
+        let context = Some(json!({
+            "selection": "heuristic_parameter_4_context",
+            "exception_record_candidate": {
+                "record": {
+                    "access_violation": {"address": 0xffff_ffff_ffff_ffffu64}
+                }
+            },
+            "context": {
+                "registers": {
+                    "rip": 0x1000,
+                    "r8": 0x2000,
+                    "r14": 0x30,
+                    "rbp": 0x110,
+                    "eflags": 0x202
+                }
+            }
+        }));
+        let fault = Some(json!({
+            "instruction_bytes": {"data": "f04b0fc12c06"},
+            "disassembly": {"lines": [{"text": "lock xadd qword ptr [r14+r8],rbp"}]}
+        }));
+        let audit = dump_fault_mechanics_audit(
+            &bugcheck,
+            &context,
+            &fault,
+            &json!({"nearby_entries": [{"address": 0x2000, "raw_qwords": {"offset_20": 0x55}}]}),
+            &json!({"status": "captured", "record": {"code": 0xC0000005u32}}),
+        );
+
+        assert_eq!(audit["status"], "conflicting_heuristic_context");
+        assert_eq!(
+            audit["register_dataflow"]["status"],
+            "conflicting_heuristic_context"
+        );
+        assert!(audit["register_dataflow"]["effective_address"].is_null());
+        assert!(audit["register_dataflow"]["bounded_record_offset_20_raw_qword"].is_null());
     }
 
     #[test]
@@ -8441,11 +8222,6 @@ mod tests {
             recurrence["fault_instruction_bytes"]["status"],
             "consistent_across_analyzed_dumps"
         );
-        assert_eq!(
-            cohort_instruction_bytes("fffff800`1234 f04b0fc12c06 lock xadd"),
-            Some("f04b0fc12c06")
-        );
-        assert_eq!(cohort_instruction_bytes("nt!Foo"), None);
     }
 
     #[test]
@@ -8459,7 +8235,7 @@ mod tests {
                         {"identity": {"module_name": "loaded_only", "image_size": 4, "time_date_stamp": 5, "checksum": 6}}
                     ]
                 },
-                "validated_stack_module_families": {"families": ["nt"]},
+                "module_mapped_stack_module_families": {"status": "captured", "families": ["nt"]},
                 "driver_filter_evidence": {"bugcheck_driver": {"status": "not_set"}}
             }),
             json!({
@@ -8469,7 +8245,7 @@ mod tests {
                         {"identity": {"module_name": "nt", "image_size": 1, "time_date_stamp": 2, "checksum": 3}}
                     ]
                 },
-                "validated_stack_module_families": {"families": ["nt", "other"]},
+                "module_mapped_stack_module_families": {"status": "captured", "families": ["nt", "other"]},
                 "driver_filter_evidence": {"bugcheck_driver": {"status": "captured", "driver_name": "other.sys"}}
             }),
         ];
@@ -8483,7 +8259,7 @@ mod tests {
             json!([{"module_name": "nt", "image_size": 1, "time_date_stamp": 2, "checksum": 3}])
         );
         assert_eq!(
-            lifecycle["validated_stack_participation"]
+            lifecycle["module_mapped_stack_participation"]
                 ["identities_or_modules_present_in_every_observed_dump"],
             json!(["nt"])
         );
@@ -8501,7 +8277,7 @@ mod tests {
             }),
             &json!({
                 "loaded_module_identities": {"status": "captured"},
-                "validated_stack_participation": {"status": "captured"},
+                "module_mapped_stack_participation": {"status": "captured"},
                 "direct_bugcheck_driver": {"status": "unavailable"}
             }),
             3,
@@ -8509,10 +8285,7 @@ mod tests {
 
         assert_eq!(synthesis["schema"], "windbg-tool.dump-cohort-evidence.v1");
         assert_eq!(synthesis["analyzed_dump_count"], 3);
-        assert_eq!(
-            synthesis["evidence"][0]["provenance"],
-            "symbolized-and-validated"
-        );
+        assert_eq!(synthesis["evidence"][0]["provenance"], "direct-context");
         assert_eq!(
             synthesis["confidence_matrix"]["ruled_out_explanations"],
             json!([])
@@ -8522,6 +8295,7 @@ mod tests {
     #[test]
     fn mapping_relation_compares_only_explicit_physical_pages() {
         let mapping = json!({
+            "page_table_walk_cross_check": {"status": "matched"},
             "page_table_walk": {
                 "final_mapping": {
                     "physical_address": 0x1363_BDD10u64
@@ -8534,6 +8308,18 @@ mod tests {
     }
 
     #[test]
+    fn suppresses_cr3_dependent_mappings_after_thread_restore_failure() {
+        let result = dump_address_space_consistency_unavailable_after_processor_restore_failure(
+            Some(0xffff_8581_bd06_8d10),
+            Some(0xffff_8581_bd05_1000),
+        );
+
+        assert_eq!(result["status"], "unavailable_current_thread_not_preserved");
+        assert!(result["fault_target_mapping"].is_null());
+        assert_eq!(result["known_mapping_relation"], "unavailable");
+    }
+
+    #[test]
     fn allocation_adjacent_metadata_refuses_unvalidated_raw_layouts() {
         let metadata = dump_allocation_adjacent_metadata_feasibility();
 
@@ -8543,26 +8329,6 @@ mod tests {
         assert_eq!(
             metadata["special_pool_and_verifier"]["status"],
             "unsupported"
-        );
-    }
-
-    #[test]
-    fn pool_tracker_provenance_requires_matching_fault_instruction() {
-        let fault = Some(json!({
-            "disassembly": {
-                "lines": [{
-                    "symbol": { "name": "nt!ExpPoolTrackerChargeEntry" },
-                    "text": "lock xadd qword ptr [r14+r8], rbp"
-                }]
-            }
-        }));
-        assert_eq!(
-            pool_tracker_entry_provenance(&fault, Some(0x1000), Some(0x20))["status"],
-            "validated"
-        );
-        assert_eq!(
-            pool_tracker_entry_provenance(&fault, Some(0x1000), None)["status"],
-            "unvalidated"
         );
     }
 

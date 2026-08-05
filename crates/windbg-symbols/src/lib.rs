@@ -163,6 +163,13 @@ pub enum NativeSymbolStatus {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PdbIdentityValidation {
+    Unverified,
+    NotAvailable,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct NativeSymbolResult {
     pub status: NativeSymbolStatus,
@@ -170,6 +177,19 @@ pub struct NativeSymbolResult {
     pub cache_dir: PathBuf,
     pub pdb_path: Option<PathBuf>,
     pub detail: String,
+}
+
+impl NativeSymbolResult {
+    pub fn pdb_identity_validation(&self) -> PdbIdentityValidation {
+        match self.status {
+            NativeSymbolStatus::Cached | NativeSymbolStatus::Downloaded => {
+                PdbIdentityValidation::Unverified
+            }
+            NativeSymbolStatus::OfflineMissing | NativeSymbolStatus::Unavailable => {
+                PdbIdentityValidation::NotAvailable
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -244,13 +264,11 @@ pub fn prefetch_pdb(
     let identity = inspect_pe_identity(image_path)?;
     let expected_path = cache_dir.join(&identity.codeview.pdb_store_path);
     if expected_path.is_file() {
-        return Ok(NativeSymbolResult {
-            status: NativeSymbolStatus::Cached,
+        return Ok(unverified_cached_pdb_result(
             identity,
-            cache_dir: cache_dir.to_path_buf(),
-            pdb_path: Some(expected_path),
-            detail: "A matching PDB is already present in the native symbol cache.".to_string(),
-        });
+            cache_dir,
+            expected_path,
+        ));
     }
     if offline {
         return Ok(NativeSymbolResult {
@@ -258,18 +276,43 @@ pub fn prefetch_pdb(
             identity,
             cache_dir: cache_dir.to_path_buf(),
             pdb_path: None,
-            detail: "Offline mode prevented native symbol download and the matching PDB is absent from the cache.".to_string(),
+            detail: "Offline mode prevented native symbol download and no PDB exists at the CodeView-derived cache path.".to_string(),
         });
     }
     let downloaded_path = download_pdb(&identity.codeview, cache_dir)?;
-    Ok(NativeSymbolResult {
+    Ok(unverified_downloaded_pdb_result(
+        identity,
+        cache_dir,
+        downloaded_path,
+    ))
+}
+
+fn unverified_cached_pdb_result(
+    identity: PeIdentity,
+    cache_dir: &Path,
+    expected_path: PathBuf,
+) -> NativeSymbolResult {
+    NativeSymbolResult {
+        status: NativeSymbolStatus::Cached,
+        identity,
+        cache_dir: cache_dir.to_path_buf(),
+        pdb_path: Some(expected_path),
+        detail: "A PDB exists at the CodeView-derived cache path, but this tool has not parsed its MSF stream to validate the embedded GUID and age. It is not configured as a matching symbol file.".to_string(),
+    }
+}
+
+fn unverified_downloaded_pdb_result(
+    identity: PeIdentity,
+    cache_dir: &Path,
+    downloaded_path: PathBuf,
+) -> NativeSymbolResult {
+    NativeSymbolResult {
         status: NativeSymbolStatus::Downloaded,
         identity,
         cache_dir: cache_dir.to_path_buf(),
         pdb_path: Some(downloaded_path),
-        detail: "Downloaded the matching PDB with the Rust-native symbol-server client."
-            .to_string(),
-    })
+        detail: "The PDB was downloaded from the CodeView-derived symbol-server path, but this tool has not parsed its MSF stream to validate the embedded GUID and age. It is not configured as a matching symbol file.".to_string(),
+    }
 }
 
 fn download_pdb(identity: &CodeViewIdentity, cache_dir: &Path) -> anyhow::Result<PathBuf> {
@@ -649,6 +692,68 @@ mod tests {
         assert_eq!(cached.status, NativeImageStatus::Cached);
         assert_eq!(cached.image_path.as_deref(), Some(cached_path.as_path()));
         fs::remove_dir_all(cache).unwrap();
+    }
+
+    #[test]
+    fn cached_pdb_is_identity_unverified_until_its_msf_stream_is_parsed() {
+        let cache = test_directory();
+        let identity = PeIdentity {
+            image_name: "ntoskrnl.exe".to_string(),
+            image_timestamp: 0x4A63_AF4E,
+            image_size: 0x0145_0000,
+            image_store_key: "4A63AF4E1450000".to_string(),
+            image_store_path: "ntoskrnl.exe\\4A63AF4E1450000\\ntoskrnl.exe".to_string(),
+            codeview: CodeViewIdentity {
+                pdb_name: "ntkrnlmp.pdb".to_string(),
+                pdb_guid: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+                pdb_age: 1,
+                pdb_store_key: "0123456789ABCDEF0123456789ABCDEF1".to_string(),
+                pdb_store_path: "ntkrnlmp.pdb\\0123456789ABCDEF0123456789ABCDEF1\\ntkrnlmp.pdb"
+                    .to_string(),
+            },
+        };
+        let cached_path = cache.join(&identity.codeview.pdb_store_path);
+
+        let result = unverified_cached_pdb_result(identity, &cache, cached_path.clone());
+
+        assert!(matches!(result.status, NativeSymbolStatus::Cached));
+        assert_eq!(
+            result.pdb_identity_validation(),
+            PdbIdentityValidation::Unverified
+        );
+        assert_eq!(result.pdb_path.as_deref(), Some(cached_path.as_path()));
+        assert!(result.detail.contains("not parsed"));
+    }
+
+    #[test]
+    fn downloaded_pdb_is_identity_unverified_until_its_msf_stream_is_parsed() {
+        let cache = test_directory();
+        let identity = PeIdentity {
+            image_name: "ntoskrnl.exe".to_string(),
+            image_timestamp: 0x4A63_AF4E,
+            image_size: 0x0145_0000,
+            image_store_key: "4A63AF4E1450000".to_string(),
+            image_store_path: "ntoskrnl.exe\\4A63AF4E1450000\\ntoskrnl.exe".to_string(),
+            codeview: CodeViewIdentity {
+                pdb_name: "ntkrnlmp.pdb".to_string(),
+                pdb_guid: "0123456789ABCDEF0123456789ABCDEF".to_string(),
+                pdb_age: 1,
+                pdb_store_key: "0123456789ABCDEF0123456789ABCDEF1".to_string(),
+                pdb_store_path: "ntkrnlmp.pdb\\0123456789ABCDEF0123456789ABCDEF1\\ntkrnlmp.pdb"
+                    .to_string(),
+            },
+        };
+        let downloaded_path = cache.join(&identity.codeview.pdb_store_path);
+
+        let result = unverified_downloaded_pdb_result(identity, &cache, downloaded_path.clone());
+
+        assert!(matches!(result.status, NativeSymbolStatus::Downloaded));
+        assert_eq!(
+            result.pdb_identity_validation(),
+            PdbIdentityValidation::Unverified
+        );
+        assert_eq!(result.pdb_path.as_deref(), Some(downloaded_path.as_path()));
+        assert!(result.detail.contains("not parsed"));
     }
 
     fn test_pe_header(timestamp: u32, image_size: u32) -> Vec<u8> {

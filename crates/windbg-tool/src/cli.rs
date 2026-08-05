@@ -1311,7 +1311,7 @@ struct DumpInspectArgs {
     #[arg(
         long,
         value_name = "ADDRESS",
-        help = "Known per-CPU pool-tracker table base used to classify --inspect-address or the captured tracker entry"
+        help = "Additional caller-supplied address whose preserved mapping can be compared with --inspect-address; no private pool-tracker layout is decoded"
     )]
     tracker_table_base: Option<String>,
 }

@@ -804,7 +804,17 @@ pub struct VirtualAddressInspection {
     pub virtual_region: Option<VirtualMemoryRegion>,
     pub query_virtual_detail: String,
     pub page_table_walk: X64PageTableWalk,
+    pub page_table_walk_cross_check: VirtualAddressTranslationCrossCheck,
     pub extension_command_bridge: ExtensionCommandBridgeStatus,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VirtualAddressTranslationCrossCheck {
+    pub status: String,
+    pub virtual_to_physical_address: Option<u64>,
+    pub page_table_walk_address: Option<u64>,
+    pub matches: Option<bool>,
     pub detail: String,
 }
 
@@ -1106,7 +1116,7 @@ pub struct ProcessorSnapshotResult {
     pub status: String,
     pub logical_processor_count: Option<u32>,
     pub returned: usize,
-    pub validated_stack_count: usize,
+    pub nonempty_saved_stack_count: usize,
     pub unwind_limited_stack_count: usize,
     pub max_frames_per_processor: u32,
     pub processors: Vec<ProcessorSnapshot>,
@@ -1374,6 +1384,44 @@ fn x64_page_table_entry(
         global: is_leaf.then_some(raw_value & (1 << 8) != 0),
         no_execute: raw_value & (1 << 63) != 0,
         page_frame_number: (raw_value & X64_PHYSICAL_ADDRESS_MASK) >> 12,
+    }
+}
+
+fn x64_large_page_physical_address(raw_value: u64, address: u64, page_size: u64) -> u64 {
+    let page_base_mask = X64_PHYSICAL_ADDRESS_MASK & !(page_size - 1);
+    (raw_value & page_base_mask) | (address & (page_size - 1))
+}
+
+fn virtual_address_translation_cross_check(
+    virtual_to_physical_address: Option<u64>,
+    page_table_walk: &X64PageTableWalk,
+) -> VirtualAddressTranslationCrossCheck {
+    let page_table_walk_address = page_table_walk
+        .final_mapping
+        .as_ref()
+        .map(|mapping| mapping.physical_address);
+    match (virtual_to_physical_address, page_table_walk_address) {
+        (Some(virtual_to_physical_address), Some(page_table_walk_address)) => {
+            let matches = virtual_to_physical_address == page_table_walk_address;
+            VirtualAddressTranslationCrossCheck {
+                status: if matches {
+                    "matched".to_string()
+                } else {
+                    "mismatch".to_string()
+                },
+                virtual_to_physical_address: Some(virtual_to_physical_address),
+                page_table_walk_address: Some(page_table_walk_address),
+                matches: Some(matches),
+                detail: "DbgEng VirtualToPhysical and the bounded raw physical page-table walk were compared for this preserved snapshot. A match does not reconstruct historical mapping state.".to_string(),
+            }
+        }
+        _ => VirtualAddressTranslationCrossCheck {
+            status: "unavailable".to_string(),
+            virtual_to_physical_address,
+            page_table_walk_address,
+            matches: None,
+            detail: "A comparison requires both a DbgEng VirtualToPhysical result and a completed bounded raw physical page-table walk.".to_string(),
+        },
     }
 }
 
@@ -1984,6 +2032,30 @@ impl DebuggerSession {
         )
     }
 
+    pub fn x64_exception_record(
+        &self,
+        exception_record_address: u64,
+    ) -> anyhow::Result<TargetExceptionRecord> {
+        let mut buffer = [0u8; EXCEPTION_RECORD64_SIZE];
+        let mut bytes_read = 0u32;
+        unsafe {
+            self.data_spaces.ReadVirtual(
+                exception_record_address,
+                buffer.as_mut_ptr().cast(),
+                buffer.len() as u32,
+                Some(&mut bytes_read),
+            )?;
+        }
+        ensure!(
+            bytes_read == buffer.len() as u32,
+            "DbgEng returned only {bytes_read} of {} bytes for the x64 EXCEPTION_RECORD",
+            buffer.len()
+        );
+        target_exception_record_from_bytes(&buffer).context(
+            "The complete x64 EXCEPTION_RECORD has an unsupported parameter count or layout",
+        )
+    }
+
     fn decode_x64_exception_context(
         &self,
         context_record_address: Option<u64>,
@@ -2202,6 +2274,9 @@ impl DebuggerSession {
             ),
         };
 
+        let page_table_walk = self.walk_x64_page_tables(address);
+        let page_table_walk_cross_check =
+            virtual_address_translation_cross_check(physical_address, &page_table_walk);
         VirtualAddressInspection {
             address,
             target_kind: self.kind,
@@ -2211,7 +2286,8 @@ impl DebuggerSession {
             query_virtual_status,
             virtual_region,
             query_virtual_detail,
-            page_table_walk: self.walk_x64_page_tables(address),
+            page_table_walk,
+            page_table_walk_cross_check,
             extension_command_bridge: ExtensionCommandBridgeStatus {
                 status: "unsupported".to_string(),
                 allowed_forms: vec![
@@ -2343,8 +2419,8 @@ impl DebuggerSession {
             let is_pd = *level == "PDE";
             if entry.large_page && (is_pdpt || is_pd) {
                 let page_size = if is_pdpt { 1u64 << 30 } else { 1u64 << 21 };
-                let page_mask = !(page_size - 1);
-                let physical_address = (raw_value & page_mask) | (address & (page_size - 1));
+                let physical_address =
+                    x64_large_page_physical_address(raw_value, address, page_size);
                 entries.push(entry);
                 return X64PageTableWalk {
                     status: "captured".to_string(),
@@ -2447,8 +2523,28 @@ impl DebuggerSession {
         );
         let logical_processor_count = unsafe { self.control.GetNumberProcessors()? };
         let mut processors = Vec::with_capacity(logical_processor_count as usize);
+        let original_thread_id = unsafe { self.system_objects.GetCurrentThreadId()? };
+        let mut current_thread_preserved = true;
 
         for processor_index in 0..logical_processor_count {
+            if !current_thread_preserved {
+                processors.push(ProcessorSnapshot {
+                    processor_index,
+                    status: "not_attempted".to_string(),
+                    engine_thread_id: None,
+                    system_thread_id: None,
+                    thread_data_offset: None,
+                    registers: None,
+                    current_module: None,
+                    current_symbol: None,
+                    stack: None,
+                    detail: Some(
+                        "The snapshot stopped selecting threads after DbgEng did not preserve the original current thread."
+                            .to_string(),
+                    ),
+                });
+                continue;
+            }
             let engine_thread_id = match unsafe {
                 self.system_objects.GetThreadIdByProcessor(processor_index)
             } {
@@ -2514,13 +2610,19 @@ impl DebuggerSession {
                     )),
                 },
             });
+            current_thread_preserved = unsafe {
+                self.system_objects
+                    .GetCurrentThreadId()
+                    .map(|current| current == original_thread_id)
+                    .unwrap_or(false)
+            };
         }
 
         let unavailable = processors
             .iter()
             .filter(|processor| processor.status != "captured")
             .count();
-        let validated_stack_count = processors
+        let nonempty_saved_stack_count = processors
             .iter()
             .filter_map(|processor| processor.stack.as_ref())
             .filter(|stack| stack.valid_frames > 0)
@@ -2542,12 +2644,16 @@ impl DebuggerSession {
             },
             logical_processor_count: Some(logical_processor_count),
             returned: processors.len(),
-            validated_stack_count,
+            nonempty_saved_stack_count,
             unwind_limited_stack_count,
             max_frames_per_processor: max_frames,
             processors,
-            current_thread_preserved: true,
-            detail: "Only DbgEng's exposed logical processor count was iterated. Each processor is associated with its active debugger thread by the documented GetThreadIdByProcessor API; the current thread is restored after every capture. The API does not establish that a saved bugcheck CONTEXT belongs to any particular processor."
+            current_thread_preserved,
+            detail: if current_thread_preserved {
+                "Only DbgEng's exposed logical processor count was iterated. Each processor is associated with its active debugger thread by the documented GetThreadIdByProcessor API. The API does not establish that a saved bugcheck CONTEXT belongs to any particular processor. Any returned function name is DbgEng symbol resolution and is not itself proof of an identity-validated PDB.".to_string()
+            } else {
+                "The processor snapshot stopped selecting threads after its current-thread restoration check failed. Captured entries remain bounded observations, but the debugger's final thread selection was not preserved.".to_string()
+            }
                 .to_string(),
         })
     }
@@ -4821,5 +4927,39 @@ mod tests {
         assert_eq!(entry.global, Some(true));
         assert!(entry.no_execute);
         assert_eq!(entry.page_frame_number, 0x12345);
+    }
+
+    #[test]
+    fn large_page_address_masks_nx_and_page_offset_bits() {
+        let address = 0xffff_8000_1234_5678;
+        let raw_2mib_pde = 0x8000_0000_1234_5083;
+        let raw_1gib_pdpte = 0x8000_0000_4000_0083;
+
+        assert_eq!(
+            x64_large_page_physical_address(raw_2mib_pde, address, 1 << 21),
+            0x1220_0000 + (address & ((1 << 21) - 1))
+        );
+        assert_eq!(
+            x64_large_page_physical_address(raw_1gib_pdpte, address, 1 << 30),
+            0x4000_0000 + (address & ((1 << 30) - 1))
+        );
+    }
+
+    #[test]
+    fn reports_translation_match_and_mismatch_explicitly() {
+        let mut walk = unavailable_x64_page_table_walk(0xffff_8000_0000_1000, "test".to_string());
+        walk.final_mapping = Some(X64PageTableMapping {
+            physical_address: 0x1234_5000,
+            page_size: 4096,
+            page_size_name: "4_kib".to_string(),
+        });
+
+        let matched = virtual_address_translation_cross_check(Some(0x1234_5000), &walk);
+        assert_eq!(matched.status, "matched");
+        assert_eq!(matched.matches, Some(true));
+
+        let mismatched = virtual_address_translation_cross_check(Some(0x1234_6000), &walk);
+        assert_eq!(mismatched.status, "mismatch");
+        assert_eq!(mismatched.matches, Some(false));
     }
 }
