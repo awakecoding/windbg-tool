@@ -4672,10 +4672,13 @@ fn dump_cohort_entry(path: &Path, max_frames: u32) -> Value {
         .unwrap_or_else(
             |error| json!({"status": "serialization_error", "detail": error.to_string()}),
         );
-    let heuristic_context =
+    let structural_parameter_context =
         dump_exception_context(&session, &target, bugcheck.data.as_ref(), max_frames);
-    let context_shape =
-        dump_cohort_context_shape(fault_address, &direct_exception, &heuristic_context);
+    let context_shape = dump_cohort_context_shape(
+        fault_address,
+        &direct_exception,
+        &structural_parameter_context,
+    );
     let module_inventory = dump_cohort_module_inventory(&session);
     let driver_filter_evidence = json!({
         "bugcheck_driver": dump_bugcheck_driver(&session),
@@ -4795,7 +4798,7 @@ fn dump_cohort_fault(session: &DebuggerSession, address: u64) -> Value {
 fn dump_cohort_context_shape(
     fault_address: Option<u64>,
     target_exception: &Value,
-    heuristic_context: &Option<Value>,
+    structural_parameter_context: &Option<Value>,
 ) -> Value {
     let direct = target_exception["context"]["registers"].as_object();
     let direct_matches_fault = direct
@@ -4806,15 +4809,17 @@ fn dump_cohort_context_shape(
     let (registers, provenance) = if direct_matches_fault == Some(true) {
         (direct, "direct_context")
     } else {
-        let registers = heuristic_context
+        let registers = structural_parameter_context
             .as_ref()
             .and_then(|context| context["context"]["registers"].as_object());
-        let provenance = match heuristic_context
+        let provenance = match structural_parameter_context
             .as_ref()
             .and_then(|context| context["selection"].as_str())
         {
             Some("parameter_3_exception_context") => "documented_bugcheck_context",
-            Some("heuristic_parameter_4_context") => "heuristic_bugcheck_parameter_context",
+            Some("structurally_validated_parameter_4_context") => {
+                "structural_parameter_compatibility"
+            }
             _ => "unavailable",
         };
         (registers, provenance)
@@ -4827,7 +4832,7 @@ fn dump_cohort_context_shape(
             } else {
                 "unavailable"
             },
-            "detail": "Neither a documented target-exception context with RIP matching the bugcheck fault address nor a structurally valid bounded bugcheck-context candidate was available."
+            "detail": "Neither a documented target-exception context with RIP matching the bugcheck fault address nor a bounded structural parameter-context candidate was available."
         });
     };
     let r8 = registers.get("r8").and_then(Value::as_u64);
@@ -4842,12 +4847,12 @@ fn dump_cohort_context_shape(
         "r8": r8,
         "r14": r14,
         "rbp": registers.get("rbp").and_then(Value::as_u64),
-        "detail": "The shape preserves only the registers required to compare the observed addressing form. A documented DbgEng context contributes only when its RIP equals the bugcheck fault address. Heuristic contexts are explicitly not used for direct thread, processor, or fault-address attribution."
+        "detail": "The shape preserves only the registers required to compare the observed addressing form. A documented DbgEng context contributes only when its RIP equals the bugcheck fault address. Structural parameter compatibility is not direct thread, processor, or fault-address attribution."
     });
     let key = if matches!(provenance, "direct_context" | "documented_bugcheck_context") {
         "effective_address_r8_plus_r14"
     } else {
-        "heuristic_effective_address_r8_plus_r14"
+        "structural_effective_address_r8_plus_r14"
     };
     result[key] = json!(effective_address);
     result
@@ -5475,7 +5480,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let bugcheck_data = input.bugcheck.data.as_ref();
     let fault_address = bugcheck_data.and_then(dump_fault_address);
     let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
-    let heuristic_exception_context =
+    let structural_parameter_context =
         dump_exception_context(session, input.target, bugcheck_data, input.max_frames);
     let documented_exception_context = input
         .target_exception
@@ -5493,7 +5498,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
                 "detail": "This context is returned by DbgEng's documented target-exception request rather than inferred from a bugcheck parameter."
             })
         });
-    let exception_context = documented_exception_context.or(heuristic_exception_context.clone());
+    let exception_context = documented_exception_context.or(structural_parameter_context.clone());
     let symbol_modules = dump_symbol_modules(session, fault_address, &exception_context);
     let symbol_readiness = dump_symbol_readiness(session, &symbol_modules, input.refresh_symbols);
     let driver_evidence = dump_driver_evidence(
@@ -5565,7 +5570,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
         "target_exception": input.target_exception,
         "fault": fault,
         "exception_context": exception_context,
-        "heuristic_exception_context": heuristic_exception_context,
+        "structural_parameter_context": structural_parameter_context,
         "fault_mechanics": fault_mechanics,
         "current_stack": input.current_stack,
         "symbol_readiness": symbol_readiness,
@@ -5607,21 +5612,25 @@ fn dump_evidence_synthesis(
         "evidence": [
             {
                 "category": "bugcheck_and_fault_access",
-                "provenance": "direct-context",
+                "provenance": "direct-snapshot",
                 "status": bugcheck.status,
                 "source_pointer": "/triage/bugcheck",
-                "detail": "The bugcheck record is an explicitly saved crash snapshot, not a record of the earlier writer or allocation lifetime."
+                "detail": "The saved bugcheck record directly supplies raw 0x1E parameters. Microsoft’s P3/P4 access contract is used only when the saved P3 has a documented access-type value."
             },
             {
                 "category": "fault_instruction_and_register_dataflow",
                 "provenance": if fault_mechanics["register_dataflow"]["status"] == "captured" {
                     "direct-context"
+                } else if fault_mechanics["register_dataflow"]["status"]
+                    == "conflicting_structural_context"
+                {
+                    "structural-snapshot"
                 } else {
-                    "heuristic"
+                    "unavailable"
                 },
                 "status": fault_mechanics["status"],
                 "source_pointer": "/triage/fault_mechanics",
-                "detail": "Raw instruction bytes and register addressing must both come from documented target-exception context before this category is captured. A structurally plausible 0x1E P4 context remains heuristic."
+                "detail": "Raw instruction bytes are direct snapshot evidence. Register decomposition is captured only when a documented target-exception context matches the fault instruction, while a pointer-shaped 0x1E P3/P4 pair is retained only as bounded structural comparison data."
             },
             {
                 "category": "pool_tracker_and_address_mapping",
@@ -5635,7 +5644,7 @@ fn dump_evidence_synthesis(
                 "provenance": "structural-snapshot",
                 "status": address_space_consistency["status"],
                 "source_pointer": "/triage/address_space_consistency",
-                "detail": "Only a documented-context-derived fault address and an explicitly supplied address are compared; physical reverse-alias enumeration is unavailable."
+                "detail": "Only explicitly supplied or fully documented-context-derived addresses are compared; physical reverse-alias enumeration is unavailable."
             },
             {
                 "category": "allocation_provenance",
@@ -5652,12 +5661,12 @@ fn dump_evidence_synthesis(
                 "detail": "An ordinary crash dump has no bounded documented record of the writer that last modified this location."
             },
             {
-                "category": "heuristic_bugcheck_context",
-                "provenance": "heuristic",
-                "status": "see_heuristic_exception_context",
-                "source_pointer": "/triage/heuristic_exception_context",
-                "detail": "A structurally valid context candidate is useful for bounded comparison but is not direct thread or CPU attribution."
-            }
+                "category": "structural_0x1e_parameter_compatibility",
+                "provenance": "structural-snapshot",
+                "status": fault_mechanics["register_dataflow"]["status"],
+                "source_pointer": "/triage/structural_parameter_context",
+                "detail": "When saved 0x1E P3/P4 do not satisfy the documented access-parameter shape, a bounded EXCEPTION_RECORD64/CONTEXT probe may report only structural agreement or disagreement; it is not a general parameter contract."
+            },
         ],
         "confidence_matrix": {
             "confirmed_snapshot_facts": [
@@ -5689,6 +5698,35 @@ fn dump_fault_address(data: &windbg_dbgeng::BugCheckData) -> Option<u64> {
     }
 }
 
+fn documented_1e_access_violation(data: &windbg_dbgeng::BugCheckData) -> Option<Value> {
+    const STATUS_ACCESS_VIOLATION: u32 = 0xC000_0005;
+    if data.code != 0x0000_001E || data.parameters[0] as u32 != STATUS_ACCESS_VIOLATION {
+        return None;
+    }
+
+    let access_type_raw = data.parameters[2];
+    let operation = match access_type_raw {
+        0 => Some("read"),
+        1 => Some("write"),
+        8 => Some("execute"),
+        _ => None,
+    };
+    Some(json!({
+        "status": if operation.is_some() { "captured" } else { "not_applicable_saved_parameter_shape" },
+        "source": "microsoft_bug_check_0x1e_parameter_contract",
+        "access_type_raw": access_type_raw,
+        "operation": operation,
+        "target_address": operation.map(|_| data.parameters[3]),
+        "raw_parameter_3": data.parameters[2],
+        "raw_parameter_4": data.parameters[3],
+        "detail": if operation.is_some() {
+            "For bugcheck 0x1E with STATUS_ACCESS_VIOLATION, Microsoft documents P3 as ExceptionInformation[0] (0=read, 1=write, 8=execute) and P4 as the address that the driver attempted to access."
+        } else {
+            "The saved P3 value is not a documented access-type value (0, 1, or 8), so Microsoft’s P3/P4 access-parameter contract is not applied to this capture. Raw P3/P4 are retained for bounded structural validation only."
+        }
+    }))
+}
+
 fn dump_exception_context(
     session: &DebuggerSession,
     target: &windbg_dbgeng::DebuggerSessionSummary,
@@ -5699,16 +5737,24 @@ fn dump_exception_context(
     if target.processor_type != Some(0x8664) {
         return Some(json!({
             "status": "architecture_unsupported",
-            "detail": "The bugcheck supplied or suggested a context address, but x64 decoding is only implemented for AMD64 dump targets.",
+            "detail": "The bugcheck supplied a bounded context candidate, but x64 decoding is only implemented for AMD64 dump targets.",
         }));
     }
 
     let candidates = match data.code {
         0x0000_003B => vec![("parameter_3_exception_context", data.parameters[2])],
-        // KMODE_EXCEPTION_NOT_HANDLED does not document a CONTEXT parameter. For this
-        // capture, inspect P4 only as a heuristic candidate and require its RIP to agree
-        // with P2 before exposing its register values.
-        0x0000_001E => vec![("heuristic_parameter_4_context", data.parameters[3])],
+        0x0000_001E
+            if documented_1e_access_violation(data)
+                .as_ref()
+                .is_some_and(|contract| {
+                    contract["status"].as_str() == Some("not_applicable_saved_parameter_shape")
+                }) =>
+        {
+            vec![(
+                "structurally_validated_parameter_4_context",
+                data.parameters[3],
+            )]
+        }
         _ => return None,
     };
     let decoded = candidates
@@ -5742,30 +5788,26 @@ fn dump_exception_context(
                     code_matches_bugcheck && instruction_address_matches_bugcheck;
                 json!({
                     "status": if matches_bugcheck { "structurally_matches_bugcheck" } else { "mismatch" },
-                    "source": "heuristic_parameter_3_exception_record",
+                    "source": "structurally_validated_parameter_3_exception_record",
                     "address": address,
                     "record": record,
                     "code_matches_bugcheck": code_matches_bugcheck,
                     "instruction_address_matches_bugcheck": instruction_address_matches_bugcheck,
-                    "detail": "P3 is decoded only as a capture-specific EXCEPTION_RECORD64 candidate. This structural match is not the documented general 0x1E parameter contract."
+                    "detail": "The raw P3 value did not satisfy the documented 0x1E access-type shape. This is a bounded EXCEPTION_RECORD64 compatibility probe that requires both bugcheck code and P2 address to match; it does not make pointer P3/P4 a general documented contract."
                 })
             }
             Err(error) => json!({
                 "status": "unavailable",
-                "source": "heuristic_parameter_3_exception_record",
+                "source": "structurally_validated_parameter_3_exception_record",
                 "address": address,
                 "detail": format!("DbgEng could not read a complete x64 EXCEPTION_RECORD candidate: {error:#}")
             }),
         }
     });
     Some(json!({
-        "status": if data.code == 0x0000_001E && selected.is_some() {
-            "heuristic_context_candidate"
-        } else {
-            selected
-                .and_then(|candidate| candidate["context"]["status"].as_str())
-                .unwrap_or("unavailable")
-        },
+        "status": selected
+            .and_then(|candidate| candidate["context"]["status"].as_str())
+            .unwrap_or("unavailable"),
         "selection": selected
             .and_then(|candidate| candidate["source"].as_str())
             .unwrap_or("none"),
@@ -5773,7 +5815,7 @@ fn dump_exception_context(
         "candidates": decoded,
         "exception_record_candidate": exception_record_candidate,
         "detail": if data.code == 0x0000_001E {
-            "For bugcheck 0x1E, P3/P4 are not a documented exception-record/context contract. P4 register values are retained only when its decoded RIP matches P2 and remain heuristic rather than direct DbgEng target-exception evidence."
+            "Microsoft documents P3/P4 as access metadata for 0x1E. This capture’s raw header P3 is not an access-type value, while bounded P3/P4 structural probes match an EXCEPTION_RECORD64 and x64 CONTEXT with P2. They are reported as a capture-specific compatibility path, not as a general parameter contract or direct thread/CPU attribution."
         } else {
             "The decoded context comes from the documented SYSTEM_SERVICE_EXCEPTION context-record parameter."
         },
@@ -5797,8 +5839,8 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         0x0000_001E => json!([
             "exception_code",
             "fault_instruction_address",
-            "exception_parameter_0",
-            "exception_parameter_1_or_build_specific_context_candidate",
+            "documented_exception_information_0_or_capture_specific_pointer",
+            "documented_exception_information_1_or_capture_specific_pointer",
         ]),
         0x0000_003B => json!([
             "exception_code",
@@ -5820,6 +5862,7 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         "name": name,
         "parameters": data.parameters,
         "parameter_roles": parameter_roles,
+        "access_violation": documented_1e_access_violation(data),
         "detail": bugcheck.detail,
     })
 }
@@ -5909,7 +5952,7 @@ fn exception_context_is_documented(exception_context: &Option<Value>) -> bool {
     )
 }
 
-fn selected_heuristic_exception_record_access_address(
+fn selected_structural_exception_record_access_address(
     exception_context: &Option<Value>,
 ) -> Option<u64> {
     exception_context
@@ -5997,10 +6040,10 @@ fn dump_pool_tracker_observation(
 ) -> Value {
     if !exception_context_is_documented(exception_context) {
         return json!({
-            "status": "heuristic_context_not_used",
-            "heuristic_entry_address_r8": selected_exception_register(exception_context, "r8"),
-            "heuristic_r14_register_value": selected_exception_register(exception_context, "r14"),
-            "detail": "The pool-tracker probe requires a documented DbgEng target-exception context. Register values from a bugcheck P4 structural candidate are preserved in fault mechanics only and are not used to classify tracker records or table membership."
+            "status": "structural_context_not_used",
+            "structural_entry_address_r8": selected_exception_register(exception_context, "r8"),
+            "structural_r14_register_value": selected_exception_register(exception_context, "r14"),
+            "detail": "The pool-tracker probe requires a documented DbgEng target-exception context. Capture-specific structural P3/P4 probes are retained for comparison only and are not used to classify tracker records or table membership."
         });
     }
     json!({
@@ -6048,7 +6091,7 @@ fn dump_write_provenance_feasibility() -> Value {
         "detail": "A complete crash dump preserves a memory snapshot and page-table state, not a durable log of stores to an arbitrary physical page. DbgEng's documented offline APIs expose reads and translations but no recent-writer, guard-page, alias-history, or allocation-free-history record for this page.",
         "supported_snapshot_evidence": [
             "Current virtual-to-physical mapping and leaf PTE flags when an address is explicitly inspected.",
-            "Build-gated pool-tracker root and bounded table-entry snapshots."
+            "Raw bytes at an explicitly supplied address without allocation or tracker-layout interpretation."
         ]
     })
 }
@@ -6107,36 +6150,49 @@ fn dump_fault_mechanics_audit(
     let fault_instruction_matches_context_rip = fault_instruction_address
         .zip(context_rip)
         .map(|(fault, rip)| fault == rip);
-    let heuristic_record_access_address =
-        selected_heuristic_exception_record_access_address(exception_context);
-    let heuristic_effective_address_matches_record = heuristic_record_access_address
+    let documented_parameter_contract = bugcheck_data.and_then(documented_1e_access_violation);
+    let documented_fault_target = documented_parameter_contract
+        .as_ref()
+        .filter(|contract| contract["status"].as_str() == Some("captured"))
+        .and_then(|contract| contract["target_address"].as_u64());
+    let structural_record_access_target =
+        selected_structural_exception_record_access_address(exception_context);
+    let comparison_target = documented_fault_target.or(structural_record_access_target);
+    let effective_address_matches_target = comparison_target
         .zip(effective_address)
         .map(|(record_address, context_address)| record_address == context_address);
     let register_dataflow_status = if !is_r8_r14_xadd || effective_address.is_none() {
         "incomplete"
     } else if context_is_documented && fault_instruction_matches_context_rip == Some(true) {
-        "captured"
+        if documented_fault_target.is_some() && effective_address_matches_target != Some(true) {
+            "documented_target_mismatch"
+        } else {
+            "captured"
+        }
     } else if fault_instruction_matches_context_rip != Some(true) {
         "context_rip_mismatch"
-    } else if heuristic_record_access_address.is_some()
-        && heuristic_effective_address_matches_record != Some(true)
+    } else if structural_record_access_target.is_some()
+        && effective_address_matches_target != Some(true)
     {
-        "conflicting_heuristic_context"
+        "conflicting_structural_context"
     } else {
-        "heuristic_context_only"
+        "structural_context_only"
     };
-    let counter_raw_qword = r8.zip(r14).and_then(|(entry_address, offset)| {
-        (offset == 0x20)
-            .then(|| entry_address.checked_add(offset))
-            .flatten()
-            .filter(|address| Some(*address) == effective_address)?;
-        pool_tracker["nearby_entries"]
-            .as_array()?
-            .iter()
-            .find(|entry| entry["address"].as_u64() == Some(entry_address))?["raw_qwords"]
-            ["offset_20"]
-            .as_u64()
-    });
+    let counter_raw_qword = (register_dataflow_status == "captured")
+        .then_some(())
+        .and_then(|()| r8.zip(r14))
+        .and_then(|(entry_address, offset)| {
+            (offset == 0x20)
+                .then(|| entry_address.checked_add(offset))
+                .flatten()
+                .filter(|address| Some(*address) == effective_address)?;
+            pool_tracker["nearby_entries"]
+                .as_array()?
+                .iter()
+                .find(|entry| entry["address"].as_u64() == Some(entry_address))?["raw_qwords"]
+                ["offset_20"]
+                .as_u64()
+        });
     let context_source = exception_context
         .as_ref()
         .and_then(|value| value["selection"].as_str());
@@ -6144,6 +6200,27 @@ fn dump_fault_mechanics_audit(
         "atomic_read_modify_write"
     } else {
         "unavailable"
+    };
+    let documented_operation = documented_parameter_contract
+        .as_ref()
+        .filter(|contract| contract["status"].as_str() == Some("captured"))
+        .and_then(|contract| contract["operation"].as_str());
+    let structural_record_operation = exception_context
+        .as_ref()
+        .and_then(|context| {
+            context.pointer("/exception_record_candidate/record/access_violation/operation")
+        })
+        .and_then(Value::as_str);
+    let access_phase_coherence = match (is_r8_r14_xadd, documented_operation) {
+        (true, Some("read")) => "coheres_with_xadd_destination_read",
+        (true, Some(_)) => "documented_access_type_does_not_establish_xadd_phase",
+        (false, Some(_)) => "instruction_bytes_not_exact_xadd",
+        (_, None) => match (is_r8_r14_xadd, structural_record_operation) {
+            (true, Some("read")) => "structurally_coheres_with_xadd_destination_read",
+            (true, Some(_)) => "structural_access_type_does_not_establish_xadd_phase",
+            (false, Some(_)) => "instruction_bytes_not_exact_xadd",
+            (_, None) => "not_applicable",
+        },
     };
     json!({
         "status": register_dataflow_status,
@@ -6155,24 +6232,28 @@ fn dump_fault_mechanics_audit(
         "instruction_bytes": fault.as_ref().map(|value| value["instruction_bytes"].clone()),
         "memory_access": {
             "kind": if is_r8_r14_xadd { access_kind } else { "unavailable" },
+            "documented_bugcheck_parameter_contract": documented_parameter_contract,
+            "structural_exception_record_access_target": structural_record_access_target,
+            "access_phase_coherence": access_phase_coherence,
             "write_completion": "unknown",
-            "detail": "Only the exact bytes F0 4B 0F C1 2C 06 decode as LOCK XADD qword ptr [R14+R8], RBP. A fault at that instruction establishes an attempted atomic read-modify-write, not that its write completed or that a prior writer corrupted the destination."
+            "detail": "Only the exact bytes F0 4B 0F C1 2C 06 decode as LOCK XADD qword ptr [R14+R8], RBP. When the bounded structural EXCEPTION_RECORD64 probe records a read, that is consistent with XADD reading its memory destination before its update. The capture-specific pointer compatibility path is not Microsoft’s general P3/P4 contract and does not establish write completion, prior writer, or allocation history."
         },
         "register_dataflow": {
             "status": register_dataflow_status,
             "entry_base_r8": context_is_documented.then_some(r8).flatten(),
-            "heuristic_entry_base_r8": (!context_is_documented).then_some(r8).flatten(),
+            "structural_entry_base_r8": (!context_is_documented).then_some(r8).flatten(),
             "r14_register_value": context_is_documented.then_some(r14).flatten(),
-            "heuristic_r14_register_value": (!context_is_documented).then_some(r14).flatten(),
+            "structural_r14_register_value": (!context_is_documented).then_some(r14).flatten(),
             "effective_address": (register_dataflow_status == "captured").then_some(effective_address).flatten(),
-            "heuristic_effective_address": (register_dataflow_status != "captured").then_some(effective_address).flatten(),
+            "structural_effective_address": (register_dataflow_status != "captured").then_some(effective_address).flatten(),
             "attempted_delta_rbp": context_is_documented.then_some(rbp).flatten(),
-            "heuristic_attempted_delta_rbp": (!context_is_documented).then_some(rbp).flatten(),
+            "structural_attempted_delta_rbp": (!context_is_documented).then_some(rbp).flatten(),
             "effective_address_matches_r8_plus_r14": effective_address.zip(r8.zip(r14).and_then(|(base, offset)| base.checked_add(offset))).map(|(left, right)| left == right),
-            "heuristic_exception_record_access_address": heuristic_record_access_address,
-            "heuristic_effective_address_matches_exception_record": heuristic_effective_address_matches_record,
+            "documented_fault_target": documented_fault_target,
+            "structural_exception_record_access_target": structural_record_access_target,
+            "effective_address_matches_access_target": effective_address_matches_target,
             "bounded_record_offset_20_raw_qword": counter_raw_qword,
-            "detail": "R14 is a register value, not an instruction-encoded displacement. The offset-0x20 qword is retained only when R14 equals 0x20 and the bounded snapshot covers the computed operand. Heuristic register values are not promoted to a captured fault target."
+            "detail": "R14 is a register value, not an instruction-encoded displacement. A register-derived operand is emitted only from a documented context, or retained as non-promoted structural comparison data when bounded P3/P4 compatibility probes conflict."
         },
         "counter_field_semantics": {
             "status": "unsupported",
@@ -6188,8 +6269,8 @@ fn dump_fault_mechanics_audit(
         "interrupt_state": {
             "context_eflags": eflags,
             "interrupt_enable_flag": eflags.map(|value| value & 0x200 != 0),
-            "status": if eflags.is_some() { "heuristic_context_only" } else { "unavailable" },
-            "detail": "EFLAGS comes from the heuristic context candidate. It is not an IRQL, interrupt-request, or processor identity record."
+            "status": if eflags.is_some() { "structural_context_only" } else { "unavailable" },
+            "detail": "EFLAGS comes from a capture-specific structural context candidate. It is not an IRQL, interrupt-request, or processor identity record."
         },
         "machine_check_whea": {
             "status": "unsupported",
@@ -7946,13 +8027,10 @@ mod tests {
         assert!(exception_context_is_documented(&Some(json!({
             "selection": "documented_dbgeng_target_exception_context"
         }))));
-        assert!(!exception_context_is_documented(&Some(json!({
-            "selection": "heuristic_parameter_4_context"
-        }))));
     }
 
     #[test]
-    fn cohort_context_shape_keeps_documented_bugcheck_context_distinct_from_heuristic() {
+    fn cohort_context_shape_distinguishes_documented_and_structural_sources() {
         let documented = dump_cohort_context_shape(
             Some(0x1000),
             &json!({}),
@@ -7968,27 +8046,29 @@ mod tests {
             documented["effective_address_r8_plus_r14"],
             json!(0x2020u64)
         );
-        assert!(documented["heuristic_effective_address_r8_plus_r14"].is_null());
 
-        let heuristic = dump_cohort_context_shape(
+        let unavailable = dump_cohort_context_shape(Some(0x1000), &json!({}), &None);
+        assert_eq!(unavailable["status"], "unavailable");
+
+        let structural = dump_cohort_context_shape(
             Some(0x1000),
             &json!({}),
             &Some(json!({
-                "selection": "heuristic_parameter_4_context",
+                "selection": "structurally_validated_parameter_4_context",
                 "context": {
                     "registers": { "rip": 0x1000, "r8": 0x2000, "r14": 0x20, "rbp": 0x110 }
                 }
             })),
         );
         assert_eq!(
-            heuristic["provenance"],
-            "heuristic_bugcheck_parameter_context"
+            structural["provenance"],
+            "structural_parameter_compatibility"
         );
         assert_eq!(
-            heuristic["heuristic_effective_address_r8_plus_r14"],
+            structural["structural_effective_address_r8_plus_r14"],
             json!(0x2020u64)
         );
-        assert!(heuristic["effective_address_r8_plus_r14"].is_null());
+        assert!(structural["effective_address_r8_plus_r14"].is_null());
     }
 
     #[test]
@@ -8012,10 +8092,10 @@ mod tests {
     }
 
     #[test]
-    fn dump_triage_describes_kmode_exception_parameters_and_fault_address() {
+    fn dump_triage_decodes_documented_kmode_access_violation_parameters() {
         let data = windbg_dbgeng::BugCheckData {
             code: 0x1E,
-            parameters: [0xC000_0005, 0xFFFF_F800_E439_70B0, 0, 0xFFFF_8581_BD06_8CC0],
+            parameters: [0xC000_0005, 0xFFFF_F800_E439_70B0, 0, 0xFFFF_FFFF_FFFF_FFFF],
         };
         let value = dump_bugcheck_value(&windbg_dbgeng::BugCheckDataResult {
             status: "captured".to_string(),
@@ -8026,10 +8106,51 @@ mod tests {
         assert_eq!(value["name"], "KMODE_EXCEPTION_NOT_HANDLED");
         assert_eq!(value["parameter_roles"][1], "fault_instruction_address");
         assert_eq!(
+            value["parameter_roles"][2],
+            "documented_exception_information_0_or_capture_specific_pointer"
+        );
+        assert_eq!(
             value["parameter_roles"][3],
-            "exception_parameter_1_or_build_specific_context_candidate"
+            "documented_exception_information_1_or_capture_specific_pointer"
+        );
+        assert_eq!(value["access_violation"]["operation"], "read");
+        assert_eq!(
+            value["access_violation"]["target_address"],
+            json!(0xFFFF_FFFF_FFFF_FFFFu64)
         );
         assert_eq!(dump_fault_address(&data), Some(0xFFFF_F800_E439_70B0));
+    }
+
+    #[test]
+    fn dump_triage_decodes_documented_kmode_access_type_values() {
+        for (access_type, operation) in [(0, "read"), (1, "write"), (8, "execute")] {
+            let data = windbg_dbgeng::BugCheckData {
+                code: 0x1E,
+                parameters: [0xC000_0005, 0x1000, access_type, 0x2000],
+            };
+            let access = documented_1e_access_violation(&data).expect("access violation");
+            assert_eq!(access["operation"], operation);
+            assert_eq!(access["target_address"], json!(0x2000u64));
+        }
+    }
+
+    #[test]
+    fn dump_triage_withholds_documented_access_semantics_for_pointer_shaped_parameters() {
+        let data = windbg_dbgeng::BugCheckData {
+            code: 0x1E,
+            parameters: [
+                0xC000_0005,
+                0x1000,
+                0xffff_8581_bd06_89b8,
+                0xffff_8581_bd06_81c0,
+            ],
+        };
+
+        let access = documented_1e_access_violation(&data).expect("access violation");
+
+        assert_eq!(access["status"], "not_applicable_saved_parameter_shape");
+        assert!(access["operation"].is_null());
+        assert!(access["target_address"].is_null());
     }
 
     #[test]
@@ -8076,7 +8197,7 @@ mod tests {
             status: "captured".to_string(),
             data: Some(windbg_dbgeng::BugCheckData {
                 code: 0x1E,
-                parameters: [0xC000_0005, 0x1000, 0, 0],
+                parameters: [0xC000_0005, 0x1000, 0, 0x2020],
             }),
             detail: "fixture".to_string(),
         };
@@ -8116,6 +8237,10 @@ mod tests {
             dump_fault_mechanics_audit(&bugcheck, &context, &fault, &tracker, &target_exception);
         assert_eq!(audit["status"], "captured");
         assert_eq!(audit["memory_access"]["kind"], "atomic_read_modify_write");
+        assert_eq!(
+            audit["memory_access"]["access_phase_coherence"],
+            "coheres_with_xadd_destination_read"
+        );
         assert_eq!(audit["register_dataflow"]["effective_address"], 0x2020);
         assert_eq!(
             audit["register_dataflow"]["bounded_record_offset_20_raw_qword"],
@@ -8140,20 +8265,28 @@ mod tests {
     }
 
     #[test]
-    fn fault_mechanics_withholds_heuristic_context_effective_address_on_conflict() {
+    fn fault_mechanics_withholds_structural_register_decomposition_on_conflict() {
         let bugcheck = windbg_dbgeng::BugCheckDataResult {
             status: "captured".to_string(),
             data: Some(windbg_dbgeng::BugCheckData {
                 code: 0x1E,
-                parameters: [0xC000_0005, 0x1000, 0, 0x2000],
+                parameters: [
+                    0xC000_0005,
+                    0x1000,
+                    0xffff_8581_bd06_89b8,
+                    0xffff_8581_bd06_81c0,
+                ],
             }),
             detail: "fixture".to_string(),
         };
         let context = Some(json!({
-            "selection": "heuristic_parameter_4_context",
+            "selection": "structurally_validated_parameter_4_context",
             "exception_record_candidate": {
                 "record": {
-                    "access_violation": {"address": 0xffff_ffff_ffff_ffffu64}
+                    "access_violation": {
+                        "operation": "read",
+                        "address": 0xffff_ffff_ffff_ffffu64
+                    }
                 }
             },
             "context": {
@@ -8174,16 +8307,24 @@ mod tests {
             &bugcheck,
             &context,
             &fault,
-            &json!({"nearby_entries": [{"address": 0x2000, "raw_qwords": {"offset_20": 0x55}}]}),
+            &json!({"nearby_entries": []}),
             &json!({"status": "captured", "record": {"code": 0xC0000005u32}}),
         );
 
-        assert_eq!(audit["status"], "conflicting_heuristic_context");
+        assert_eq!(audit["status"], "conflicting_structural_context");
         assert_eq!(
             audit["register_dataflow"]["status"],
-            "conflicting_heuristic_context"
+            "conflicting_structural_context"
         );
         assert!(audit["register_dataflow"]["effective_address"].is_null());
+        assert_eq!(
+            audit["register_dataflow"]["structural_exception_record_access_target"],
+            json!(0xffff_ffff_ffff_ffffu64)
+        );
+        assert_eq!(
+            audit["memory_access"]["access_phase_coherence"],
+            "structurally_coheres_with_xadd_destination_read"
+        );
         assert!(audit["register_dataflow"]["bounded_record_offset_20_raw_qword"].is_null());
     }
 
