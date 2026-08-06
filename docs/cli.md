@@ -45,10 +45,15 @@ the optional header tail. It reconciles that tuple against `ReadBugCheckData` on
 code-and-four-parameter equality. A structurally valid object addressed by a final bugcheck
 slot is still a rooted structural candidate, not a typed parameter or an exception-time object.
 For bugcheck `0x1E`, pointer-shaped final slots that do not meet the documented
-access-type/fault-address contract are reported as untyped nonstandard values. A matching
-exception-record-shaped object and context-shaped object can support only a wrapper-like
-inference; they cannot distinguish an undocumented dispatch path from corrupted, reused, or
-otherwise unrelated state and never promote fault-time registers.
+access-type/fault-address contract are reported as untyped nonstandard values. By default, a
+matching exception-record-shaped object and context-shaped object can support only a
+wrapper-like inference. One identity-gated exact-kernel-build contract can additionally verify
+the first four raw DbgEng return addresses and the final call arguments against audited wrapper
+code. When every check matches, the report identifies P3/P4 as that wrapper's active
+`EXCEPTION_RECORD`/`CONTEXT` pair. This is derived code-path evidence, not a documented DbgEng
+or dump-format contract: it proves the pair is not arbitrary nearby state, but it does not prove
+that earlier handlers did not modify volatile context registers. Consequently, even this result
+never promotes a conflicting `R8+R14` operand to fault-time state.
 
 ## Common replay workflow
 
