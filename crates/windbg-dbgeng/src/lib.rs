@@ -618,6 +618,7 @@ pub struct DumpHeaderSnapshot {
     pub status: String,
     pub source: String,
     pub bytes_returned: u32,
+    pub fixed_prefix_status: String,
     pub tail_status: String,
     pub signature: Option<u32>,
     pub valid_dump: Option<u32>,
@@ -844,6 +845,9 @@ const X64_CONTEXT_SIZE: u32 = 0x4D0;
 const CONTEXT_AMD64_FLAG: u32 = 0x0010_0000;
 const CONTEXT_X64_REQUIRED_REGISTER_FLAGS: u32 = CONTEXT_AMD64_FLAG | 0x0000_0003;
 const DUMP_HEADER64_SIZE: usize = 0x2000;
+const DUMP_HEADER64_FIXED_PREFIX_SIZE: usize = 0x60;
+const DUMP_HEADER64_TAIL_THROUGH_BOOT_ID_SIZE: usize = 0x1050;
+const DUMP_HEADER64_DUMP_TYPE_OFFSET: usize = 0xF94;
 const DUMP_HEADER64_CONTEXT_RECORD_OFFSET: usize = 0x344;
 const DUMP_HEADER64_CONTEXT_RECORD_SIZE: usize = 3000;
 const EXCEPTION_RECORD64_SIZE: usize = 0x98;
@@ -5152,6 +5156,7 @@ fn unavailable_dump_header(detail: String) -> DumpHeaderSnapshot {
         status: "unavailable".to_string(),
         source: "dbgeng_idebugadvanced2_debug_request_get_dump_header".to_string(),
         bytes_returned: 0,
+        fixed_prefix_status: "unavailable".to_string(),
         tail_status: "unavailable".to_string(),
         signature: None,
         valid_dump: None,
@@ -5189,81 +5194,139 @@ fn unavailable_dump_header(detail: String) -> DumpHeaderSnapshot {
 }
 
 fn dump_header_from_bytes(bytes: &[u8], bytes_returned: u32) -> DumpHeaderSnapshot {
-    const HEADER_PREFIX_SIZE: usize = 0x1050;
-    if bytes.len() < HEADER_PREFIX_SIZE {
+    if bytes.len() < DUMP_HEADER64_FIXED_PREFIX_SIZE {
         return unavailable_dump_header(format!(
-            "DbgEng returned only {} bytes; the documented DUMP_HEADER64 fields through BootId require {HEADER_PREFIX_SIZE} bytes.",
+            "DbgEng returned only {} bytes; the documented DUMP_HEADER64 fixed bugcheck prefix requires {DUMP_HEADER64_FIXED_PREFIX_SIZE} bytes.",
             bytes.len()
         ));
     }
     let signature = read_u32_le(bytes, 0);
     let valid_dump = read_u32_le(bytes, 4);
-    let machine_image_type = read_u32_le(bytes, 0x30);
-    let dump_type = read_u32_le(bytes, 0xf94);
+    let fixed_prefix_valid = signature == Some(0x4547_4150) && valid_dump == Some(0x3436_5544);
+    let tail_available = bytes.len() >= DUMP_HEADER64_TAIL_THROUGH_BOOT_ID_SIZE;
+    let dump_type = tail_available
+        .then(|| read_u32_le(bytes, DUMP_HEADER64_DUMP_TYPE_OFFSET))
+        .flatten();
     let tail_valid = dump_type.and_then(dump_type_name).is_some();
-    let header_contract_valid =
-        tail_valid && signature == Some(0x4547_4150) && valid_dump == Some(0x3436_5544);
-    let attributes_raw = tail_valid.then(|| read_u32_le(bytes, 0x1048)).flatten();
+    let header_contract_valid = fixed_prefix_valid && tail_valid;
+    let attributes_raw = header_contract_valid
+        .then(|| read_u32_le(bytes, 0x1048))
+        .flatten();
     DumpHeaderSnapshot {
-        status: if tail_valid {
+        status: if header_contract_valid {
             "captured".to_string()
-        } else {
+        } else if fixed_prefix_valid {
             "captured_prefix_only".to_string()
+        } else {
+            "unvalidated_fixed_prefix".to_string()
         },
         source: "dbgeng_idebugadvanced2_debug_request_get_dump_header".to_string(),
         bytes_returned,
-        tail_status: if tail_valid {
+        fixed_prefix_status: if fixed_prefix_valid {
             "validated".to_string()
         } else {
             "unvalidated".to_string()
         },
+        tail_status: if header_contract_valid {
+            "validated".to_string()
+        } else if tail_available {
+            "unvalidated".to_string()
+        } else {
+            "unavailable".to_string()
+        },
         signature,
         valid_dump,
-        major_version: read_u32_le(bytes, 8),
-        minor_version: read_u32_le(bytes, 12),
-        directory_table_base: read_u64_le(bytes, 0x10),
-        pfn_database: read_u64_le(bytes, 0x18),
-        loaded_module_list: read_u64_le(bytes, 0x20),
-        active_process_head: read_u64_le(bytes, 0x28),
-        machine_image_type,
-        processor_count: read_u32_le(bytes, 0x34),
-        bugcheck_code: read_u32_le(bytes, 0x38),
-        bugcheck_parameters: [
-            read_u64_le(bytes, 0x40),
-            read_u64_le(bytes, 0x48),
-            read_u64_le(bytes, 0x50),
-            read_u64_le(bytes, 0x58),
-        ]
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .and_then(|values| values.try_into().ok()),
+        major_version: fixed_prefix_valid.then(|| read_u32_le(bytes, 8)).flatten(),
+        minor_version: fixed_prefix_valid.then(|| read_u32_le(bytes, 12)).flatten(),
+        directory_table_base: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x10))
+            .flatten(),
+        pfn_database: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x18))
+            .flatten(),
+        loaded_module_list: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x20))
+            .flatten(),
+        active_process_head: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x28))
+            .flatten(),
+        machine_image_type: fixed_prefix_valid
+            .then(|| read_u32_le(bytes, 0x30))
+            .flatten(),
+        processor_count: fixed_prefix_valid
+            .then(|| read_u32_le(bytes, 0x34))
+            .flatten(),
+        bugcheck_code: fixed_prefix_valid
+            .then(|| read_u32_le(bytes, 0x38))
+            .flatten(),
+        bugcheck_parameters: fixed_prefix_valid
+            .then(|| {
+                [
+                    read_u64_le(bytes, 0x40),
+                    read_u64_le(bytes, 0x48),
+                    read_u64_le(bytes, 0x50),
+                    read_u64_le(bytes, 0x58),
+                ]
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .and_then(|values| values.try_into().ok())
+            })
+            .flatten(),
         embedded_exception_context: dump_header_embedded_exception_context(
             bytes,
             header_contract_valid,
-            machine_image_type,
+            fixed_prefix_valid
+                .then(|| read_u32_le(bytes, 0x30))
+                .flatten(),
         ),
-        version_user: header_ascii(&bytes[0x60..0x80]),
-        dump_type: tail_valid.then_some(dump_type).flatten(),
-        dump_type_name: dump_type.and_then(dump_type_name).map(str::to_string),
-        required_dump_space_bytes: tail_valid.then(|| read_u64_le(bytes, 0xf98)).flatten(),
-        system_time_filetime: tail_valid.then(|| read_u64_le(bytes, 0xfa0)).flatten(),
-        comment: tail_valid
+        version_user: fixed_prefix_valid
+            .then(|| bytes.get(0x60..0x80).and_then(header_ascii))
+            .flatten(),
+        dump_type: header_contract_valid.then_some(dump_type).flatten(),
+        dump_type_name: header_contract_valid
+            .then(|| dump_type.and_then(dump_type_name).map(str::to_string))
+            .flatten(),
+        required_dump_space_bytes: header_contract_valid
+            .then(|| read_u64_le(bytes, 0xf98))
+            .flatten(),
+        system_time_filetime: header_contract_valid
+            .then(|| read_u64_le(bytes, 0xfa0))
+            .flatten(),
+        comment: header_contract_valid
             .then(|| header_ascii(&bytes[0xfa8..0x1028]))
             .flatten(),
-        system_uptime_100ns: tail_valid.then(|| read_u64_le(bytes, 0x1028)).flatten(),
-        mini_dump_fields: tail_valid.then(|| read_u32_le(bytes, 0x1030)).flatten(),
-        secondary_data_state: tail_valid.then(|| read_u32_le(bytes, 0x1034)).flatten(),
-        product_type: tail_valid.then(|| read_u32_le(bytes, 0x1038)).flatten(),
-        suite_mask: tail_valid.then(|| read_u32_le(bytes, 0x103c)).flatten(),
-        writer_status: tail_valid.then(|| read_u32_le(bytes, 0x1040)).flatten(),
-        kd_secondary_version: tail_valid.then(|| bytes.get(0x1045).copied()).flatten(),
+        system_uptime_100ns: header_contract_valid
+            .then(|| read_u64_le(bytes, 0x1028))
+            .flatten(),
+        mini_dump_fields: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1030))
+            .flatten(),
+        secondary_data_state: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1034))
+            .flatten(),
+        product_type: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1038))
+            .flatten(),
+        suite_mask: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x103c))
+            .flatten(),
+        writer_status: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1040))
+            .flatten(),
+        kd_secondary_version: header_contract_valid
+            .then(|| bytes.get(0x1045).copied())
+            .flatten(),
         attributes_raw,
         attributes: attributes_raw.map(dump_attribute_names).unwrap_or_default(),
-        boot_id: tail_valid.then(|| read_u32_le(bytes, 0x104c)).flatten(),
+        boot_id: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x104c))
+            .flatten(),
         detail: if header_contract_valid {
             "The documented DUMP_HEADER64 bytes passed signature, valid-dump marker, and dump-type checks. SecondaryDataState is reported verbatim because the documented DbgEng request does not enumerate or define individual kernel blackbox stream identifiers or payload layouts.".to_string()
+        } else if fixed_prefix_valid {
+            "The documented DUMP_HEADER64 fixed prefix passed its signature and valid-dump marker checks, so its saved bugcheck code and P1-P4 fields are captured at their documented offsets. The tail did not validate as a complete DUMP_HEADER64 contract, so embedded context/exception and tail fields are withheld rather than interpreting unvalidated bytes or assuming a dump-layout variant.".to_string()
         } else {
-            "DbgEng returned a header prefix whose signature and basic fields can be decoded, but the complete DUMP_HEADER64 contract did not pass signature, valid-dump marker, and dump-type validation. Embedded context/exception fields and tail fields are withheld rather than interpreting unvalidated bytes or assuming a dump-layout variant.".to_string()
+            "DbgEng returned bytes that did not pass the documented DUMP_HEADER64 fixed-prefix signature and valid-dump marker checks. No bugcheck, embedded context/exception, or tail field is interpreted.".to_string()
         },
     }
 }
@@ -5784,6 +5847,7 @@ mod tests {
         let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_SIZE as u32);
 
         assert_eq!(header.status, "captured");
+        assert_eq!(header.fixed_prefix_status, "validated");
         assert_eq!(header.processor_count, Some(24));
         assert_eq!(header.bugcheck_code, Some(0x1e));
         assert_eq!(
@@ -5857,15 +5921,63 @@ mod tests {
     #[test]
     fn withholds_unvalidated_dump_header_tail() {
         let mut bytes = vec![0u8; DUMP_HEADER64_SIZE];
-        bytes[0xf94..0xf98].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[0..4].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x3436_5544u32.to_le_bytes());
+        bytes[0x38..0x3c].copy_from_slice(&0x1eu32.to_le_bytes());
+        bytes[0x40..0x48].copy_from_slice(&0xffff_ffff_c000_0005u64.to_le_bytes());
+        bytes[0x48..0x50].copy_from_slice(&0xffff_f800_e439_70b0u64.to_le_bytes());
+        bytes[0x50..0x58].copy_from_slice(&0xffff_f283_9446_89b8u64.to_le_bytes());
+        bytes[0x58..0x60].copy_from_slice(&0xffff_f283_9446_81c0u64.to_le_bytes());
+        bytes[DUMP_HEADER64_DUMP_TYPE_OFFSET..DUMP_HEADER64_DUMP_TYPE_OFFSET + 4]
+            .copy_from_slice(&0x4547_4150u32.to_le_bytes());
         bytes[0x1034..0x1038].copy_from_slice(&7u32.to_le_bytes());
 
         let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_SIZE as u32);
 
         assert_eq!(header.status, "captured_prefix_only");
+        assert_eq!(header.fixed_prefix_status, "validated");
         assert_eq!(header.tail_status, "unvalidated");
+        assert_eq!(header.bugcheck_code, Some(0x1e));
+        assert_eq!(
+            header.bugcheck_parameters,
+            Some([
+                0xffff_ffff_c000_0005,
+                0xffff_f800_e439_70b0,
+                0xffff_f283_9446_89b8,
+                0xffff_f283_9446_81c0,
+            ])
+        );
         assert_eq!(header.dump_type, None);
         assert_eq!(header.secondary_data_state, None);
+        assert_eq!(header.embedded_exception_context.status, "unavailable");
+    }
+
+    #[test]
+    fn decodes_fixed_bugcheck_prefix_without_a_complete_header_tail() {
+        let mut bytes = vec![0u8; DUMP_HEADER64_FIXED_PREFIX_SIZE];
+        bytes[0..4].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x3436_5544u32.to_le_bytes());
+        bytes[0x38..0x3c].copy_from_slice(&0x1eu32.to_le_bytes());
+        bytes[0x40..0x48].copy_from_slice(&0xffff_ffff_c000_0005u64.to_le_bytes());
+        bytes[0x48..0x50].copy_from_slice(&0xffff_f800_e439_70b0u64.to_le_bytes());
+        bytes[0x50..0x58].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        bytes[0x58..0x60].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+
+        let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_FIXED_PREFIX_SIZE as u32);
+
+        assert_eq!(header.status, "captured_prefix_only");
+        assert_eq!(header.fixed_prefix_status, "validated");
+        assert_eq!(header.tail_status, "unavailable");
+        assert_eq!(header.bugcheck_code, Some(0x1e));
+        assert_eq!(
+            header.bugcheck_parameters,
+            Some([
+                0xffff_ffff_c000_0005,
+                0xffff_f800_e439_70b0,
+                0x1111_2222_3333_4444,
+                0x5555_6666_7777_8888,
+            ])
+        );
         assert_eq!(header.embedded_exception_context.status, "unavailable");
     }
 

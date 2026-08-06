@@ -5524,6 +5524,8 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     let bugcheck_data = input.bugcheck.data.as_ref();
     let fault_address = bugcheck_data.and_then(dump_fault_address);
     let fault = fault_address.map(|address| dump_address_observation(session, address, 8));
+    let bugcheck_header_reconciliation =
+        dump_bugcheck_header_reconciliation(input.bugcheck, input.dump_header);
     let structural_parameter_context =
         dump_exception_context(session, input.target, bugcheck_data, input.max_frames);
     let documented_exception_context = target_exception_contract_verified(input.target_exception)
@@ -5637,6 +5639,7 @@ fn dump_triage_value(session: &DebuggerSession, input: DumpTriageInput<'_>) -> V
     json!({
         "bugcheck": dump_bugcheck_value(input.bugcheck),
         "dump_header": input.dump_header,
+        "bugcheck_header_reconciliation": bugcheck_header_reconciliation,
         "dump_events": input.dump_events,
         "debugger_data": input.debugger_data,
         "target_exception": input.target_exception,
@@ -5816,7 +5819,7 @@ fn documented_1e_access_violation(data: &windbg_dbgeng::BugCheckData) -> Option<
         "detail": if operation.is_some() {
             "For bugcheck 0x1E with STATUS_ACCESS_VIOLATION, Microsoft documents P3 as ExceptionInformation[0] (0=read, 1=write, 8=execute) and P4 as the address that the driver attempted to access."
         } else {
-            "The saved P3 value is not a documented access-type value (0, 1, or 8), so Microsoft’s P3/P4 access-parameter contract is not applied to this capture. Raw P3/P4 are retained for bounded structural validation only."
+            "The saved P3 value is not a documented access-type value (0, 1, or 8), so Microsoft's P3/P4 access-parameter contract is not applied to this capture. P3 and P4 remain untyped final bugcheck slots; any bounded object at either value is an unlinked structural candidate, not the fault-time exception report."
         }
     }))
 }
@@ -5881,22 +5884,61 @@ fn dump_exception_context(
                 let matches_bugcheck =
                     code_matches_bugcheck && instruction_address_matches_bugcheck;
                 json!({
-                    "status": if matches_bugcheck { "structurally_matches_bugcheck" } else { "mismatch" },
-                    "source": "structurally_validated_parameter_3_exception_record",
+                    "status": if matches_bugcheck { "structurally_matches_final_tuple" } else { "mismatch" },
+                    "source": "unlinked_structural_parameter_3_exception_record_candidate",
                     "address": address,
                     "record": record,
-                    "code_matches_bugcheck": code_matches_bugcheck,
-                    "instruction_address_matches_bugcheck": instruction_address_matches_bugcheck,
-                    "detail": "The raw P3 value did not satisfy the documented 0x1E access-type shape. This is a bounded EXCEPTION_RECORD64 compatibility probe that requires both bugcheck code and P2 address to match; it does not make pointer P3/P4 a general documented contract."
+                    "code_matches_final_tuple": code_matches_bugcheck,
+                    "instruction_address_matches_final_tuple_p2": instruction_address_matches_bugcheck,
+                    "detail": "The raw P3 final bugcheck slot did not satisfy the documented 0x1E access-type shape. This bounded read found bytes at that untyped slot value that structurally decode as an EXCEPTION_RECORD64 and match the final tuple's code and P2. It does not establish that this nested candidate supplied the final tuple, that its ExceptionInformation is fault-time data, or that pointer P3/P4 is a documented contract."
                 })
             }
             Err(error) => json!({
                 "status": "unavailable",
-                "source": "structurally_validated_parameter_3_exception_record",
+                "source": "unlinked_structural_parameter_3_exception_record_candidate",
                 "address": address,
-                "detail": format!("DbgEng could not read a complete x64 EXCEPTION_RECORD candidate: {error:#}")
+                "detail": format!("DbgEng could not read a complete x64 EXCEPTION_RECORD candidate at the untyped P3 slot value: {error:#}")
             }),
         }
+    });
+    let p3_candidate_status = exception_record_candidate
+        .as_ref()
+        .and_then(|candidate| candidate["status"].as_str())
+        .unwrap_or("unavailable");
+    let p4_candidate_status = decoded
+        .iter()
+        .find(|candidate| {
+            candidate["source"].as_str() == Some("structurally_validated_parameter_4_context")
+        })
+        .and_then(|candidate| candidate["context"]["status"].as_str())
+        .unwrap_or("unavailable");
+    let untyped_pointer_pair_assessment = (data.code == 0x0000_001E).then(|| {
+        json!({
+            "status": "non_promoting_inference",
+            "p3_final_slot": {
+                "raw_value": data.parameters[2],
+                "candidate_kind": "unlinked_exception_record_candidate",
+                "candidate_status": p3_candidate_status,
+            },
+            "p4_final_slot": {
+                "raw_value": data.parameters[3],
+                "candidate_kind": "unlinked_amd64_context_candidate",
+                "candidate_status": p4_candidate_status,
+            },
+            "assessment": if p3_candidate_status == "structurally_matches_final_tuple"
+                && matches!(p4_candidate_status, "captured" | "context_captured_stack_unavailable")
+            {
+                "structurally_consistent_with_an_undocumented_wrapper_pair"
+            } else {
+                "insufficient_structural_pair_evidence"
+            },
+            "alternatives_not_distinguished": [
+                "an undocumented wrapper or special exception-dispatch path",
+                "corrupted or reused ExceptionInformation values",
+                "separately saved objects with no causal relationship",
+            ],
+            "detail": "Two canonical pointer-shaped final slots that respectively decode as a matching EXCEPTION_RECORD64 and an AMD64 CONTEXT are structurally consistent with a wrapper-like pair. This is an inference only: no documented kernel-dump contract identifies the outer record, links it to either pointed-to object, or distinguishes that interpretation from corrupted/reused exception-information values."
+        })
     });
     Some(json!({
         "status": selected
@@ -5913,8 +5955,9 @@ fn dump_exception_context(
         "context": selected.map(|candidate| candidate["context"].clone()),
         "candidates": decoded,
         "exception_record_candidate": exception_record_candidate,
+        "untyped_pointer_pair_assessment": untyped_pointer_pair_assessment,
         "detail": if data.code == 0x0000_001E {
-            "Microsoft documents P3/P4 as access metadata for 0x1E. This capture’s raw header P3 is not an access-type value, while bounded P3/P4 structural probes match an EXCEPTION_RECORD64 and x64 CONTEXT with P2. The CONTEXT is a structurally validated compatible saved context, but remains ambiguous because DbgEng's documented target-exception requests are unavailable and the independently parsed access target conflicts with R8+R14. It is not a general parameter contract, exact fault-context proof, or direct thread/CPU attribution."
+            "Microsoft documents P3/P4 as access metadata for 0x1E only when P3 is an access-type value. This capture's saved final P3/P4 slots are pointer-shaped and therefore untyped. Bounded reads found an unlinked EXCEPTION_RECORD64 candidate at P3 and an unlinked AMD64 CONTEXT candidate at P4; neither candidate is promoted merely because its code/P2 or RIP matches the final tuple. The P4 context remains ambiguous, and the nested record's access target is only a comparison observation, not the stronger direct fault report."
         } else {
             "The decoded context comes from the documented SYSTEM_SERVICE_EXCEPTION context-record parameter."
         },
@@ -5935,6 +5978,20 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         _ => "UNKNOWN",
     };
     let parameter_roles = match data.code {
+        0x0000_001E
+            if documented_1e_access_violation(data)
+                .as_ref()
+                .is_some_and(|access| {
+                    access["status"].as_str() == Some("not_applicable_saved_parameter_shape")
+                }) =>
+        {
+            json!([
+                "exception_code",
+                "fault_instruction_address",
+                "untyped_nonstandard_final_slot",
+                "untyped_nonstandard_final_slot",
+            ])
+        }
         0x0000_001E => json!([
             "exception_code",
             "fault_instruction_address",
@@ -5963,6 +6020,65 @@ fn dump_bugcheck_value(bugcheck: &windbg_dbgeng::BugCheckDataResult) -> Value {
         "parameter_roles": parameter_roles,
         "access_violation": documented_1e_access_violation(data),
         "detail": bugcheck.detail,
+    })
+}
+
+fn dump_bugcheck_header_reconciliation(
+    bugcheck: &windbg_dbgeng::BugCheckDataResult,
+    dump_header: &Value,
+) -> Value {
+    let Some(bugcheck_data) = bugcheck.data.as_ref() else {
+        return json!({
+            "status": "unavailable_bugcheck_data",
+            "detail": "DbgEng did not return a saved bugcheck tuple, so it cannot be compared with the dump header's fixed prefix."
+        });
+    };
+    if dump_header["fixed_prefix_status"].as_str() != Some("validated") {
+        return json!({
+            "status": "unavailable_unvalidated_header_fixed_prefix",
+            "dbgeng_bugcheck": {
+                "code": bugcheck_data.code,
+                "parameters": bugcheck_data.parameters,
+            },
+            "header_fixed_prefix_status": dump_header["fixed_prefix_status"],
+            "detail": "The DUMP_HEADER64 fixed prefix did not pass its signature and valid-dump marker checks, so its bugcheck fields are not compared."
+        });
+    }
+    let header_parameters: Option<[u64; 4]> = dump_header["bugcheck_parameters"]
+        .as_array()
+        .and_then(|values| {
+            values
+                .iter()
+                .map(Value::as_u64)
+                .collect::<Option<Vec<_>>>()
+                .and_then(|values| values.try_into().ok())
+        });
+    let header_code = dump_header["bugcheck_code"].as_u64();
+    let matched = header_code
+        .zip(header_parameters)
+        .map(|(code, parameters)| {
+            code == bugcheck_data.code as u64 && parameters == bugcheck_data.parameters
+        });
+    json!({
+        "status": match matched {
+            Some(true) => "matched_saved_final_tuple",
+            Some(false) => "mismatch",
+            None => "unavailable_incomplete_header_tuple",
+        },
+        "sources": [
+            "dbgeng_idebugcontrol_read_bug_check_data",
+            "dbgeng_idebugadvanced2_debug_request_get_dump_header_fixed_prefix",
+        ],
+        "header_fixed_prefix_status": dump_header["fixed_prefix_status"],
+        "dbgeng_bugcheck": {
+            "code": bugcheck_data.code,
+            "parameters": bugcheck_data.parameters,
+        },
+        "header_bugcheck": {
+            "code": header_code,
+            "parameters": header_parameters,
+        },
+        "detail": "Agreement confirms that two documented DbgEng surfaces expose the same saved final bugcheck tuple. It does not assign typed P3/P4 semantics when their values are outside the documented 0x1E access-violation shape, authenticate any pointed-to object, or distinguish a wrapper, special dispatch path, or corrupted/reused exception-information values."
     })
 }
 
@@ -6298,7 +6414,7 @@ fn dump_fault_mechanics_audit(
     } else if structural_record_access_target.is_some()
         && effective_address_matches_target != Some(true)
     {
-        "conflicting_structural_context"
+        "conflicting_unlinked_candidates"
     } else {
         "structural_context_only"
     };
@@ -6340,8 +6456,8 @@ fn dump_fault_mechanics_audit(
         (true, Some(_)) => "documented_access_type_does_not_establish_xadd_phase",
         (false, Some(_)) => "instruction_bytes_not_exact_xadd",
         (_, None) => match (is_r8_r14_xadd, structural_record_operation) {
-            (true, Some("read")) => "structurally_coheres_with_xadd_destination_read",
-            (true, Some(_)) => "structural_access_type_does_not_establish_xadd_phase",
+            (true, Some("read")) => "unlinked_candidate_read_is_instruction_consistent",
+            (true, Some(_)) => "unlinked_candidate_access_type_does_not_establish_xadd_phase",
             (false, Some(_)) => "instruction_bytes_not_exact_xadd",
             (_, None) => "not_applicable",
         },
@@ -6360,7 +6476,7 @@ fn dump_fault_mechanics_audit(
             "structural_exception_record_access_target": structural_record_access_target,
             "access_phase_coherence": access_phase_coherence,
             "write_completion": "unknown",
-            "detail": "Only the exact bytes F0 4B 0F C1 2C 06 decode as LOCK XADD qword ptr [R14+R8], RBP. When the bounded structural EXCEPTION_RECORD64 probe records a read, that is consistent with XADD reading its memory destination before its update. The capture-specific pointer compatibility path is not Microsoft’s general P3/P4 contract and does not establish write completion, prior writer, or allocation history."
+            "detail": "Only the exact bytes F0 4B 0F C1 2C 06 decode as LOCK XADD qword ptr [R14+R8], RBP. A read in the unlinked EXCEPTION_RECORD64 candidate is instruction-consistent with XADD reading its destination before its update, but does not establish that candidate as the fault-time report. The capture-specific pointer shape is not Microsoft's general P3/P4 contract and does not establish write completion, prior writer, or allocation history."
         },
         "register_dataflow": {
             "status": register_dataflow_status,
@@ -6377,7 +6493,7 @@ fn dump_fault_mechanics_audit(
             "structural_exception_record_access_target": structural_record_access_target,
             "effective_address_matches_access_target": effective_address_matches_target,
             "bounded_record_offset_20_raw_qword": counter_raw_qword,
-            "detail": "R14 is a register value, not an instruction-encoded displacement. A register-derived operand is emitted only from a documented context, or retained as non-promoted structural comparison data when bounded P3/P4 compatibility probes conflict."
+            "detail": "R14 is a register value, not an instruction-encoded displacement. A register-derived operand is emitted only from a documented context, or retained as non-promoted structural comparison data when an unlinked P3 object candidate and P4 context candidate conflict."
         },
         "context_exception_record_relationship": {
             "status": if effective_address_matches_target == Some(false) {
@@ -6387,7 +6503,7 @@ fn dump_fault_mechanics_audit(
             },
             "context_register_candidate": effective_address,
             "exception_record_access_target": comparison_target,
-            "detail": "LOCK XADD is architecturally a read-modify-write instruction, but this dump exposes no documented per-instruction retirement state or DbgEng target-exception context with which to bind the capture-specific P4 CONTEXT to the P3 EXCEPTION_RECORD. The tool does not attribute a mismatch to instruction restart, fault delivery, register mutation, or a transient mapping change; the two values remain separate conflicting saved-state observations."
+            "detail": "LOCK XADD is architecturally a read-modify-write instruction, but this dump exposes no documented per-instruction retirement state or DbgEng target-exception context with which to bind the unlinked P4 CONTEXT candidate to the unlinked P3 EXCEPTION_RECORD candidate. The tool does not attribute a mismatch to instruction restart, fault delivery, register mutation, a wrapper, corruption, or a transient mapping change; the two values remain separate saved-state observations."
         },
         "counter_field_semantics": {
             "status": "unsupported",
@@ -6505,6 +6621,13 @@ fn context_candidate(
         "status": if context_captured { "captured" } else { context_status },
         "context_status": context_status,
         "exception_record_present": exception_record.is_some(),
+        "exception_record_relationship": if descriptor.documented_linkage {
+            "documented_linked_to_context"
+        } else if exception_record.is_some() {
+            "unlinked_comparison_only"
+        } else {
+            "unavailable"
+        },
         "context_rip": rip,
         "context_rip_matches_bugcheck_p2": rip_matches_bugcheck,
         "r8_plus_r14": operand,
@@ -6550,6 +6673,30 @@ fn dump_context_candidate_reconciliation(
     let saved_context_matches_p4 = saved_context_address
         .zip(bugcheck_data.map(|data| data.parameters[3]))
         .map(|(saved_context, p4)| saved_context == p4);
+    let untyped_final_slots = bugcheck_data
+        .filter(|data| {
+            data.code == 0x0000_001E
+                && documented_1e_access_violation(data)
+                    .as_ref()
+                    .is_some_and(|contract| {
+                        contract["status"].as_str()
+                            == Some("not_applicable_saved_parameter_shape")
+                    })
+        })
+        .map(|data| {
+            json!({
+                "status": "nonstandard_untyped_parameter_shape",
+                "p3": {
+                    "raw_value": data.parameters[2],
+                    "candidate_kind": "unlinked_exception_record_candidate",
+                },
+                "p4": {
+                    "raw_value": data.parameters[3],
+                    "candidate_kind": "unlinked_amd64_context_candidate",
+                },
+                "detail": "The saved final 0x1E P3/P4 values are outside Microsoft's access-type/address contract. They are retained as untyped final slots; structural objects at their values are unlinked candidates and cannot supply fault-time semantics without a documented linkage."
+            })
+        });
 
     let mut candidates = vec![
         context_candidate(
@@ -6626,7 +6773,7 @@ fn dump_context_candidate_reconciliation(
                 },
                 explicit_root: "raw_bugcheck_parameter_4",
                 documented_linkage: false,
-                linkage_detail: "P4 is explicitly rooted by the raw bugcheck field and bounded-read as a complete AMD64 CONTEXT. No DbgEng or dump-format contract ties it to P3 in this 0x1E parameter shape.",
+                linkage_detail: "P4 is explicitly rooted by the final raw bugcheck slot and bounded-read as a complete AMD64 CONTEXT. P3's structurally parsed object is an unlinked comparison candidate; no DbgEng or dump-format contract ties either candidate to the final exception or to one another in this 0x1E parameter shape.",
             },
             structural_context,
             structural_record,
@@ -6715,6 +6862,7 @@ fn dump_context_candidate_reconciliation(
             "context_status": debugger_data["saved_context"]["status"],
             "detail": "This independently documents whether P4 is the kernel's saved bugcheck CONTEXT. It does not provide the missing P3 EXCEPTION_RECORD-to-CONTEXT linkage, so it cannot by itself make P4 fault-time eligible."
         },
+        "untyped_final_slots": untyped_final_slots,
         "candidates": candidates,
         "fault_time_context": {
             "status": if resolved_candidate.is_some() {
@@ -6729,9 +6877,9 @@ fn dump_context_candidate_reconciliation(
             "selected_source": resolved_candidate.as_ref().and_then(|candidate| candidate["source"].as_str()),
             "candidate": resolved_candidate,
             "matching_rip_conflicting_operand": matching_rip_conflicting_operand,
-            "detail": "A candidate is fault-time eligible only when an explicit documented linkage supplies its context and exception record, both match the saved bugcheck, the AMD64 fields validate, RIP equals P2, and R8+R14 equals the recorded access target. Matching RIP alone, a pointer-shaped root, header field co-location, or unwind output is insufficient."
+            "detail": "A candidate is fault-time eligible only when an explicit documented linkage supplies its context and exception record, both match the saved bugcheck, the AMD64 fields validate, RIP equals P2, and R8+R14 equals the documented linked record's access target. Matching RIP alone, an untyped pointer-shaped final slot, a structural object candidate, header field co-location, or unwind output is insufficient."
         },
-        "detail": "Only explicit roots are inventoried: raw bugcheck P4, documented DbgEng event data, validated DUMP_HEADER64 fields, and contexts derived by bounded stack unwinding. No arbitrary memory scan, private kernel layout, trap-frame guess, or event selection is used."
+        "detail": "Only explicit roots are inventoried: raw final bugcheck slots, documented DbgEng event data, validated DUMP_HEADER64 fields, and contexts derived by bounded stack unwinding. No arbitrary memory scan, private kernel layout, trap-frame guess, or event selection is used. A structurally valid object reached through an untyped final slot is recorded as an unlinked candidate rather than a direct exception report."
     })
 }
 
@@ -6829,7 +6977,7 @@ fn dump_fault_context_provenance(
             "detail": if fault_time_status == "fault_time" {
                 "The reconciler found a documented context-and-record linkage that satisfies every required cross-check."
             } else {
-                "No candidate is promoted to fault-time state. A structurally valid P4 context remains an ambiguous saved snapshot even when its RIP equals P2; the reconciliation inventory records every explicit candidate and rejected linkage."
+                "No candidate is promoted to fault-time state. A structurally valid P4 context remains an unlinked saved snapshot even when its RIP equals P2, and a structurally valid P3 object is only an unlinked nested candidate; the reconciliation inventory records every explicit candidate and rejected linkage."
             }
         },
         "promotion_checks": {
@@ -6845,7 +6993,7 @@ fn dump_fault_context_provenance(
             "structural_exception_record_access_target": structural_exception_target,
             "documented_exception_target": documented_exception_target,
             "rsp_mod_16": validation.and_then(|value| value["rsp_mod_16"].as_u64()),
-            "detail": "RSP alignment is recorded as an observation; canonicality and the explicitly validated AMD64 control/integer/selector fields are required. Address adjacency, readability, and an unwind result are not linkage."
+            "detail": "RSP alignment is recorded as an observation; canonicality and the explicitly validated AMD64 control/integer/selector fields are required. An unlinked P3 object's access target is comparison-only. Address adjacency, readability, and an unwind result are not linkage."
         },
         "evidence_graph": {
             "nodes": [
@@ -6859,13 +7007,15 @@ fn dump_fault_context_provenance(
                     "id": "bugcheck_p3",
                     "source": "raw_bugcheck_parameter",
                     "address": bugcheck_data.map(|data| data.parameters[2]),
-                    "status": if structural_exception_target.is_some() { "structurally_validated_exception_record" } else { "unavailable" }
+                    "status": if structural_exception_target.is_some() { "structurally_validated_unlinked_nested_exception_record_candidate" } else { "unavailable" },
+                    "detail": "P3 is a final saved bugcheck slot. A readable EXCEPTION_RECORD64 at that slot value is an unlinked nested candidate, not a direct fault-time exception report."
                 },
                 {
                     "id": "bugcheck_p4",
                     "source": "raw_bugcheck_parameter",
                     "address": bugcheck_data.map(|data| data.parameters[3]),
-                    "status": if context_available { "structurally_validated_amd64_context" } else { "unavailable" }
+                    "status": if context_available { "structurally_validated_unlinked_amd64_context_candidate" } else { "unavailable" },
+                    "detail": "P4 is a final saved bugcheck slot. A readable AMD64 CONTEXT at that slot value is an unlinked candidate, not fault-time state."
                 },
                 {
                     "id": "dump_header_embedded_context",
@@ -6911,14 +7061,14 @@ fn dump_fault_context_provenance(
                 {
                     "from": "bugcheck_p3",
                     "to": "fault_instruction",
-                    "relationship": "structural_field_match",
-                    "status": if structural_exception_target.is_some() { "P3 exception address matches P2" } else { "unavailable" }
+                    "relationship": "unlinked_nested_structural_field_match",
+                    "status": if structural_exception_target.is_some() { "unlinked P3 candidate ExceptionAddress matches P2" } else { "unavailable" }
                 },
                 {
                     "from": "bugcheck_p4",
                     "to": "fault_instruction",
-                    "relationship": "structural_field_match",
-                    "status": if rip_matches_fault_instruction { "context RIP matches P2" } else { "unavailable_or_mismatch" }
+                    "relationship": "unlinked_structural_field_match",
+                    "status": if rip_matches_fault_instruction { "unlinked P4 candidate RIP matches P2" } else { "unavailable_or_mismatch" }
                 },
                 {
                     "from": "dbgeng_target_exception",
@@ -8954,6 +9104,66 @@ mod tests {
         assert_eq!(access["status"], "not_applicable_saved_parameter_shape");
         assert!(access["operation"].is_null());
         assert!(access["target_address"].is_null());
+        let value = dump_bugcheck_value(&windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(data),
+            detail: "fixture".to_string(),
+        });
+        assert_eq!(
+            value["parameter_roles"][2],
+            "untyped_nonstandard_final_slot"
+        );
+        assert_eq!(
+            value["parameter_roles"][3],
+            "untyped_nonstandard_final_slot"
+        );
+    }
+
+    #[test]
+    fn bugcheck_header_reconciliation_requires_an_exact_fixed_prefix_tuple() {
+        let bugcheck = windbg_dbgeng::BugCheckDataResult {
+            status: "captured".to_string(),
+            data: Some(windbg_dbgeng::BugCheckData {
+                code: 0x1E,
+                parameters: [
+                    0xffff_ffff_c000_0005,
+                    0xffff_f800_e439_70b0,
+                    0xffff_f283_9446_89b8,
+                    0xffff_f283_9446_81c0,
+                ],
+            }),
+            detail: "fixture".to_string(),
+        };
+        let matching_header = json!({
+            "fixed_prefix_status": "validated",
+            "bugcheck_code": 0x1Eu32,
+            "bugcheck_parameters": [
+                0xffff_ffff_c000_0005u64,
+                0xffff_f800_e439_70b0u64,
+                0xffff_f283_9446_89b8u64,
+                0xffff_f283_9446_81c0u64,
+            ],
+        });
+
+        assert_eq!(
+            dump_bugcheck_header_reconciliation(&bugcheck, &matching_header)["status"],
+            "matched_saved_final_tuple"
+        );
+
+        let swapped_header = json!({
+            "fixed_prefix_status": "validated",
+            "bugcheck_code": 0x1Eu32,
+            "bugcheck_parameters": [
+                0xffff_ffff_c000_0005u64,
+                0xffff_f800_e439_70b0u64,
+                0xffff_f283_9446_81c0u64,
+                0xffff_f283_9446_89b8u64,
+            ],
+        });
+        assert_eq!(
+            dump_bugcheck_header_reconciliation(&bugcheck, &swapped_header)["status"],
+            "mismatch"
+        );
     }
 
     #[test]
@@ -9114,10 +9324,10 @@ mod tests {
             &json!({"status": "captured", "record": {"code": 0xC0000005u32}}),
         );
 
-        assert_eq!(audit["status"], "conflicting_structural_context");
+        assert_eq!(audit["status"], "conflicting_unlinked_candidates");
         assert_eq!(
             audit["register_dataflow"]["status"],
-            "conflicting_structural_context"
+            "conflicting_unlinked_candidates"
         );
         assert!(audit["register_dataflow"]["effective_address"].is_null());
         assert_eq!(
@@ -9126,7 +9336,7 @@ mod tests {
         );
         assert_eq!(
             audit["memory_access"]["access_phase_coherence"],
-            "structurally_coheres_with_xadd_destination_read"
+            "unlinked_candidate_read_is_instruction_consistent"
         );
         assert_eq!(
             audit["context_exception_record_relationship"]["status"],

@@ -39,6 +39,17 @@ does not record active exception records. Target-exception context/record pairs 
 linked only when DbgEng's target class verifies a user-mode minidump, the documented scope of
 those requests; any result from another target type remains unlinked.
 
+For complete dumps, the tool independently decodes the signature-validated fixed
+`DUMP_HEADER64` prefix through the four saved bugcheck parameters before attempting to decode
+the optional header tail. It reconciles that tuple against `ReadBugCheckData` only on exact
+code-and-four-parameter equality. A structurally valid object addressed by a final bugcheck
+slot is still a rooted structural candidate, not a typed parameter or an exception-time object.
+For bugcheck `0x1E`, pointer-shaped final slots that do not meet the documented
+access-type/fault-address contract are reported as untyped nonstandard values. A matching
+exception-record-shaped object and context-shaped object can support only a wrapper-like
+inference; they cannot distinguish an undocumented dispatch path from corrupted, reused, or
+otherwise unrelated state and never promote fault-time registers.
+
 ## Common replay workflow
 
 Start or reuse the local daemon:
