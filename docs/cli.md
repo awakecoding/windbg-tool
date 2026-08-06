@@ -26,6 +26,19 @@ unwind, and never treats a loaded driver or `ntoskrnl.exe` fault location as dri
 Add `--refresh-symbols` only when the configured symbol path may be contacted; the report records
 whether DbgEng loaded PDB-backed symbols or only has module-level metadata.
 
+Context candidates are reconciled only from explicit roots: raw bugcheck fields, documented
+DbgEng saved-context and stored-event data, validated `DUMP_HEADER64` fields, and bounded unwind
+output. `ReadDebuggerData(DEBUG_DATA_SavedContextAddr)` proves only that DbgEng identified a
+context saved during a bugcheck; a null result is reported explicitly, and a non-null result still
+does not link that context to an `EXCEPTION_RECORD`. Each candidate reports one strict provenance
+category. A matching RIP is not fault-time proof: the tool requires a documented
+context-to-exception link plus matching bugcheck, AMD64 validation, and operand target before
+promoting registers. Header `ContextRecord` and `Exception` bytes remain unlinked evidence,
+because Microsoft's documented header-initialization routine can run before memory capture and
+does not record active exception records. Target-exception context/record pairs are considered
+linked only when DbgEng's target class verifies a user-mode minidump, the documented scope of
+those requests; any result from another target type remains unlinked.
+
 ## Common replay workflow
 
 Start or reuse the local daemon:
