@@ -618,6 +618,7 @@ pub struct DumpHeaderSnapshot {
     pub status: String,
     pub source: String,
     pub bytes_returned: u32,
+    pub fixed_prefix_status: String,
     pub tail_status: String,
     pub signature: Option<u32>,
     pub valid_dump: Option<u32>,
@@ -631,6 +632,7 @@ pub struct DumpHeaderSnapshot {
     pub processor_count: Option<u32>,
     pub bugcheck_code: Option<u32>,
     pub bugcheck_parameters: Option<[u64; 4]>,
+    pub embedded_exception_context: DumpHeaderEmbeddedExceptionContext,
     pub version_user: Option<String>,
     pub dump_type: Option<u32>,
     pub dump_type_name: Option<String>,
@@ -647,6 +649,39 @@ pub struct DumpHeaderSnapshot {
     pub attributes_raw: Option<u32>,
     pub attributes: Vec<String>,
     pub boot_id: Option<u32>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DumpHeaderEmbeddedExceptionContext {
+    pub status: String,
+    pub provenance_category: String,
+    pub context_status: String,
+    pub exception_record_status: String,
+    pub context: Option<X64ExceptionContext>,
+    pub exception_record: Option<TargetExceptionRecord>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DumpEventInventory {
+    pub status: String,
+    pub source: String,
+    pub event_count: Option<u32>,
+    pub current_event_index: Option<u32>,
+    pub current_event_index_status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DumpDebuggerData {
+    pub status: String,
+    pub source: String,
+    pub saved_context_address: Option<u64>,
+    pub saved_context_status: String,
+    pub saved_context: Option<X64ExceptionContext>,
+    pub ki_bugcheck_data_address: Option<u64>,
+    pub ki_bugcheck_data_status: String,
     pub detail: String,
 }
 
@@ -672,6 +707,7 @@ pub struct TargetAccessViolation {
 pub struct TargetExceptionSnapshot {
     pub status: String,
     pub source: String,
+    pub contract: TargetExceptionContract,
     pub stored_event: StoredEventInformation,
     pub thread_system_id: Option<u32>,
     pub thread_status: String,
@@ -679,6 +715,15 @@ pub struct TargetExceptionSnapshot {
     pub record_status: String,
     pub context: Option<X64ExceptionContext>,
     pub context_status: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct TargetExceptionContract {
+    pub status: String,
+    pub source: String,
+    pub debuggee_class: Option<u32>,
+    pub debuggee_qualifier: Option<u32>,
     pub detail: String,
 }
 
@@ -800,7 +845,14 @@ const X64_CONTEXT_SIZE: u32 = 0x4D0;
 const CONTEXT_AMD64_FLAG: u32 = 0x0010_0000;
 const CONTEXT_X64_REQUIRED_REGISTER_FLAGS: u32 = CONTEXT_AMD64_FLAG | 0x0000_0003;
 const DUMP_HEADER64_SIZE: usize = 0x2000;
+const DUMP_HEADER64_FIXED_PREFIX_SIZE: usize = 0x60;
+const DUMP_HEADER64_TAIL_THROUGH_BOOT_ID_SIZE: usize = 0x1050;
+const DUMP_HEADER64_DUMP_TYPE_OFFSET: usize = 0xF94;
+const DUMP_HEADER64_CONTEXT_RECORD_OFFSET: usize = 0x344;
+const DUMP_HEADER64_CONTEXT_RECORD_SIZE: usize = 3000;
 const EXCEPTION_RECORD64_SIZE: usize = 0x98;
+const DUMP_HEADER64_EXCEPTION_OFFSET: usize =
+    DUMP_HEADER64_CONTEXT_RECORD_OFFSET + DUMP_HEADER64_CONTEXT_RECORD_SIZE;
 
 // The dump target's architecture can differ from the host build architecture. Keep this prefix
 // independent of windows::CONTEXT so ARM64 builds can decode an AMD64 dump safely.
@@ -936,6 +988,89 @@ fn x64_context_validation(
         rsp_canonical_for_selected_address_width: canonicality.map(|value| value.1),
         control_registers_in_amd64_context: false,
         detail: "The fixed AMD64 CONTEXT offsets were independently decoded from the bounded byte buffer and compared with the C-compatible prefix. CS/SS and EFLAGS checks are structural sanity observations, not thread or CPU attribution. AMD64 CONTEXT does not contain CR3 or CR4; any selected-debugger CR4 is used only for canonical-address checks and does not establish the saved context's paging root.".to_string(),
+    }
+}
+
+fn decode_x64_context_structural(
+    context_record_address: Option<u64>,
+    buffer: &[u8],
+    bytes_read: u32,
+    selected_address_width: Option<(u64, u8)>,
+) -> X64ExceptionContext {
+    let requested_size = X64_CONTEXT_SIZE;
+    if buffer.len() < requested_size as usize {
+        return X64ExceptionContext {
+            status: "partial".to_string(),
+            context_record_address,
+            requested_size,
+            bytes_read,
+            complete: false,
+            context_flags: None,
+            validation: None,
+            registers: None,
+            stack: None,
+            unwind_contexts: None,
+            detail: format!(
+                "The bounded source contains only {} of {requested_size} AMD64 CONTEXT bytes.",
+                buffer.len()
+            ),
+        };
+    }
+    let context = x64_context_prefix_from_bytes(buffer)
+        .expect("the complete x64 CONTEXT buffer must contain its documented prefix");
+    let context_flags = context.context_flags;
+    if context_flags & CONTEXT_X64_REQUIRED_REGISTER_FLAGS != CONTEXT_X64_REQUIRED_REGISTER_FLAGS {
+        return X64ExceptionContext {
+            status: "invalid".to_string(),
+            context_record_address,
+            requested_size,
+            bytes_read,
+            complete: true,
+            context_flags: Some(context_flags),
+            validation: None,
+            registers: None,
+            stack: None,
+            unwind_contexts: None,
+            detail: "The complete context record does not contain the AMD64 control and integer register groups required for register decoding.".to_string(),
+        };
+    }
+    let registers = X64ExceptionRegisters {
+        rax: context.rax,
+        rbx: context.rbx,
+        rcx: context.rcx,
+        rdx: context.rdx,
+        rsi: context.rsi,
+        rdi: context.rdi,
+        rbp: context.rbp,
+        rsp: context.rsp,
+        r8: context.r8,
+        r9: context.r9,
+        r10: context.r10,
+        r11: context.r11,
+        r12: context.r12,
+        r13: context.r13,
+        r14: context.r14,
+        r15: context.r15,
+        rip: context.rip,
+        eflags: context.eflags,
+    };
+    X64ExceptionContext {
+        status: "captured".to_string(),
+        context_record_address,
+        requested_size,
+        bytes_read,
+        complete: true,
+        context_flags: Some(context_flags),
+        validation: Some(x64_context_validation(
+            &context,
+            buffer,
+            selected_address_width,
+        )),
+        registers: Some(registers),
+        stack: None,
+        unwind_contexts: None,
+        detail: "Decoded a complete AMD64 CONTEXT record without using stack unwinding."
+            .to_string(),
     }
 }
 
@@ -2093,6 +2228,85 @@ impl DebuggerSession {
         }
     }
 
+    pub fn dump_debugger_data(&self, max_frames: u32) -> DumpDebuggerData {
+        const DEBUG_DATA_SAVED_CONTEXT_ADDR: u32 = 40;
+        const DEBUG_DATA_KI_BUGCHECK_DATA_ADDR: u32 = 136;
+
+        let read_u64 = |index| {
+            let mut value = 0u64;
+            let mut bytes_returned = 0u32;
+            let result = unsafe {
+                self.data_spaces.ReadDebuggerData(
+                    index,
+                    (&mut value as *mut u64).cast(),
+                    std::mem::size_of::<u64>() as u32,
+                    Some(&mut bytes_returned),
+                )
+            };
+            match result {
+                Ok(()) if bytes_returned == std::mem::size_of::<u64>() as u32 => Ok(value),
+                Ok(()) => Err(anyhow::anyhow!(
+                    "DbgEng returned {bytes_returned} of {} bytes",
+                    std::mem::size_of::<u64>()
+                )),
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        };
+
+        let (saved_context_address, saved_context_status) =
+            match read_u64(DEBUG_DATA_SAVED_CONTEXT_ADDR) {
+                Ok(0) => (
+                    None,
+                    "not_present: DbgEng returned a null saved-context address".to_string(),
+                ),
+                Ok(address) => (Some(address), "captured".to_string()),
+                Err(error) => (None, format!("unavailable: {error}")),
+            };
+        let saved_context = saved_context_address.map(|address| {
+            if self.processor_type().ok() == Some(0x8664) {
+                self.x64_exception_context(address, max_frames)
+            } else {
+                X64ExceptionContext {
+                    status: "architecture_unsupported".to_string(),
+                    context_record_address: Some(address),
+                    requested_size: X64_CONTEXT_SIZE,
+                    bytes_read: 0,
+                    complete: false,
+                    context_flags: None,
+                    validation: None,
+                    registers: None,
+                    stack: None,
+                    unwind_contexts: None,
+                    detail: "DEBUG_DATA_SavedContextAddr returned a context address, but this inspector only decodes AMD64 CONTEXT records.".to_string(),
+                }
+            }
+        });
+        let (ki_bugcheck_data_address, ki_bugcheck_data_status) =
+            match read_u64(DEBUG_DATA_KI_BUGCHECK_DATA_ADDR) {
+                Ok(0) => (
+                    None,
+                    "not_present: DbgEng returned a null KiBugCheckData address".to_string(),
+                ),
+                Ok(address) => (Some(address), "captured".to_string()),
+                Err(error) => (None, format!("unavailable: {error}")),
+            };
+
+        DumpDebuggerData {
+            status: if saved_context_address.is_some() || ki_bugcheck_data_address.is_some() {
+                "captured".to_string()
+            } else {
+                "unavailable".to_string()
+            },
+            source: "dbgeng_idebugdataspaces3_readdebuggerdata".to_string(),
+            saved_context_address,
+            saved_context_status,
+            saved_context,
+            ki_bugcheck_data_address,
+            ki_bugcheck_data_status,
+            detail: "ReadDebuggerData returns the documented address of the saved bugcheck context and the KiBugCheckData kernel variable. The saved-context address proves only that a context was saved during the bugcheck; it does not link that context to P3 or establish instruction-fault-time registers. KiBugCheckData is retained as an address-only root because no versioned public layout is decoded.".to_string(),
+        }
+    }
+
     pub fn dump_header(&self) -> DumpHeaderSnapshot {
         use windows::core::Interface;
         use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugAdvanced2;
@@ -2129,6 +2343,57 @@ impl DebuggerSession {
             Err(error) => unavailable_dump_header(format!(
                 "DbgEng DEBUG_REQUEST_GET_DUMP_HEADER failed: {error}"
             )),
+        }
+    }
+
+    pub fn dump_event_inventory(&self) -> DumpEventInventory {
+        use windows::core::Interface;
+        use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugControl3;
+
+        let control: IDebugControl3 = match self.client.cast() {
+            Ok(control) => control,
+            Err(error) => {
+                return DumpEventInventory {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_idebugcontrol3_event_inventory".to_string(),
+                    event_count: None,
+                    current_event_index: None,
+                    current_event_index_status: "unavailable".to_string(),
+                    detail: format!(
+                        "DbgEng did not expose IDebugControl3 for the bounded event inventory: {error}"
+                    ),
+                };
+            }
+        };
+        let event_count = match unsafe { control.GetNumberEvents() } {
+            Ok(event_count) => event_count,
+            Err(error) => {
+                return DumpEventInventory {
+                    status: "unavailable".to_string(),
+                    source: "dbgeng_idebugcontrol3_event_inventory".to_string(),
+                    event_count: None,
+                    current_event_index: None,
+                    current_event_index_status: "unavailable".to_string(),
+                    detail: format!("DbgEng GetNumberEvents failed: {error}"),
+                };
+            }
+        };
+        let (current_event_index, current_event_index_status, current_event_index_detail) =
+            match unsafe { control.GetCurrentEventIndex() } {
+                Ok(index) => (Some(index), "captured".to_string(), None),
+                Err(error) => (
+                    None,
+                    "unavailable".to_string(),
+                    Some(format!("DbgEng GetCurrentEventIndex failed: {error}")),
+                ),
+            };
+        DumpEventInventory {
+            status: "captured".to_string(),
+            source: "dbgeng_idebugcontrol3_event_inventory".to_string(),
+            event_count: Some(event_count),
+            current_event_index,
+            current_event_index_status,
+            detail: current_event_index_detail.unwrap_or_else(|| "DbgEng returned bounded event-list metadata without selecting or replaying an event. Event enumeration does not expose a typed exception-record-to-context pointer relationship for this kernel dump, so no event is treated as P3/P4 linkage.".to_string()),
         }
     }
 
@@ -2235,10 +2500,52 @@ impl DebuggerSession {
         }
     }
 
+    fn target_exception_contract(&self) -> TargetExceptionContract {
+        use windows::Win32::System::Diagnostics::Debug::Extensions::{
+            DEBUG_CLASS_USER_WINDOWS, DEBUG_DUMP_SMALL,
+        };
+
+        let mut debuggee_class = 0u32;
+        let mut debuggee_qualifier = 0u32;
+        match unsafe {
+            self.control
+                .GetDebuggeeType(&mut debuggee_class, &mut debuggee_qualifier)
+        } {
+            Ok(()) if debuggee_class == DEBUG_CLASS_USER_WINDOWS
+                && debuggee_qualifier == DEBUG_DUMP_SMALL =>
+            {
+                TargetExceptionContract {
+                    status: "verified_user_mode_minidump".to_string(),
+                    source: "dbgeng_idebugcontrol_getdebuggeetype".to_string(),
+                    debuggee_class: Some(debuggee_class),
+                    debuggee_qualifier: Some(debuggee_qualifier),
+                    detail: "DbgEng identified a user-mode minidump, the documented target scope for target-exception context, thread, and record requests.".to_string(),
+                }
+            }
+            Ok(()) => TargetExceptionContract {
+                status: "unsupported_debuggee_type".to_string(),
+                source: "dbgeng_idebugcontrol_getdebuggeetype".to_string(),
+                debuggee_class: Some(debuggee_class),
+                debuggee_qualifier: Some(debuggee_qualifier),
+                detail: "DbgEng target-exception requests are documented for user-mode minidumps only. Any returned data outside that verified target type remains an unlinked observation.".to_string(),
+            },
+            Err(error) => TargetExceptionContract {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol_getdebuggeetype".to_string(),
+                debuggee_class: None,
+                debuggee_qualifier: None,
+                detail: format!(
+                    "DbgEng GetDebuggeeType failed, so the documented user-mode-minidump scope could not be verified: {error}"
+                ),
+            },
+        }
+    }
+
     pub fn target_exception_snapshot(&self, max_frames: u32) -> TargetExceptionSnapshot {
         use windows::core::Interface;
         use windows::Win32::System::Diagnostics::Debug::Extensions::IDebugAdvanced2;
 
+        let contract = self.target_exception_contract();
         let stored_event = self.stored_event_information(max_frames);
         let advanced: IDebugAdvanced2 = match self.client.cast() {
             Ok(advanced) => advanced,
@@ -2246,6 +2553,7 @@ impl DebuggerSession {
                 return TargetExceptionSnapshot {
                     status: "unavailable".to_string(),
                     source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+                    contract,
                     stored_event,
                     thread_system_id: None,
                     thread_status: "unavailable".to_string(),
@@ -2342,6 +2650,7 @@ impl DebuggerSession {
                 _ => "partial".to_string(),
             },
             source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+            contract,
             stored_event,
             thread_system_id: (thread_status == "captured").then_some(thread_system_id),
             thread_status,
@@ -2592,67 +2901,15 @@ impl DebuggerSession {
         bytes_read: u32,
         max_frames: u32,
     ) -> X64ExceptionContext {
-        let requested_size = X64_CONTEXT_SIZE;
-        if buffer.len() < requested_size as usize {
-            return X64ExceptionContext {
-                status: "partial".to_string(),
-                context_record_address,
-                requested_size,
-                bytes_read,
-                complete: false,
-                context_flags: None,
-                validation: None,
-                registers: None,
-                stack: None,
-                unwind_contexts: None,
-                detail: format!(
-                    "DbgEng returned only {} of {requested_size} bytes for the x64 CONTEXT record.",
-                    buffer.len()
-                ),
-            };
-        }
-        let context = x64_context_prefix_from_bytes(buffer)
-            .expect("the complete x64 CONTEXT buffer must contain its documented prefix");
-        let context_flags = context.context_flags;
-        if context_flags & CONTEXT_X64_REQUIRED_REGISTER_FLAGS
-            != CONTEXT_X64_REQUIRED_REGISTER_FLAGS
-        {
-            return X64ExceptionContext {
-                status: "invalid".to_string(),
-                context_record_address,
-                requested_size,
-                bytes_read,
-                complete: true,
-                context_flags: Some(context_flags),
-                validation: None,
-                registers: None,
-                stack: None,
-                unwind_contexts: None,
-                detail: "The complete context record does not contain the AMD64 control and integer register groups required for register or stack decoding.".to_string(),
-            };
-        }
-        let registers = X64ExceptionRegisters {
-            rax: context.rax,
-            rbx: context.rbx,
-            rcx: context.rcx,
-            rdx: context.rdx,
-            rsi: context.rsi,
-            rdi: context.rdi,
-            rbp: context.rbp,
-            rsp: context.rsp,
-            r8: context.r8,
-            r9: context.r9,
-            r10: context.r10,
-            r11: context.r11,
-            r12: context.r12,
-            r13: context.r13,
-            r14: context.r14,
-            r15: context.r15,
-            rip: context.rip,
-            eflags: context.eflags,
+        let mut decoded = decode_x64_context_structural(
+            context_record_address,
+            buffer,
+            bytes_read,
+            self.selected_x64_address_width().ok(),
+        );
+        let Some(registers) = decoded.registers.as_ref() else {
+            return decoded;
         };
-        let selected_address_width = self.selected_x64_address_width().ok();
-        let validation = x64_context_validation(&context, buffer, selected_address_width);
         let stack =
             self.stack_trace_from_offsets(registers.rbp, registers.rsp, registers.rip, max_frames);
         let unwind_contexts = self.context_stack_trace(buffer, max_frames);
@@ -2671,19 +2928,11 @@ impl DebuggerSession {
                 ),
             ),
         };
-        X64ExceptionContext {
-            status,
-            context_record_address,
-            requested_size,
-            bytes_read,
-            complete: true,
-            context_flags: Some(context_flags),
-            validation: Some(validation),
-            registers: Some(registers),
-            stack: stack.ok(),
-            unwind_contexts: Some(unwind_contexts),
-            detail,
-        }
+        decoded.status = status;
+        decoded.stack = stack.ok();
+        decoded.unwind_contexts = Some(unwind_contexts);
+        decoded.detail = detail;
+        decoded
     }
 
     pub fn virtual_memory_map(&self, region_limit: u32) -> anyhow::Result<VirtualMemoryMap> {
@@ -4373,10 +4622,41 @@ impl DebuggerSession {
         unavailable_dump_header("DbgEng sessions are only supported on Windows".to_string())
     }
 
+    pub fn dump_debugger_data(&self, _max_frames: u32) -> DumpDebuggerData {
+        DumpDebuggerData {
+            status: "unavailable".to_string(),
+            source: "dbgeng_idebugdataspaces3_readdebuggerdata".to_string(),
+            saved_context_address: None,
+            saved_context_status: "unavailable".to_string(),
+            saved_context: None,
+            ki_bugcheck_data_address: None,
+            ki_bugcheck_data_status: "unavailable".to_string(),
+            detail: "DbgEng sessions are only supported on Windows".to_string(),
+        }
+    }
+
+    pub fn dump_event_inventory(&self) -> DumpEventInventory {
+        DumpEventInventory {
+            status: "unavailable".to_string(),
+            source: "dbgeng_idebugcontrol3_event_inventory".to_string(),
+            event_count: None,
+            current_event_index: None,
+            current_event_index_status: "unavailable".to_string(),
+            detail: "DbgEng sessions are only supported on Windows".to_string(),
+        }
+    }
+
     pub fn target_exception_snapshot(&self, _max_frames: u32) -> TargetExceptionSnapshot {
         TargetExceptionSnapshot {
             status: "unavailable".to_string(),
             source: "dbgeng_idebugadvanced2_target_exception_requests".to_string(),
+            contract: TargetExceptionContract {
+                status: "unavailable".to_string(),
+                source: "dbgeng_idebugcontrol_getdebuggeetype".to_string(),
+                debuggee_class: None,
+                debuggee_qualifier: None,
+                detail: "DbgEng sessions are only supported on Windows".to_string(),
+            },
             stored_event: StoredEventInformation {
                 status: "unavailable".to_string(),
                 source: "dbgeng_idebugcontrol4_get_stored_event_information".to_string(),
@@ -4798,11 +5078,85 @@ fn decode_utf16(buffer: &[u16]) -> String {
     String::from_utf16_lossy(&buffer[..end])
 }
 
+fn unavailable_dump_header_embedded_exception_context(
+    detail: impl Into<String>,
+) -> DumpHeaderEmbeddedExceptionContext {
+    DumpHeaderEmbeddedExceptionContext {
+        status: "unavailable".to_string(),
+        provenance_category: "unavailable".to_string(),
+        context_status: "unavailable".to_string(),
+        exception_record_status: "unavailable".to_string(),
+        context: None,
+        exception_record: None,
+        detail: detail.into(),
+    }
+}
+
+fn dump_header_embedded_exception_context(
+    bytes: &[u8],
+    header_contract_valid: bool,
+    machine_image_type: Option<u32>,
+) -> DumpHeaderEmbeddedExceptionContext {
+    if !header_contract_valid {
+        return unavailable_dump_header_embedded_exception_context(
+            "The DUMP_HEADER64 signature, valid-dump marker, or dump type was not validated, so its embedded ContextRecord and Exception bytes are withheld.",
+        );
+    }
+    if machine_image_type != Some(0x8664) {
+        return DumpHeaderEmbeddedExceptionContext {
+            status: "architecture_unsupported".to_string(),
+            provenance_category: "unavailable".to_string(),
+            context_status: "architecture_unsupported".to_string(),
+            exception_record_status: "architecture_unsupported".to_string(),
+            context: None,
+            exception_record: None,
+            detail: "The documented DUMP_HEADER64 layout is present, but this inspector decodes its embedded ContextRecord and EXCEPTION_RECORD64 only for AMD64 targets.".to_string(),
+        };
+    }
+    let Some(context_bytes) = bytes.get(
+        DUMP_HEADER64_CONTEXT_RECORD_OFFSET
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + X64_CONTEXT_SIZE as usize,
+    ) else {
+        return unavailable_dump_header_embedded_exception_context(format!(
+            "The validated DUMP_HEADER64 bytes do not include a complete AMD64 CONTEXT prefix at offset 0x{DUMP_HEADER64_CONTEXT_RECORD_OFFSET:X}."
+        ));
+    };
+    let Some(exception_bytes) = bytes.get(
+        DUMP_HEADER64_EXCEPTION_OFFSET..DUMP_HEADER64_EXCEPTION_OFFSET + EXCEPTION_RECORD64_SIZE,
+    ) else {
+        return unavailable_dump_header_embedded_exception_context(format!(
+            "The validated DUMP_HEADER64 bytes do not include a complete EXCEPTION_RECORD64 at offset 0x{DUMP_HEADER64_EXCEPTION_OFFSET:X}."
+        ));
+    };
+    let context = decode_x64_context_structural(None, context_bytes, X64_CONTEXT_SIZE, None);
+    let context_status = context.status.clone();
+    let exception_record = target_exception_record_from_bytes(exception_bytes);
+    let exception_record_status = if exception_record.is_some() {
+        "captured".to_string()
+    } else {
+        "invalid".to_string()
+    };
+    DumpHeaderEmbeddedExceptionContext {
+        status: if context_status == "captured" && exception_record.is_some() {
+            "captured".to_string()
+        } else {
+            "partial_or_invalid".to_string()
+        },
+        provenance_category: "direct_dbgeng_or_dump_field".to_string(),
+        context_status,
+        exception_record_status,
+        context: Some(context),
+        exception_record,
+        detail: "DUMP_HEADER64 declares fixed ContextRecord and EXCEPTION_RECORD64 fields at validated offsets. They are direct dump-field observations, not a documented P3/P4 pointer relationship: Microsoft documents that KeInitializeCrashDumpHeader can create a header before memory is recorded and does not record active exception records. This inspector therefore never promotes these embedded fields to fault-time or P3/P4 linkage.".to_string(),
+    }
+}
+
 fn unavailable_dump_header(detail: String) -> DumpHeaderSnapshot {
     DumpHeaderSnapshot {
         status: "unavailable".to_string(),
         source: "dbgeng_idebugadvanced2_debug_request_get_dump_header".to_string(),
         bytes_returned: 0,
+        fixed_prefix_status: "unavailable".to_string(),
         tail_status: "unavailable".to_string(),
         signature: None,
         valid_dump: None,
@@ -4816,6 +5170,9 @@ fn unavailable_dump_header(detail: String) -> DumpHeaderSnapshot {
         processor_count: None,
         bugcheck_code: None,
         bugcheck_parameters: None,
+        embedded_exception_context: unavailable_dump_header_embedded_exception_context(
+            "The dump header is unavailable, so its embedded ContextRecord and Exception fields cannot be inspected.",
+        ),
         version_user: None,
         dump_type: None,
         dump_type_name: None,
@@ -4837,71 +5194,139 @@ fn unavailable_dump_header(detail: String) -> DumpHeaderSnapshot {
 }
 
 fn dump_header_from_bytes(bytes: &[u8], bytes_returned: u32) -> DumpHeaderSnapshot {
-    const HEADER_PREFIX_SIZE: usize = 0x1050;
-    if bytes.len() < HEADER_PREFIX_SIZE {
+    if bytes.len() < DUMP_HEADER64_FIXED_PREFIX_SIZE {
         return unavailable_dump_header(format!(
-            "DbgEng returned only {} bytes; the documented DUMP_HEADER64 fields through BootId require {HEADER_PREFIX_SIZE} bytes.",
+            "DbgEng returned only {} bytes; the documented DUMP_HEADER64 fixed bugcheck prefix requires {DUMP_HEADER64_FIXED_PREFIX_SIZE} bytes.",
             bytes.len()
         ));
     }
-    let dump_type = read_u32_le(bytes, 0xf94);
+    let signature = read_u32_le(bytes, 0);
+    let valid_dump = read_u32_le(bytes, 4);
+    let fixed_prefix_valid = signature == Some(0x4547_4150) && valid_dump == Some(0x3436_5544);
+    let tail_available = bytes.len() >= DUMP_HEADER64_TAIL_THROUGH_BOOT_ID_SIZE;
+    let dump_type = tail_available
+        .then(|| read_u32_le(bytes, DUMP_HEADER64_DUMP_TYPE_OFFSET))
+        .flatten();
     let tail_valid = dump_type.and_then(dump_type_name).is_some();
-    let attributes_raw = tail_valid.then(|| read_u32_le(bytes, 0x1048)).flatten();
+    let header_contract_valid = fixed_prefix_valid && tail_valid;
+    let attributes_raw = header_contract_valid
+        .then(|| read_u32_le(bytes, 0x1048))
+        .flatten();
     DumpHeaderSnapshot {
-        status: if tail_valid {
+        status: if header_contract_valid {
             "captured".to_string()
-        } else {
+        } else if fixed_prefix_valid {
             "captured_prefix_only".to_string()
+        } else {
+            "unvalidated_fixed_prefix".to_string()
         },
         source: "dbgeng_idebugadvanced2_debug_request_get_dump_header".to_string(),
         bytes_returned,
-        tail_status: if tail_valid {
+        fixed_prefix_status: if fixed_prefix_valid {
             "validated".to_string()
         } else {
             "unvalidated".to_string()
         },
-        signature: read_u32_le(bytes, 0),
-        valid_dump: read_u32_le(bytes, 4),
-        major_version: read_u32_le(bytes, 8),
-        minor_version: read_u32_le(bytes, 12),
-        directory_table_base: read_u64_le(bytes, 0x10),
-        pfn_database: read_u64_le(bytes, 0x18),
-        loaded_module_list: read_u64_le(bytes, 0x20),
-        active_process_head: read_u64_le(bytes, 0x28),
-        machine_image_type: read_u32_le(bytes, 0x30),
-        processor_count: read_u32_le(bytes, 0x34),
-        bugcheck_code: read_u32_le(bytes, 0x38),
-        bugcheck_parameters: [
-            read_u64_le(bytes, 0x40),
-            read_u64_le(bytes, 0x48),
-            read_u64_le(bytes, 0x50),
-            read_u64_le(bytes, 0x58),
-        ]
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .and_then(|values| values.try_into().ok()),
-        version_user: header_ascii(&bytes[0x60..0x80]),
-        dump_type: tail_valid.then_some(dump_type).flatten(),
-        dump_type_name: dump_type.and_then(dump_type_name).map(str::to_string),
-        required_dump_space_bytes: tail_valid.then(|| read_u64_le(bytes, 0xf98)).flatten(),
-        system_time_filetime: tail_valid.then(|| read_u64_le(bytes, 0xfa0)).flatten(),
-        comment: tail_valid
+        tail_status: if header_contract_valid {
+            "validated".to_string()
+        } else if tail_available {
+            "unvalidated".to_string()
+        } else {
+            "unavailable".to_string()
+        },
+        signature,
+        valid_dump,
+        major_version: fixed_prefix_valid.then(|| read_u32_le(bytes, 8)).flatten(),
+        minor_version: fixed_prefix_valid.then(|| read_u32_le(bytes, 12)).flatten(),
+        directory_table_base: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x10))
+            .flatten(),
+        pfn_database: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x18))
+            .flatten(),
+        loaded_module_list: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x20))
+            .flatten(),
+        active_process_head: fixed_prefix_valid
+            .then(|| read_u64_le(bytes, 0x28))
+            .flatten(),
+        machine_image_type: fixed_prefix_valid
+            .then(|| read_u32_le(bytes, 0x30))
+            .flatten(),
+        processor_count: fixed_prefix_valid
+            .then(|| read_u32_le(bytes, 0x34))
+            .flatten(),
+        bugcheck_code: fixed_prefix_valid
+            .then(|| read_u32_le(bytes, 0x38))
+            .flatten(),
+        bugcheck_parameters: fixed_prefix_valid
+            .then(|| {
+                [
+                    read_u64_le(bytes, 0x40),
+                    read_u64_le(bytes, 0x48),
+                    read_u64_le(bytes, 0x50),
+                    read_u64_le(bytes, 0x58),
+                ]
+                .into_iter()
+                .collect::<Option<Vec<_>>>()
+                .and_then(|values| values.try_into().ok())
+            })
+            .flatten(),
+        embedded_exception_context: dump_header_embedded_exception_context(
+            bytes,
+            header_contract_valid,
+            fixed_prefix_valid
+                .then(|| read_u32_le(bytes, 0x30))
+                .flatten(),
+        ),
+        version_user: fixed_prefix_valid
+            .then(|| bytes.get(0x60..0x80).and_then(header_ascii))
+            .flatten(),
+        dump_type: header_contract_valid.then_some(dump_type).flatten(),
+        dump_type_name: header_contract_valid
+            .then(|| dump_type.and_then(dump_type_name).map(str::to_string))
+            .flatten(),
+        required_dump_space_bytes: header_contract_valid
+            .then(|| read_u64_le(bytes, 0xf98))
+            .flatten(),
+        system_time_filetime: header_contract_valid
+            .then(|| read_u64_le(bytes, 0xfa0))
+            .flatten(),
+        comment: header_contract_valid
             .then(|| header_ascii(&bytes[0xfa8..0x1028]))
             .flatten(),
-        system_uptime_100ns: tail_valid.then(|| read_u64_le(bytes, 0x1028)).flatten(),
-        mini_dump_fields: tail_valid.then(|| read_u32_le(bytes, 0x1030)).flatten(),
-        secondary_data_state: tail_valid.then(|| read_u32_le(bytes, 0x1034)).flatten(),
-        product_type: tail_valid.then(|| read_u32_le(bytes, 0x1038)).flatten(),
-        suite_mask: tail_valid.then(|| read_u32_le(bytes, 0x103c)).flatten(),
-        writer_status: tail_valid.then(|| read_u32_le(bytes, 0x1040)).flatten(),
-        kd_secondary_version: tail_valid.then(|| bytes.get(0x1045).copied()).flatten(),
+        system_uptime_100ns: header_contract_valid
+            .then(|| read_u64_le(bytes, 0x1028))
+            .flatten(),
+        mini_dump_fields: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1030))
+            .flatten(),
+        secondary_data_state: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1034))
+            .flatten(),
+        product_type: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1038))
+            .flatten(),
+        suite_mask: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x103c))
+            .flatten(),
+        writer_status: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x1040))
+            .flatten(),
+        kd_secondary_version: header_contract_valid
+            .then(|| bytes.get(0x1045).copied())
+            .flatten(),
         attributes_raw,
         attributes: attributes_raw.map(dump_attribute_names).unwrap_or_default(),
-        boot_id: tail_valid.then(|| read_u32_le(bytes, 0x104c)).flatten(),
-        detail: if tail_valid {
-            "The documented DUMP_HEADER64 bytes are a static dump-capture record. SecondaryDataState is reported verbatim because the documented DbgEng request does not enumerate or define individual kernel blackbox stream identifiers or payload layouts.".to_string()
+        boot_id: header_contract_valid
+            .then(|| read_u32_le(bytes, 0x104c))
+            .flatten(),
+        detail: if header_contract_valid {
+            "The documented DUMP_HEADER64 bytes passed signature, valid-dump marker, and dump-type checks. SecondaryDataState is reported verbatim because the documented DbgEng request does not enumerate or define individual kernel blackbox stream identifiers or payload layouts.".to_string()
+        } else if fixed_prefix_valid {
+            "The documented DUMP_HEADER64 fixed prefix passed its signature and valid-dump marker checks, so its saved bugcheck code and P1-P4 fields are captured at their documented offsets. The tail did not validate as a complete DUMP_HEADER64 contract, so embedded context/exception and tail fields are withheld rather than interpreting unvalidated bytes or assuming a dump-layout variant.".to_string()
         } else {
-            "DbgEng returned a header prefix whose signature and basic fields can be decoded, but the purported DUMP_HEADER64 tail did not contain a documented DUMP_TYPE value. Tail fields are withheld rather than interpreting unvalidated bytes or assuming a dump-layout variant.".to_string()
+            "DbgEng returned bytes that did not pass the documented DUMP_HEADER64 fixed-prefix signature and valid-dump marker checks. No bugcheck, embedded context/exception, or tail field is interpreted.".to_string()
         },
     }
 }
@@ -5384,10 +5809,45 @@ mod tests {
         bytes[0x1034..0x1038].copy_from_slice(&7u32.to_le_bytes());
         bytes[0x1048..0x104c].copy_from_slice(&((1u32 << 5) | (1 << 8)).to_le_bytes());
         bytes[0x104c..0x1050].copy_from_slice(&9u32.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x30
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x34]
+            .copy_from_slice(&0x0010_001f_u32.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x38
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x3a]
+            .copy_from_slice(&0x10_u16.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x42
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x44]
+            .copy_from_slice(&0x18_u16.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x44
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x48]
+            .copy_from_slice(&0x202_u32.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x98
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0xa0]
+            .copy_from_slice(&0xffff_f800_0000_1000_u64.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0xb8
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0xc0]
+            .copy_from_slice(&0x2000_u64.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0xe8
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0xf0]
+            .copy_from_slice(&0x20_u64.to_le_bytes());
+        bytes[DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0xf8
+            ..DUMP_HEADER64_CONTEXT_RECORD_OFFSET + 0x100]
+            .copy_from_slice(&0xffff_f800_e439_70b0_u64.to_le_bytes());
+        bytes[DUMP_HEADER64_EXCEPTION_OFFSET..DUMP_HEADER64_EXCEPTION_OFFSET + 4]
+            .copy_from_slice(&0xc000_0005u32.to_le_bytes());
+        bytes[DUMP_HEADER64_EXCEPTION_OFFSET + 16..DUMP_HEADER64_EXCEPTION_OFFSET + 24]
+            .copy_from_slice(&0xffff_f800_e439_70b0_u64.to_le_bytes());
+        bytes[DUMP_HEADER64_EXCEPTION_OFFSET + 24..DUMP_HEADER64_EXCEPTION_OFFSET + 28]
+            .copy_from_slice(&2u32.to_le_bytes());
+        bytes[DUMP_HEADER64_EXCEPTION_OFFSET + 32..DUMP_HEADER64_EXCEPTION_OFFSET + 40]
+            .copy_from_slice(&0u64.to_le_bytes());
+        bytes[DUMP_HEADER64_EXCEPTION_OFFSET + 40..DUMP_HEADER64_EXCEPTION_OFFSET + 48]
+            .copy_from_slice(&0x2020_u64.to_le_bytes());
 
         let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_SIZE as u32);
 
         assert_eq!(header.status, "captured");
+        assert_eq!(header.fixed_prefix_status, "validated");
         assert_eq!(header.processor_count, Some(24));
         assert_eq!(header.bugcheck_code, Some(0x1e));
         assert_eq!(
@@ -5405,6 +5865,29 @@ mod tests {
             vec!["generated_offline", "encrypted_dump_data"]
         );
         assert_eq!(header.boot_id, Some(9));
+        assert_eq!(header.embedded_exception_context.status, "captured");
+        assert_eq!(
+            header.embedded_exception_context.provenance_category,
+            "direct_dbgeng_or_dump_field"
+        );
+        assert_eq!(
+            header
+                .embedded_exception_context
+                .context
+                .as_ref()
+                .and_then(|context| context.registers.as_ref())
+                .map(|registers| registers.rip),
+            Some(0xffff_f800_e439_70b0)
+        );
+        assert_eq!(
+            header
+                .embedded_exception_context
+                .exception_record
+                .as_ref()
+                .and_then(|record| record.access_violation.as_ref())
+                .map(|access| access.address),
+            Some(0x2020)
+        );
     }
 
     #[test]
@@ -5438,15 +5921,64 @@ mod tests {
     #[test]
     fn withholds_unvalidated_dump_header_tail() {
         let mut bytes = vec![0u8; DUMP_HEADER64_SIZE];
-        bytes[0xf94..0xf98].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[0..4].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x3436_5544u32.to_le_bytes());
+        bytes[0x38..0x3c].copy_from_slice(&0x1eu32.to_le_bytes());
+        bytes[0x40..0x48].copy_from_slice(&0xffff_ffff_c000_0005u64.to_le_bytes());
+        bytes[0x48..0x50].copy_from_slice(&0xffff_f800_e439_70b0u64.to_le_bytes());
+        bytes[0x50..0x58].copy_from_slice(&0xffff_f283_9446_89b8u64.to_le_bytes());
+        bytes[0x58..0x60].copy_from_slice(&0xffff_f283_9446_81c0u64.to_le_bytes());
+        bytes[DUMP_HEADER64_DUMP_TYPE_OFFSET..DUMP_HEADER64_DUMP_TYPE_OFFSET + 4]
+            .copy_from_slice(&0x4547_4150u32.to_le_bytes());
         bytes[0x1034..0x1038].copy_from_slice(&7u32.to_le_bytes());
 
         let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_SIZE as u32);
 
         assert_eq!(header.status, "captured_prefix_only");
+        assert_eq!(header.fixed_prefix_status, "validated");
         assert_eq!(header.tail_status, "unvalidated");
+        assert_eq!(header.bugcheck_code, Some(0x1e));
+        assert_eq!(
+            header.bugcheck_parameters,
+            Some([
+                0xffff_ffff_c000_0005,
+                0xffff_f800_e439_70b0,
+                0xffff_f283_9446_89b8,
+                0xffff_f283_9446_81c0,
+            ])
+        );
         assert_eq!(header.dump_type, None);
         assert_eq!(header.secondary_data_state, None);
+        assert_eq!(header.embedded_exception_context.status, "unavailable");
+    }
+
+    #[test]
+    fn decodes_fixed_bugcheck_prefix_without_a_complete_header_tail() {
+        let mut bytes = vec![0u8; DUMP_HEADER64_FIXED_PREFIX_SIZE];
+        bytes[0..4].copy_from_slice(&0x4547_4150u32.to_le_bytes());
+        bytes[4..8].copy_from_slice(&0x3436_5544u32.to_le_bytes());
+        bytes[0x38..0x3c].copy_from_slice(&0x1eu32.to_le_bytes());
+        bytes[0x40..0x48].copy_from_slice(&0xffff_ffff_c000_0005u64.to_le_bytes());
+        bytes[0x48..0x50].copy_from_slice(&0xffff_f800_e439_70b0u64.to_le_bytes());
+        bytes[0x50..0x58].copy_from_slice(&0x1111_2222_3333_4444u64.to_le_bytes());
+        bytes[0x58..0x60].copy_from_slice(&0x5555_6666_7777_8888u64.to_le_bytes());
+
+        let header = dump_header_from_bytes(&bytes, DUMP_HEADER64_FIXED_PREFIX_SIZE as u32);
+
+        assert_eq!(header.status, "captured_prefix_only");
+        assert_eq!(header.fixed_prefix_status, "validated");
+        assert_eq!(header.tail_status, "unavailable");
+        assert_eq!(header.bugcheck_code, Some(0x1e));
+        assert_eq!(
+            header.bugcheck_parameters,
+            Some([
+                0xffff_ffff_c000_0005,
+                0xffff_f800_e439_70b0,
+                0x1111_2222_3333_4444,
+                0x5555_6666_7777_8888,
+            ])
+        );
+        assert_eq!(header.embedded_exception_context.status, "unavailable");
     }
 
     #[test]

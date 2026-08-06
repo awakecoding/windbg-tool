@@ -26,6 +26,35 @@ unwind, and never treats a loaded driver or `ntoskrnl.exe` fault location as dri
 Add `--refresh-symbols` only when the configured symbol path may be contacted; the report records
 whether DbgEng loaded PDB-backed symbols or only has module-level metadata.
 
+Context candidates are reconciled only from explicit roots: raw bugcheck fields, documented
+DbgEng saved-context and stored-event data, validated `DUMP_HEADER64` fields, and bounded unwind
+output. `ReadDebuggerData(DEBUG_DATA_SavedContextAddr)` proves only that DbgEng identified a
+context saved during a bugcheck; a null result is reported explicitly, and a non-null result still
+does not link that context to an `EXCEPTION_RECORD`. Each candidate reports one strict provenance
+category. A matching RIP is not fault-time proof: the tool requires a documented
+context-to-exception link plus matching bugcheck, AMD64 validation, and operand target before
+promoting registers. Header `ContextRecord` and `Exception` bytes remain unlinked evidence,
+because Microsoft's documented header-initialization routine can run before memory capture and
+does not record active exception records. Target-exception context/record pairs are considered
+linked only when DbgEng's target class verifies a user-mode minidump, the documented scope of
+those requests; any result from another target type remains unlinked.
+
+For complete dumps, the tool independently decodes the signature-validated fixed
+`DUMP_HEADER64` prefix through the four saved bugcheck parameters before attempting to decode
+the optional header tail. It reconciles that tuple against `ReadBugCheckData` only on exact
+code-and-four-parameter equality. A structurally valid object addressed by a final bugcheck
+slot is still a rooted structural candidate, not a typed parameter or an exception-time object.
+For bugcheck `0x1E`, pointer-shaped final slots that do not meet the documented
+access-type/fault-address contract are reported as untyped nonstandard values. By default, a
+matching exception-record-shaped object and context-shaped object can support only a
+wrapper-like inference. One identity-gated exact-kernel-build contract can additionally verify
+the first four raw DbgEng return addresses and the final call arguments against audited wrapper
+code. When every check matches, the report identifies P3/P4 as that wrapper's active
+`EXCEPTION_RECORD`/`CONTEXT` pair. This is derived code-path evidence, not a documented DbgEng
+or dump-format contract: it proves the pair is not arbitrary nearby state, but it does not prove
+that earlier handlers did not modify volatile context registers. Consequently, even this result
+never promotes a conflicting `R8+R14` operand to fault-time state.
+
 ## Common replay workflow
 
 Start or reuse the local daemon:
