@@ -1,5 +1,7 @@
 # windbg-tool
 
+This repository has been migrated to [Devolutions/windbg-tool](https://github.com/Devolutions/windbg-tool).
+
 `windbg-tool` is a Windows-first command-line tool and MCP server for WinDbg-oriented automation. It is centered on Time Travel Debugging (TTD) replay, but it also covers broader WinDbg workflows such as daemon-backed CLI automation, symbol and source diagnostics, disassembly and memory inspection helpers, DbgEng process-server support, remote debugging command generation, and WinDbg install/update/launch.
 
 `windbg-tool` is the product name. You will still see `windbg-ttd` in MCP server configuration and `ttd_*` tool names because the replay/MCP surface grew out of the original TTD-focused implementation.
